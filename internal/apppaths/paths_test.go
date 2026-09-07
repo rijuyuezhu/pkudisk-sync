@@ -42,7 +42,10 @@ func TestPrepareCreatesRealPrivateDirectories(t *testing.T) {
 	if err := paths.PrepareConfig(); err != nil {
 		t.Fatal(err)
 	}
-	for _, dir := range []string{filepath.Dir(paths.StateDB), filepath.Dir(paths.RcloneConfig)} {
+	if err := paths.PrepareRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{filepath.Dir(paths.StateDB), filepath.Dir(paths.RcloneConfig), paths.RuntimeDir} {
 		info, err := os.Lstat(dir)
 		if err != nil {
 			t.Fatal(err)

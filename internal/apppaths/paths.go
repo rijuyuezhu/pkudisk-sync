@@ -74,10 +74,16 @@ func (p Paths) PrepareState() error {
 	return ensurePrivateDir(filepath.Dir(p.StateDB))
 }
 
-// PrepareConfig creates the private application directory containing the
-// embedded rclone config. It does not create or populate rclone.conf itself.
+// PrepareConfig creates the application directory containing the embedded
+// rclone config. It does not create or populate rclone.conf itself.
 func (p Paths) PrepareConfig() error {
 	return ensurePrivateDir(filepath.Dir(p.RcloneConfig))
+}
+
+// PrepareRuntime creates the per-user runtime directory used for process-level
+// coordination such as the daemon single-instance lock.
+func (p Paths) PrepareRuntime() error {
+	return ensurePrivateDir(p.RuntimeDir)
 }
 
 func ensurePrivateDir(dir string) error {

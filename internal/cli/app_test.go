@@ -11,6 +11,7 @@ import (
 
 	"github.com/rijuyuezhu/pkudisk-sync/internal/apppaths"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/daemon"
+	"github.com/rijuyuezhu/pkudisk-sync/internal/daemonlock"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/reconcile"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/rootmarker"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/store"
@@ -190,6 +191,32 @@ func TestDaemonDefaultDeletePolicyUsesCountGuardOnly(t *testing.T) {
 	}
 	if gotPolicy.MaxCount != 100 || gotPolicy.MaxFraction != 0 || gotPolicy.MassDeleteApproved {
 		t.Fatalf("default daemon policy = %+v", gotPolicy)
+	}
+}
+
+func TestDaemonRefusesSecondInstanceBeforeWiringRunner(t *testing.T) {
+	paths := cliTestPaths(t)
+	if err := paths.PrepareRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	held, err := daemonlock.Acquire(paths.RuntimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
+	app.installRcloneConfig = func(string) error {
+		t.Fatal("rclone config installed before daemon lease was acquired")
+		return nil
+	}
+	app.newRunner = func(*store.Store, reconcile.DeletePolicy, daemon.Reporter) (daemonRunner, error) {
+		t.Fatal("runner created while another daemon held the lease")
+		return nil, nil
+	}
+	err = app.Run(context.Background(), []string{"daemon"})
+	if !errors.Is(err, daemonlock.ErrAlreadyRunning) {
+		t.Fatalf("second daemon error = %v, want ErrAlreadyRunning", err)
 	}
 }
 

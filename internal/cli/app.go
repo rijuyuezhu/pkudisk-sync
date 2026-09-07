@@ -15,6 +15,7 @@ import (
 
 	"github.com/rijuyuezhu/pkudisk-sync/internal/apppaths"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/daemon"
+	"github.com/rijuyuezhu/pkudisk-sync/internal/daemonlock"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/executor"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/reconcile"
@@ -284,6 +285,15 @@ func (a *Application) runDaemon(ctx context.Context, args []string) error {
 	if policy.MaxCount == 0 && policy.MaxFraction == 0 {
 		return fmt.Errorf("at least one daemon delete threshold must remain enabled")
 	}
+
+	if err := a.paths.PrepareRuntime(); err != nil {
+		return err
+	}
+	lease, err := daemonlock.Acquire(a.paths.RuntimeDir)
+	if err != nil {
+		return err
+	}
+	defer lease.Close()
 
 	if err := a.paths.PrepareConfig(); err != nil {
 		return err
