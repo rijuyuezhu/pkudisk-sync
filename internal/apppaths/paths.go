@@ -17,6 +17,17 @@ const (
 	envRuntimeDir   = "PKUDISK_SYNC_RUNTIME_DIR"
 )
 
+// OverridesActive reports whether this process is using explicit path
+// overrides that a login-managed background service would not inherit.
+func OverridesActive() bool {
+	for _, name := range []string{envStateDB, envRcloneConfig, envCacheDir, envRuntimeDir} {
+		if os.Getenv(name) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // Paths are all per-user paths owned by pkudisk-sync. The embedded rclone
 // backend deliberately does not use the user's global rclone configuration.
 type Paths struct {

@@ -6,7 +6,7 @@ The project directly embeds the Go `rclone-pkudisk` backend and rclone libraries
 
 ## Status
 
-The Phase B/C core and the first Phase D product loop are implemented: pure three-way reconciliation, initial merge, SQLite baseline/operation/conflict authority, deletion gates, crash recovery, multiple selected sync roots, full local/remote scans, guarded in-process file/directory mutations, root-marker safety, durable journal-to-postcondition execution, recursive filesystem watcher hints, periodic repair polling, pause/resume observation, dynamic discovery of newly configured roots, a cross-platform single-instance daemon lease, and a minimal foreground CLI.
+The Phase B/C core and the first Phase D/E product loop are implemented: pure three-way reconciliation, initial merge, SQLite baseline/operation/conflict authority, deletion gates, crash recovery, multiple selected sync roots, full local/remote scans, guarded in-process file/directory mutations, root-marker safety, durable journal-to-postcondition execution, recursive filesystem watcher hints, periodic repair polling, pause/resume observation, dynamic discovery of newly configured roots, a cross-platform single-instance daemon lease, a minimal CLI, and native per-user background-service wiring for Linux, macOS, and Windows.
 
 The executor directly imports rclone and `rclone-pkudisk`; it starts no rclone subprocess and exposes no internal RC/IPC boundary. Live PKU Disk smoke tests have validated expected-absent create, conditional update, stale-revision rejection, expected-absent collision rejection, exact-revision download, exact-ID file delete, and guarded exact-ID empty-directory delete. Non-empty remote directories are refused and preserved.
 
@@ -69,6 +69,18 @@ pkudisk-sync daemon
 
 `root add` refuses a local symlink root and refuses a remote name that is not configured as a `pkudisk` remote in the app-owned rclone config. `--poll 0` uses the daemon's 60-second repair default. The foreground daemon combines filesystem hints with full repair scans and, by default, blocks a cycle proposing more than 100 deletions. The fractional guard is disabled by default so ordinary deletes in small roots are not blocked; enable it explicitly with `--max-delete-fraction` when desired. At least one delete threshold must remain enabled. Only one daemon may own a user's runtime directory at a time; a second foreground/service instance fails immediately instead of reconciling concurrently.
 
+To run the same daemon as a current-user background service:
+
+```bash
+pkudisk-sync service install
+pkudisk-sync service start
+pkudisk-sync service status
+pkudisk-sync service stop
+pkudisk-sync service uninstall
+```
+
+`install` registers but deliberately does not start synchronization immediately. Linux uses a `systemd --user` unit, macOS uses a LaunchAgent in `~/Library/LaunchAgents`, and Windows uses an interactive current-user Scheduled Task with limited privileges. The installed service always uses the platform default app paths; `service install` therefore refuses `PKUDISK_SYNC_*` path overrides rather than silently starting later with a different state database or rclone config.
+
 ## Planned implementation order
 
 1. Pure domain model and three-way planner.
@@ -76,7 +88,7 @@ pkudisk-sync daemon
 3. Deletion guards and crash-recovery decision model.
 4. In-process executor using the Go rclone / `rclone-pkudisk` APIs directly. **Implemented.**
 5. Native watchers and continuous multi-root daemon. **Implemented with foreground CLI.**
-6. Per-user service packaging and CLI/UI polish. **Service installers and richer UX remain.**
+6. Per-user service packaging and CLI/UI polish. **Native Linux/macOS/Windows user-service control is implemented; richer UX and release packaging remain.**
 
 ## Development
 

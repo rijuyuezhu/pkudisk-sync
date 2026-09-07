@@ -16,6 +16,7 @@ import (
 	"github.com/rijuyuezhu/pkudisk-sync/internal/rootmarker"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/store"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/syncer"
+	"github.com/rijuyuezhu/pkudisk-sync/internal/userservice"
 )
 
 func TestRootAddListPauseResume(t *testing.T) {
@@ -229,6 +230,63 @@ func TestDaemonRejectsAllDeleteThresholdsDisabled(t *testing.T) {
 	}
 }
 
+func TestServiceCommandsWireNativeManager(t *testing.T) {
+	for _, name := range []string{
+		"PKUDISK_SYNC_STATE_DB",
+		"PKUDISK_SYNC_RCLONE_CONFIG",
+		"PKUDISK_SYNC_CACHE_DIR",
+		"PKUDISK_SYNC_RUNTIME_DIR",
+	} {
+		t.Setenv(name, "")
+	}
+	paths := cliTestPaths(t)
+	var stdout bytes.Buffer
+	app := New(paths, &stdout, &bytes.Buffer{})
+	executable := filepath.Join(t.TempDir(), "bin", "pkudisk-sync")
+	if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(executable, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	app.executablePath = func() (string, error) { return executable, nil }
+	fake := &fakeServiceManager{status: userservice.StatusActive}
+	app.newService = func(got string) (userservice.Manager, error) {
+		if got != executable {
+			t.Fatalf("service executable = %q, want %q", got, executable)
+		}
+		return fake, nil
+	}
+
+	for _, command := range []string{"install", "status", "start", "stop", "uninstall"} {
+		if err := app.Run(context.Background(), []string{"service", command}); err != nil {
+			t.Fatalf("service %s: %v", command, err)
+		}
+	}
+	wantCalls := []string{"install", "status", "start", "stop", "uninstall"}
+	if strings.Join(fake.calls, ",") != strings.Join(wantCalls, ",") {
+		t.Fatalf("service calls = %v, want %v", fake.calls, wantCalls)
+	}
+	for _, want := range []string{"service installed", "active", "service started", "service stopped", "service uninstalled"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("service output %q missing %q", stdout.String(), want)
+		}
+	}
+}
+
+func TestServiceInstallRejectsPathOverridesBeforeProvider(t *testing.T) {
+	t.Setenv("PKUDISK_SYNC_STATE_DB", filepath.Join(t.TempDir(), "state.db"))
+	app := New(cliTestPaths(t), &bytes.Buffer{}, &bytes.Buffer{})
+	app.executablePath = func() (string, error) {
+		t.Fatal("service provider resolution ran before override rejection")
+		return "", nil
+	}
+	err := app.Run(context.Background(), []string{"service", "install"})
+	if err == nil || !strings.Contains(err.Error(), "requires default") {
+		t.Fatalf("service install error = %v", err)
+	}
+}
+
 func TestParseRemoteSpec(t *testing.T) {
 	name, root, err := parseRemoteSpec("pkudisk:Personal/Path:WithColon")
 	if err != nil {
@@ -261,6 +319,36 @@ type fakeDaemonRunner struct {
 func (r *fakeDaemonRunner) Run(context.Context) error {
 	r.called = true
 	return nil
+}
+
+type fakeServiceManager struct {
+	calls  []string
+	status userservice.Status
+}
+
+func (m *fakeServiceManager) Install(context.Context) error {
+	m.calls = append(m.calls, "install")
+	return nil
+}
+
+func (m *fakeServiceManager) Uninstall(context.Context) error {
+	m.calls = append(m.calls, "uninstall")
+	return nil
+}
+
+func (m *fakeServiceManager) Start(context.Context) error {
+	m.calls = append(m.calls, "start")
+	return nil
+}
+
+func (m *fakeServiceManager) Stop(context.Context) error {
+	m.calls = append(m.calls, "stop")
+	return nil
+}
+
+func (m *fakeServiceManager) Status(context.Context) (userservice.Status, error) {
+	m.calls = append(m.calls, "status")
+	return m.status, nil
 }
 
 func cliTestPaths(t *testing.T) apppaths.Paths {

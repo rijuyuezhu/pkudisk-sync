@@ -28,6 +28,19 @@ func TestDefaultHonorsExplicitOverrides(t *testing.T) {
 	}
 }
 
+func TestOverridesActive(t *testing.T) {
+	for _, name := range []string{envStateDB, envRcloneConfig, envCacheDir, envRuntimeDir} {
+		t.Setenv(name, "")
+	}
+	if OverridesActive() {
+		t.Fatal("OverridesActive() = true with no overrides")
+	}
+	t.Setenv(envRuntimeDir, filepath.Join(t.TempDir(), "runtime"))
+	if !OverridesActive() {
+		t.Fatal("OverridesActive() = false with runtime override")
+	}
+}
+
 func TestPrepareCreatesRealPrivateDirectories(t *testing.T) {
 	base := t.TempDir()
 	paths := Paths{

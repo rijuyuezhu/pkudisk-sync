@@ -20,6 +20,7 @@ import (
 	"github.com/rijuyuezhu/pkudisk-sync/internal/executor"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/reconcile"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/store"
+	"github.com/rijuyuezhu/pkudisk-sync/internal/userservice"
 )
 
 const (
@@ -40,6 +41,8 @@ type Application struct {
 	installRcloneConfig func(string) error
 	validateRemote      func(string) error
 	newRunner           func(*store.Store, reconcile.DeletePolicy, daemon.Reporter) (daemonRunner, error)
+	executablePath      func() (string, error)
+	newService          func(string) (userservice.Manager, error)
 }
 
 func New(paths apppaths.Paths, stdout, stderr io.Writer) *Application {
@@ -62,6 +65,8 @@ func New(paths apppaths.Paths, stdout, stderr io.Writer) *Application {
 		newRunner: func(state *store.Store, policy reconcile.DeletePolicy, report daemon.Reporter) (daemonRunner, error) {
 			return daemon.NewRunner(state, policy, report)
 		},
+		executablePath: os.Executable,
+		newService:     userservice.New,
 	}
 }
 
@@ -80,6 +85,8 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 		return a.runRoot(ctx, args[1:])
 	case "daemon":
 		return a.runDaemon(ctx, args[1:])
+	case "service":
+		return a.runService(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -95,6 +102,8 @@ func (a *Application) printUsage() {
 	fmt.Fprintln(a.stdout, "  root pause ID                      Pause one selected pair")
 	fmt.Fprintln(a.stdout, "  root resume ID                     Resume one selected pair")
 	fmt.Fprintln(a.stdout, "  daemon                             Run the foreground sync daemon")
+	fmt.Fprintln(a.stdout, "  service install|start|stop|status  Manage the current user's background daemon")
+	fmt.Fprintln(a.stdout, "  service uninstall                  Remove the current user's background daemon")
 }
 
 func (a *Application) runPaths(args []string) error {
@@ -106,6 +115,68 @@ func (a *Application) runPaths(args []string) error {
 	fmt.Fprintf(a.stdout, "cache_dir\t%s\n", a.paths.CacheDir)
 	fmt.Fprintf(a.stdout, "runtime_dir\t%s\n", a.paths.RuntimeDir)
 	return nil
+}
+
+func (a *Application) runService(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("service requires exactly one of: install, uninstall, start, stop, status")
+	}
+	if args[0] == "install" && apppaths.OverridesActive() {
+		return fmt.Errorf("service install requires default pkudisk-sync paths; unset PKUDISK_SYNC_* path overrides first")
+	}
+	manager, err := a.serviceManager()
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "install":
+		if err := manager.Install(ctx); err != nil {
+			return err
+		}
+		fmt.Fprintln(a.stdout, "service installed")
+	case "uninstall":
+		if err := manager.Uninstall(ctx); err != nil {
+			return err
+		}
+		fmt.Fprintln(a.stdout, "service uninstalled")
+	case "start":
+		if err := manager.Start(ctx); err != nil {
+			return err
+		}
+		fmt.Fprintln(a.stdout, "service started")
+	case "stop":
+		if err := manager.Stop(ctx); err != nil {
+			return err
+		}
+		fmt.Fprintln(a.stdout, "service stopped")
+	case "status":
+		status, err := manager.Status(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(a.stdout, status)
+	default:
+		return fmt.Errorf("unknown service command %q", args[0])
+	}
+	return nil
+}
+
+func (a *Application) serviceManager() (userservice.Manager, error) {
+	executable, err := a.executablePath()
+	if err != nil {
+		return nil, fmt.Errorf("resolve pkudisk-sync executable: %w", err)
+	}
+	if !filepath.IsAbs(executable) {
+		executable, err = filepath.Abs(executable)
+		if err != nil {
+			return nil, fmt.Errorf("make pkudisk-sync executable absolute: %w", err)
+		}
+	}
+	manager, err := a.newService(filepath.Clean(executable))
+	if err != nil {
+		return nil, err
+	}
+	return manager, nil
 }
 
 func (a *Application) runRoot(ctx context.Context, args []string) error {
