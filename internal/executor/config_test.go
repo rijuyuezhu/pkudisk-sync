@@ -84,3 +84,18 @@ func TestDownloadContextPinsRevisionAndDisablesMultithread(t *testing.T) {
 		t.Fatalf("download precondition headers = %#v", got)
 	}
 }
+func TestEmbeddedPKUDiskBackendHasSyncCommands(t *testing.T) {
+	info, err := fs.Find("pkudisk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := make(map[string]bool, len(info.CommandHelp))
+	for _, command := range info.CommandHelp {
+		commands[command.Name] = true
+	}
+	for _, required := range []string{"sync-delete", "sync-delete-dir", "sync-move"} {
+		if !commands[required] {
+			t.Fatalf("embedded pkudisk backend is missing required command %q", required)
+		}
+	}
+}

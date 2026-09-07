@@ -57,29 +57,65 @@ func NewRoot(ctx context.Context, root domain.SyncRoot, remoteConfig configmap.M
 }
 
 // Upload copies the current local file to the same relative remote path under
-// an explicit remote baseline precondition. The caller must still observe both
-// sides after success before committing a new baseline; a local save can race
-// with the transfer even though remote overwrite safety is CAS-protected.
-func (e *RootExecutor) Upload(ctx context.Context, relPath string, expectedLocal domain.LocalFingerprint, expectedRemote domain.RemoteExpectation) error {
+// an explicit remote baseline precondition. It returns the exact destination
+// object produced by this rclone copy so the coordinator can distinguish this
+// mutation's revision from a later concurrent remote write.
+func (e *RootExecutor) Upload(ctx context.Context, relPath string, expectedLocal domain.LocalFingerprint, expectedRemote domain.RemoteExpectation) (domain.RemoteFingerprint, error) {
 	if err := validateFilePathAndLocalExpectation(relPath, expectedLocal); err != nil {
-		return err
+		return domain.RemoteFingerprint{}, err
 	}
 	if err := validateFileRemoteExpectation(expectedRemote); err != nil {
-		return err
+		return domain.RemoteFingerprint{}, err
 	}
 	current, err := e.ObserveLocalFile(ctx, relPath)
 	if err != nil {
-		return err
+		return domain.RemoteFingerprint{}, err
 	}
 	if !domain.LocalEquivalent(current, expectedLocal) {
-		return fmt.Errorf("local upload precondition failed for %q", relPath)
+		return domain.RemoteFingerprint{}, fmt.Errorf("local upload precondition failed for %q", relPath)
+	}
+
+	src, err := e.local.NewObject(ctx, relPath)
+	if err != nil {
+		return domain.RemoteFingerprint{}, fmt.Errorf("open local upload source %q: %w", relPath, err)
+	}
+	var dst fs.Object
+	dst, err = e.remote.NewObject(ctx, relPath)
+	if errors.Is(err, fs.ErrorObjectNotFound) {
+		dst = nil
+	} else if err != nil {
+		return domain.RemoteFingerprint{}, fmt.Errorf("resolve remote upload destination %q: %w", relPath, err)
+	}
+	if expectedRemote.Absent {
+		if dst != nil {
+			return domain.RemoteFingerprint{}, fmt.Errorf("remote upload precondition failed for %q: expected absent", relPath)
+		}
+	} else {
+		if dst == nil {
+			return domain.RemoteFingerprint{}, fmt.Errorf("remote upload precondition failed for %q: expected present", relPath)
+		}
+		observed, err := remoteFileFingerprint(ctx, dst)
+		if err != nil {
+			return domain.RemoteFingerprint{}, err
+		}
+		if !remoteMatchesExpectation(observed, expectedRemote, domain.KindFile) {
+			return domain.RemoteFingerprint{}, fmt.Errorf("remote upload precondition failed for %q", relPath)
+		}
 	}
 
 	copyCtx := uploadContext(ctx, expectedRemote.ID, expectedRemote.Rev, expectedRemote.Absent)
-	if err := operations.CopyFile(copyCtx, e.remote, e.local, relPath, relPath); err != nil {
-		return fmt.Errorf("upload %q: %w", relPath, err)
+	newDst, err := operations.Copy(copyCtx, e.remote, dst, relPath, src)
+	if err != nil {
+		return domain.RemoteFingerprint{}, fmt.Errorf("upload %q: %w", relPath, err)
 	}
-	return nil
+	if newDst == nil {
+		return domain.RemoteFingerprint{}, fmt.Errorf("upload %q returned no destination object", relPath)
+	}
+	written, err := remoteFileFingerprint(copyCtx, newDst)
+	if err != nil {
+		return domain.RemoteFingerprint{}, fmt.Errorf("read upload result %q: %w", relPath, err)
+	}
+	return written, nil
 }
 
 // DownloadToTemp downloads an exact expected remote revision to a caller-owned
@@ -121,6 +157,24 @@ func (e *RootExecutor) DeleteRemoteFile(ctx context.Context, expected domain.Rem
 	_, err := e.remotePKU.Command(ctx, "sync-delete", []string{expected.ID}, map[string]string{"expected-rev": expected.Rev})
 	if err != nil {
 		return fmt.Errorf("delete remote file %q: %w", expected.ID, err)
+	}
+	return nil
+}
+
+// DeleteRemoteDir deletes the exact expected empty directory ID through the
+// backend's guarded sync primitive. The backend performs an immediate empty
+// listing check before the AnyShare recursive-delete call; callers must still
+// observe the postcondition because AnyShare has no atomic only-if-empty CAS.
+func (e *RootExecutor) DeleteRemoteDir(ctx context.Context, expected domain.RemoteExpectation) error {
+	if err := expected.Validate(); err != nil {
+		return fmt.Errorf("expected remote state: %w", err)
+	}
+	if expected.Absent || strings.TrimSpace(expected.Rev) != "" {
+		return fmt.Errorf("remote directory delete requires a present directory expectation without a revision")
+	}
+	_, err := e.remotePKU.Command(ctx, "sync-delete-dir", []string{expected.ID}, nil)
+	if err != nil {
+		return fmt.Errorf("delete remote directory %q: %w", expected.ID, err)
 	}
 	return nil
 }

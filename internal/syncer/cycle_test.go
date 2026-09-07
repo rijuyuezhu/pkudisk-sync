@@ -1,0 +1,604 @@
+package syncer
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
+	"github.com/rijuyuezhu/pkudisk-sync/internal/executor"
+	"github.com/rijuyuezhu/pkudisk-sync/internal/reconcile"
+	"github.com/rijuyuezhu/pkudisk-sync/internal/rootmarker"
+	"github.com/rijuyuezhu/pkudisk-sync/internal/store"
+)
+
+var _ DataPlane = (*executor.RootExecutor)(nil)
+var _ DataPlane = (*fakeDataPlane)(nil)
+
+func TestRunRootCycleInitialNestedTreeConvergesAndInitializes(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	data := &fakeDataPlane{
+		local: map[string]domain.LocalFingerprint{
+			"docs":       localDirFP(),
+			"docs/a.txt": localFileFP(5, 50),
+		},
+		remote: make(map[string]domain.RemoteFingerprint),
+	}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Blocked || !result.Initial || !result.Initialized || result.Applied != 2 {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if got := strings.Join(data.calls, ","); got != "ensure-remote-dir:docs,upload:docs/a.txt" {
+		t.Fatalf("mutation order = %q", got)
+	}
+	assertRootInitialized(t, state, root.ID, true)
+	baselines, err := state.ListBaselines(ctx, root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(baselines) != 2 {
+		t.Fatalf("baseline count = %d, want 2: %+v", len(baselines), baselines)
+	}
+	operations, err := state.ListOperations(ctx, root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 0 {
+		t.Fatalf("completed operations remain: %+v", operations)
+	}
+}
+
+func TestRunRootCycleInitialEqualContentCommitsWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	data := &fakeDataPlane{
+		local: map[string]domain.LocalFingerprint{"same.txt": localFileFP(4, 40)},
+		remote: map[string]domain.RemoteFingerprint{
+			"same.txt": remoteFileFP("doc-same", "rev-same", 4),
+		},
+		contentEqual: map[string]bool{"same.txt": true},
+	}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Initialized || result.ContentChecks != 1 || result.Applied != 0 {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if got := strings.Join(data.calls, ","); got != "compare:same.txt" {
+		t.Fatalf("calls = %q", got)
+	}
+	baseline, ok, err := state.GetBaseline(ctx, root.ID, "same.txt")
+	if err != nil || !ok {
+		t.Fatalf("baseline = %+v ok=%v err=%v", baseline, ok, err)
+	}
+	if baseline.Remote.ID != "doc-same" || baseline.Remote.Rev != "rev-same" {
+		t.Fatalf("baseline remote = %+v", baseline.Remote)
+	}
+}
+
+func TestRunRootCycleInitialConflictPersistsAndDoesNotInitialize(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	data := &fakeDataPlane{
+		local: map[string]domain.LocalFingerprint{"conflict.txt": localFileFP(4, 40)},
+		remote: map[string]domain.RemoteFingerprint{
+			"conflict.txt": remoteFileFP("doc-conflict", "rev-a", 4),
+		},
+		contentEqual: map[string]bool{"conflict.txt": false},
+	}
+
+	first, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Initialized || first.Conflicts != 1 || first.ContentChecks != 1 {
+		t.Fatalf("first result = %+v", first)
+	}
+	assertRootInitialized(t, state, root.ID, false)
+	conflicts, err := state.ListConflicts(ctx, root.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conflicts) != 1 || conflicts[0].RelPath != "conflict.txt" {
+		t.Fatalf("conflicts = %+v", conflicts)
+	}
+
+	second, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Initialized || second.Conflicts != 1 {
+		t.Fatalf("second result = %+v", second)
+	}
+	conflicts, err = state.ListConflicts(ctx, root.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conflicts) != 1 {
+		t.Fatalf("repeated cycle duplicated unresolved conflict: %+v", conflicts)
+	}
+}
+
+func TestRunRootCycleDropsStalePlannedIntentThenReplans(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	stale := domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationEnsureRemote,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "a.txt",
+		ExpectedLocal:  localFileFP(1, 10),
+		ExpectedRemote: domain.RemoteExpectation{Absent: true},
+	}
+	if _, err := state.CreateOperation(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	data := &fakeDataPlane{
+		local:  map[string]domain.LocalFingerprint{"a.txt": localFileFP(2, 20)},
+		remote: make(map[string]domain.RemoteFingerprint),
+	}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Initialized || result.Applied != 1 {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if got := strings.Join(data.calls, ","); got != "upload:a.txt" {
+		t.Fatalf("stale planned operation was replayed or extra mutation occurred: %q", got)
+	}
+	baseline, ok, err := state.GetBaseline(ctx, root.ID, "a.txt")
+	if err != nil || !ok {
+		t.Fatalf("baseline = %+v ok=%v err=%v", baseline, ok, err)
+	}
+	if baseline.Local != localFileFP(2, 20) {
+		t.Fatalf("baseline committed stale local state: %+v", baseline.Local)
+	}
+}
+
+func TestRunRootCycleRecoversAlreadyCompletedRunningDeleteWithoutReplay(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, true)
+	baseline := domain.Baseline{
+		SyncRootID: root.ID,
+		RelPath:    "gone.txt",
+		Local:      localFileFP(3, 30),
+		Remote:     remoteFileFP("doc-gone", "rev-gone", 3),
+	}
+	if err := state.PutBaseline(ctx, baseline); err != nil {
+		t.Fatal(err)
+	}
+	op, err := state.CreateOperation(ctx, domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationDeleteRemote,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "gone.txt",
+		ExpectedLocal:  domain.LocalFingerprint{},
+		ExpectedRemote: domain.RemoteExpectation{ID: "doc-gone", Rev: "rev-gone"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetOperationPhase(ctx, op.ID, domain.OperationRunning, "", true); err != nil {
+		t.Fatal(err)
+	}
+	data := &fakeDataPlane{local: make(map[string]domain.LocalFingerprint), remote: make(map[string]domain.RemoteFingerprint)}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Recovered != 1 || result.Applied != 0 || result.Blocked {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if len(data.calls) != 0 {
+		t.Fatalf("already-completed running delete was replayed: %+v", data.calls)
+	}
+	if _, ok, err := state.GetBaseline(ctx, root.ID, "gone.txt"); err != nil || ok {
+		t.Fatalf("deleted baseline remains: ok=%v err=%v", ok, err)
+	}
+	if operations, err := state.ListOperations(ctx, root.ID); err != nil || len(operations) != 0 {
+		t.Fatalf("recovered operation remains: %+v err=%v", operations, err)
+	}
+}
+
+func TestRunRootCycleMassDeleteGateHasNoSideEffects(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, true)
+	baseline := domain.Baseline{
+		SyncRootID: root.ID,
+		RelPath:    "keep-remote.txt",
+		Local:      localFileFP(3, 30),
+		Remote:     remoteFileFP("doc-keep", "rev-keep", 3),
+	}
+	if err := state.PutBaseline(ctx, baseline); err != nil {
+		t.Fatal(err)
+	}
+	data := &fakeDataPlane{
+		local: make(map[string]domain.LocalFingerprint),
+		remote: map[string]domain.RemoteFingerprint{
+			"keep-remote.txt": baseline.Remote,
+		},
+	}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Blocked || result.BlockReason != string(reconcile.BlockDeletePolicyUnset) {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if len(data.calls) != 0 {
+		t.Fatalf("blocked delete plan mutated data: %+v", data.calls)
+	}
+	if operations, err := state.ListOperations(ctx, root.ID); err != nil || len(operations) != 0 {
+		t.Fatalf("blocked plan journaled operations: %+v err=%v", operations, err)
+	}
+}
+
+func TestRunRootCycleDeletesChildrenBeforeParentDirectory(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, true)
+	dirRemote := remoteDirFP("dir-doc")
+	fileRemote := remoteFileFP("file-doc", "file-rev", 2)
+	for _, baseline := range []domain.Baseline{
+		{SyncRootID: root.ID, RelPath: "docs", Local: localDirFP(), Remote: dirRemote},
+		{SyncRootID: root.ID, RelPath: "docs/a.txt", Local: localFileFP(2, 20), Remote: fileRemote},
+	} {
+		if err := state.PutBaseline(ctx, baseline); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data := &fakeDataPlane{
+		local: make(map[string]domain.LocalFingerprint),
+		remote: map[string]domain.RemoteFingerprint{
+			"docs":       dirRemote,
+			"docs/a.txt": fileRemote,
+		},
+	}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Blocked || result.Applied != 2 {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if got := strings.Join(data.calls, ","); got != "delete-remote-file:docs/a.txt,delete-remote-dir:docs" {
+		t.Fatalf("delete order = %q", got)
+	}
+}
+
+func TestRunRootCycleMissingMarkerBlocksBeforeScan(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, false, false)
+	data := &fakeDataPlane{local: make(map[string]domain.LocalFingerprint), remote: make(map[string]domain.RemoteFingerprint)}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Blocked || result.BlockReason != string(reconcile.BlockRootUnhealthy) || result.BlockDetail == "" {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if data.scans != 0 || len(data.calls) != 0 {
+		t.Fatalf("unhealthy root reached data plane: scans=%d calls=%+v", data.scans, data.calls)
+	}
+}
+
+func newCycleRoot(t *testing.T, marker, initialized bool) (*store.Store, domain.SyncRoot) {
+	t.Helper()
+	ctx := context.Background()
+	base := t.TempDir()
+	localRoot := filepath.Join(base, "root")
+	if err := os.Mkdir(localRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Open(ctx, filepath.Join(base, "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = state.Close() })
+	root := domain.SyncRoot{
+		UUID:                "cycle-root-uuid",
+		LocalRoot:           localRoot,
+		RemoteName:          "pkudisk",
+		RemoteRoot:          "Personal/Sync",
+		Enabled:             true,
+		PollIntervalSeconds: 60,
+	}
+	root, err = state.CreateSyncRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marker {
+		if err := rootmarker.Ensure(root.LocalRoot, root.UUID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if initialized {
+		if err := state.MarkSyncRootInitialized(ctx, root.ID); err != nil {
+			t.Fatal(err)
+		}
+		root.Initialized = true
+	}
+	return state, root
+}
+
+func assertRootInitialized(t *testing.T, state *store.Store, rootID int64, want bool) {
+	t.Helper()
+	root, ok, err := state.GetSyncRoot(context.Background(), rootID)
+	if err != nil || !ok {
+		t.Fatalf("GetSyncRoot() = %+v ok=%v err=%v", root, ok, err)
+	}
+	if root.Initialized != want {
+		t.Fatalf("root initialized = %v, want %v", root.Initialized, want)
+	}
+}
+
+type fakeDataPlane struct {
+	local                map[string]domain.LocalFingerprint
+	remote               map[string]domain.RemoteFingerprint
+	contentEqual         map[string]bool
+	calls                []string
+	scans                int
+	revCounter           int
+	uploadPostOverride   map[string]domain.RemoteFingerprint
+	downloadPostOverride map[string]domain.LocalFingerprint
+}
+
+func (f *fakeDataPlane) ScanLocal(context.Context) (map[string]domain.LocalFingerprint, error) {
+	f.scans++
+	return cloneLocal(f.local), nil
+}
+
+func (f *fakeDataPlane) ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, error) {
+	f.scans++
+	return cloneRemote(f.remote), nil
+}
+
+func (f *fakeDataPlane) ObserveLocalEntry(_ context.Context, rel string) (domain.LocalFingerprint, error) {
+	return f.local[rel], nil
+}
+
+func (f *fakeDataPlane) ObserveRemoteEntry(_ context.Context, rel string) (domain.RemoteFingerprint, error) {
+	return f.remote[rel], nil
+}
+
+func (f *fakeDataPlane) CompareFileContent(_ context.Context, rel string, local domain.LocalFingerprint, remote domain.RemoteExpectation) (bool, error) {
+	if !domain.LocalEquivalent(f.local[rel], local) || !fakeRemoteMatches(f.remote[rel], remote, domain.KindFile) {
+		return false, fmt.Errorf("compare precondition mismatch for %q", rel)
+	}
+	f.calls = append(f.calls, "compare:"+rel)
+	return f.contentEqual[rel], nil
+}
+
+func (f *fakeDataPlane) Upload(_ context.Context, rel string, local domain.LocalFingerprint, remote domain.RemoteExpectation) (domain.RemoteFingerprint, error) {
+	if !domain.LocalEquivalent(f.local[rel], local) || !fakeRemoteMatches(f.remote[rel], remote, domain.KindFile) {
+		return domain.RemoteFingerprint{}, fmt.Errorf("upload precondition mismatch for %q", rel)
+	}
+	f.calls = append(f.calls, "upload:"+rel)
+	f.revCounter++
+	id := remote.ID
+	if remote.Absent {
+		id = "remote:" + rel
+	}
+	written := remoteFileFP(id, fmt.Sprintf("rev-%d", f.revCounter), local.Size)
+	f.remote[rel] = written
+	converged := true
+	if override, ok := f.uploadPostOverride[rel]; ok {
+		f.remote[rel] = override
+		converged = false
+	}
+	if f.contentEqual == nil {
+		f.contentEqual = make(map[string]bool)
+	}
+	f.contentEqual[rel] = converged
+	return written, nil
+}
+
+func (f *fakeDataPlane) EnsureRemoteDir(_ context.Context, rel string, expected domain.RemoteExpectation) error {
+	if !fakeRemoteMatches(f.remote[rel], expected, domain.KindDir) {
+		return fmt.Errorf("remote dir precondition mismatch for %q", rel)
+	}
+	f.calls = append(f.calls, "ensure-remote-dir:"+rel)
+	f.remote[rel] = remoteDirFP("dir:" + rel)
+	return nil
+}
+
+func (f *fakeDataPlane) EnsureLocalFile(_ context.Context, rel string, expectedLocal domain.LocalFingerprint, expectedRemote domain.RemoteExpectation) (domain.LocalFingerprint, error) {
+	if !domain.LocalEquivalent(f.local[rel], expectedLocal) || !fakeRemoteMatches(f.remote[rel], expectedRemote, domain.KindFile) {
+		return domain.LocalFingerprint{}, fmt.Errorf("local file precondition mismatch for %q", rel)
+	}
+	f.calls = append(f.calls, "ensure-local-file:"+rel)
+	remote := f.remote[rel]
+	written := localFileFP(remote.Size, remote.MtimeUS*1000+1)
+	f.local[rel] = written
+	converged := true
+	if override, ok := f.downloadPostOverride[rel]; ok {
+		f.local[rel] = override
+		converged = false
+	}
+	if f.contentEqual == nil {
+		f.contentEqual = make(map[string]bool)
+	}
+	f.contentEqual[rel] = converged
+	return written, nil
+}
+
+func (f *fakeDataPlane) EnsureLocalDir(_ context.Context, rel string, expected domain.LocalFingerprint) error {
+	if !domain.LocalEquivalent(f.local[rel], expected) || expected.Present {
+		return fmt.Errorf("local dir precondition mismatch for %q", rel)
+	}
+	f.calls = append(f.calls, "ensure-local-dir:"+rel)
+	f.local[rel] = localDirFP()
+	return nil
+}
+
+func (f *fakeDataPlane) DeleteRemoteFile(_ context.Context, expected domain.RemoteExpectation) error {
+	rel, current, ok := f.findRemoteByID(expected.ID)
+	if !ok || !fakeRemoteMatches(current, expected, domain.KindFile) {
+		return fmt.Errorf("remote file delete precondition mismatch for %q", expected.ID)
+	}
+	f.calls = append(f.calls, "delete-remote-file:"+rel)
+	delete(f.remote, rel)
+	return nil
+}
+
+func (f *fakeDataPlane) DeleteRemoteDir(_ context.Context, expected domain.RemoteExpectation) error {
+	rel, current, ok := f.findRemoteByID(expected.ID)
+	if !ok || !fakeRemoteMatches(current, expected, domain.KindDir) {
+		return fmt.Errorf("remote dir delete precondition mismatch for %q", expected.ID)
+	}
+	prefix := rel + "/"
+	for child := range f.remote {
+		if strings.HasPrefix(child, prefix) {
+			return fmt.Errorf("remote dir %q is not empty", rel)
+		}
+	}
+	f.calls = append(f.calls, "delete-remote-dir:"+rel)
+	delete(f.remote, rel)
+	return nil
+}
+
+func (f *fakeDataPlane) DeleteLocal(_ context.Context, rel string, expected domain.LocalFingerprint) error {
+	if !domain.LocalEquivalent(f.local[rel], expected) {
+		return fmt.Errorf("local delete precondition mismatch for %q", rel)
+	}
+	if expected.Kind == domain.KindDir {
+		prefix := rel + "/"
+		for child := range f.local {
+			if strings.HasPrefix(child, prefix) {
+				return fmt.Errorf("local dir %q is not empty", rel)
+			}
+		}
+	}
+	f.calls = append(f.calls, "delete-local:"+rel)
+	delete(f.local, rel)
+	return nil
+}
+
+func (f *fakeDataPlane) findRemoteByID(id string) (string, domain.RemoteFingerprint, bool) {
+	for rel, remote := range f.remote {
+		if remote.ID == id {
+			return rel, remote, true
+		}
+	}
+	return "", domain.RemoteFingerprint{}, false
+}
+
+func cloneLocal(in map[string]domain.LocalFingerprint) map[string]domain.LocalFingerprint {
+	out := make(map[string]domain.LocalFingerprint, len(in))
+	for rel, fp := range in {
+		out[rel] = fp
+	}
+	return out
+}
+
+func cloneRemote(in map[string]domain.RemoteFingerprint) map[string]domain.RemoteFingerprint {
+	out := make(map[string]domain.RemoteFingerprint, len(in))
+	for rel, fp := range in {
+		out[rel] = fp
+	}
+	return out
+}
+
+func fakeRemoteMatches(current domain.RemoteFingerprint, expected domain.RemoteExpectation, kind domain.EntryKind) bool {
+	if expected.Absent {
+		return !current.Present
+	}
+	if !current.Present || current.Kind != kind || current.ID != expected.ID {
+		return false
+	}
+	if kind == domain.KindFile {
+		return current.Rev == expected.Rev
+	}
+	return expected.Rev == ""
+}
+
+func localFileFP(size, mtime int64) domain.LocalFingerprint {
+	return domain.LocalFingerprint{Present: true, Kind: domain.KindFile, Size: size, MtimeNS: mtime}
+}
+
+func localDirFP() domain.LocalFingerprint {
+	return domain.LocalFingerprint{Present: true, Kind: domain.KindDir}
+}
+
+func remoteFileFP(id, rev string, size int64) domain.RemoteFingerprint {
+	return domain.RemoteFingerprint{Present: true, Kind: domain.KindFile, ID: id, Rev: rev, Size: size, MtimeUS: size + 100}
+}
+
+func remoteDirFP(id string) domain.RemoteFingerprint {
+	return domain.RemoteFingerprint{Present: true, Kind: domain.KindDir, ID: id, MtimeUS: 100}
+}
+
+func TestRunRootCycleDoesNotCommitUploadIfRemoteChangesAfterCopy(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	data := &fakeDataPlane{
+		local:  map[string]domain.LocalFingerprint{"race.txt": localFileFP(4, 40)},
+		remote: make(map[string]domain.RemoteFingerprint),
+		uploadPostOverride: map[string]domain.RemoteFingerprint{
+			"race.txt": remoteFileFP("remote:race.txt", "third-party-rev", 4),
+		},
+	}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+	if err == nil {
+		t.Fatalf("concurrent post-upload remote change was accepted: result=%+v", result)
+	}
+	if _, ok, getErr := state.GetBaseline(ctx, root.ID, "race.txt"); getErr != nil || ok {
+		t.Fatalf("baseline committed despite post-upload race: ok=%v err=%v", ok, getErr)
+	}
+	operations, listErr := state.ListOperations(ctx, root.ID)
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(operations) != 1 || operations[0].Phase != domain.OperationRecovering {
+		t.Fatalf("post-upload race did not leave recoverable intent: %+v", operations)
+	}
+	if operations[0].Attempts != 1 {
+		t.Fatalf("attempt count = %d, want 1", operations[0].Attempts)
+	}
+}
+
+func TestRunRootCycleDoesNotCommitDownloadIfLocalChangesAfterReplace(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, true)
+	data := &fakeDataPlane{
+		local:  make(map[string]domain.LocalFingerprint),
+		remote: map[string]domain.RemoteFingerprint{"race.txt": remoteFileFP("remote:race.txt", "rev-1", 4)},
+		downloadPostOverride: map[string]domain.LocalFingerprint{
+			"race.txt": localFileFP(4, 999999),
+		},
+	}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+	if err == nil {
+		t.Fatalf("concurrent post-download local change was accepted: result=%+v", result)
+	}
+	if _, ok, getErr := state.GetBaseline(ctx, root.ID, "race.txt"); getErr != nil || ok {
+		t.Fatalf("baseline committed despite post-download race: ok=%v err=%v", ok, getErr)
+	}
+	operations, listErr := state.ListOperations(ctx, root.ID)
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(operations) != 1 || operations[0].Phase != domain.OperationRecovering {
+		t.Fatalf("post-download race did not leave recoverable intent: %+v", operations)
+	}
+	if operations[0].Attempts != 1 {
+		t.Fatalf("attempt count = %d, want 1", operations[0].Attempts)
+	}
+}

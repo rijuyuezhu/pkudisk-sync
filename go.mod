@@ -4,7 +4,8 @@ go 1.26.0
 
 require (
 	github.com/rclone/rclone v1.75.1
-	github.com/rijuyuezhu/rclone-pkudisk v1.75.1-pkudisk.2.0.20260907133525-0ccaceabafa8
+	github.com/rijuyuezhu/rclone-pkudisk v1.75.1-pkudisk.2.0.20260907160413-cd624f111055
+	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.58.0
 )
 
@@ -61,7 +62,6 @@ require (
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.15.0 // indirect

@@ -65,9 +65,6 @@ func PlanFullSnapshot(syncRootID int64, initial bool, baselines []domain.Baselin
 		}
 		baselineByPath[baseline.RelPath] = baseline
 	}
-	if initial && len(baselineByPath) != 0 {
-		return RootPlan{}, fmt.Errorf("initial reconciliation requires an empty committed baseline")
-	}
 
 	paths := unionPaths(baselineByPath, snapshot.Local, snapshot.Remote)
 	plan := RootPlan{Initial: initial, Decisions: make([]domain.Decision, 0, len(paths))}
@@ -82,7 +79,26 @@ func PlanFullSnapshot(syncRootID int64, initial bool, baselines []domain.Baselin
 			err      error
 		)
 		if initial {
-			decision, err = PlanInitial(relPath, local, remote, content)
+			if baseline, exists := baselineByPath[relPath]; exists &&
+				domain.LocalEquivalent(baseline.Local, local) &&
+				domain.RemoteEquivalent(baseline.Remote, remote) {
+				decision = domain.Decision{
+					RelPath:        relPath,
+					Kind:           domain.DecisionNoop,
+					EntryKind:      presentKind(local, remote),
+					Reason:         "partial initial baseline still matches both sides",
+					ExpectedLocal:  local,
+					ExpectedRemote: remoteExpectation(remote),
+				}
+			} else {
+				decision, err = PlanInitial(relPath, local, remote, content)
+				if err == nil && !local.Present && !remote.Present {
+					if _, exists := baselineByPath[relPath]; exists {
+						decision.Kind = domain.DecisionDropBaseline
+						decision.Reason = "partial initial baseline path is now absent on both sides"
+					}
+				}
+			}
 		} else {
 			baseline, exists := baselineByPath[relPath]
 			if !exists {

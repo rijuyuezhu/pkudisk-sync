@@ -138,6 +138,44 @@ func TestOperationRoundTripAndPhaseTransitions(t *testing.T) {
 	}
 }
 
+func TestDeleteOperationOnlyDeletesPlannedIntent(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	root := createTestRoot(t, s)
+	op := domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationEnsureRemote,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "new.txt",
+		ExpectedLocal:  localFile(3, 33),
+		ExpectedRemote: domain.RemoteExpectation{Absent: true},
+	}
+	planned, err := s.CreateOperation(ctx, op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteOperation(ctx, planned.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.GetOperation(ctx, planned.ID); err != nil || ok {
+		t.Fatalf("planned operation still exists or lookup failed: ok=%v err=%v", ok, err)
+	}
+
+	running, err := s.CreateOperation(ctx, op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetOperationPhase(ctx, running.ID, domain.OperationRunning, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteOperation(ctx, running.ID); err == nil {
+		t.Fatal("running operation was deleted through planned-only helper")
+	}
+	if got, ok, err := s.GetOperation(ctx, running.ID); err != nil || !ok || got.Phase != domain.OperationRunning {
+		t.Fatalf("running operation changed after rejected delete: got=%+v ok=%v err=%v", got, ok, err)
+	}
+}
+
 func TestCommitBaselineAndDeleteOperationIsAtomic(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)

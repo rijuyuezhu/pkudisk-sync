@@ -105,6 +105,21 @@ func (s *Store) ListOperations(ctx context.Context, syncRootID int64) ([]domain.
 	return operations, nil
 }
 
+// DeleteOperation removes an intent only when the caller has proved no external
+// mutation started (for example, a planned intent whose preconditions are now
+// stale and must be replanned). Running/recovering intents must never be dropped
+// through this helper.
+func (s *Store) DeleteOperation(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return fmt.Errorf("operation ID must be positive")
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM operations WHERE id = ? AND phase = ?`, id, string(domain.OperationPlanned))
+	if err != nil {
+		return fmt.Errorf("delete planned operation: %w", err)
+	}
+	return requireOneRow(result, "planned operation")
+}
+
 // SetOperationPhase updates recovery state. incrementAttempts should be true
 // only when an actual external mutation attempt is about to start.
 func (s *Store) SetOperationPhase(ctx context.Context, id int64, phase domain.OperationPhase, lastError string, incrementAttempts bool) error {

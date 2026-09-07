@@ -6,11 +6,11 @@ The project directly embeds the Go `rclone-pkudisk` backend and rclone libraries
 
 ## Status
 
-The Phase B core is implemented: pure three-way reconciliation, initial merge, SQLite baseline/operation/conflict authority, deletion gates, crash-recovery decisions, and multiple selected sync roots. Work has started on **Phase C: in-process execution**.
+The Phase B core and the first complete Phase C root cycle are implemented: pure three-way reconciliation, initial merge, SQLite baseline/operation/conflict authority, deletion gates, crash recovery, multiple selected sync roots, full local/remote scans, guarded in-process file/directory mutations, root-marker safety, and durable journal-to-postcondition execution.
 
-The executor directly imports rclone and `rclone-pkudisk`; it starts no rclone subprocess and exposes no internal RC/IPC boundary. A live PKU Disk smoke test has validated expected-absent create, conditional update, stale-revision rejection, expected-absent collision rejection, exact-revision download, and exact-ID delete entirely in-process.
+The executor directly imports rclone and `rclone-pkudisk`; it starts no rclone subprocess and exposes no internal RC/IPC boundary. Live PKU Disk smoke tests have validated expected-absent create, conditional update, stale-revision rejection, expected-absent collision rejection, exact-revision download, exact-ID file delete, and guarded exact-ID empty-directory delete. Non-empty remote directories are refused and preserved.
 
-The required backend safety contract was merged into `rclone-pkudisk` main at `0ccacea` (`feat(pkudisk): add stateful sync safety contract (#16)`). The Go dependency is pinned to a pseudo-version containing that commit.
+The required backend safety contract is on `rclone-pkudisk` main through `cd624f1`: #16 adds stateful file CAS primitives and #17 adds guarded exact-ID empty-directory delete. The Go dependency is pinned to a pseudo-version containing `cd624f1`.
 
 ## Selected directory pairs
 

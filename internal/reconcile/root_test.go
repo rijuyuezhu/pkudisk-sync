@@ -194,12 +194,33 @@ func TestPlanFullSnapshotRejectsUnsafeSnapshotEncoding(t *testing.T) {
 	}
 }
 
-func TestPlanFullSnapshotInitialRejectsExistingBaseline(t *testing.T) {
-	_, err := PlanFullSnapshot(1, true, []domain.Baseline{
-		rootBaseline("a.txt", lf(1, 1), rf("a", "r", 1)),
-	}, completeSnapshot(nil, nil), DeletePolicy{})
-	if err == nil {
-		t.Fatal("expected initial plan with committed baseline to fail")
+func TestPlanFullSnapshotInitialAllowsPartialBaselinesWithoutDeleteInference(t *testing.T) {
+	baselines := []domain.Baseline{
+		rootBaseline("gone.txt", lf(1, 1), rf("gone", "r1", 1)),
+		rootBaseline("restore-local.txt", lf(2, 2), rf("restore", "r2", 2)),
+	}
+	snapshot := completeSnapshot(
+		map[string]domain.LocalFingerprint{
+			"restore-local.txt": lf(2, 2),
+		},
+		map[string]domain.RemoteFingerprint{},
+	)
+	plan, err := PlanFullSnapshot(1, true, baselines, snapshot, DeletePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.ProposedDeletes != 0 {
+		t.Fatalf("partial initial plan proposed %d deletes", plan.ProposedDeletes)
+	}
+	decisions := make(map[string]domain.Decision, len(plan.Decisions))
+	for _, decision := range plan.Decisions {
+		decisions[decision.RelPath] = decision
+	}
+	if decisions["gone.txt"].Kind != domain.DecisionDropBaseline {
+		t.Fatalf("gone baseline decision = %+v", decisions["gone.txt"])
+	}
+	if decisions["restore-local.txt"].Kind != domain.DecisionEnsureRemote || !decisions["restore-local.txt"].ExpectedRemote.Absent {
+		t.Fatalf("restore-local decision = %+v", decisions["restore-local.txt"])
 	}
 }
 
