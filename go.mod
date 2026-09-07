@@ -3,6 +3,7 @@ module github.com/rijuyuezhu/pkudisk-sync
 go 1.26.0
 
 require (
+	github.com/adrg/xdg v0.5.3
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/rclone/rclone v1.75.1
 	github.com/rijuyuezhu/rclone-pkudisk v1.75.1-pkudisk.2.0.20260907160413-cd624f111055
@@ -13,7 +14,6 @@ require (
 require (
 	github.com/Max-Sum/base32768 v0.0.0-20230304063302-18e6ce5945fd // indirect
 	github.com/abbot/go-http-auth v0.4.0 // indirect
-	github.com/adrg/xdg v0.5.3 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect

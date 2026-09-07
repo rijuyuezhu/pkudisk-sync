@@ -6,7 +6,7 @@ The project directly embeds the Go `rclone-pkudisk` backend and rclone libraries
 
 ## Status
 
-The Phase B/C core and the first Phase D daemon loop are implemented: pure three-way reconciliation, initial merge, SQLite baseline/operation/conflict authority, deletion gates, crash recovery, multiple selected sync roots, full local/remote scans, guarded in-process file/directory mutations, root-marker safety, durable journal-to-postcondition execution, recursive filesystem watcher hints, periodic repair polling, pause/resume observation, and dynamic discovery of newly configured roots.
+The Phase B/C core and the first Phase D product loop are implemented: pure three-way reconciliation, initial merge, SQLite baseline/operation/conflict authority, deletion gates, crash recovery, multiple selected sync roots, full local/remote scans, guarded in-process file/directory mutations, root-marker safety, durable journal-to-postcondition execution, recursive filesystem watcher hints, periodic repair polling, pause/resume observation, dynamic discovery of newly configured roots, and a minimal foreground CLI.
 
 The executor directly imports rclone and `rclone-pkudisk`; it starts no rclone subprocess and exposes no internal RC/IPC boundary. Live PKU Disk smoke tests have validated expected-absent create, conditional update, stale-revision rejection, expected-absent collision rejection, exact-revision download, exact-ID file delete, and guarded exact-ID empty-directory delete. Non-empty remote directories are refused and preserved.
 
@@ -28,7 +28,7 @@ For example:
 ~/Notes         <->  pkudisk:Personal/Notes
 ```
 
-The names are not hard-coded. Each root has its own baseline, operations, conflicts, marker, polling state, and enabled/paused state. `SetupRoot` establishes the marker and durable registration as one serialized product workflow. Local roots may not overlap each other, and two roots on the same rclone remote may not own overlapping remote paths. This prevents one file from being reconciled by two roots.
+The names are not hard-coded. Each root has its own baseline, operations, conflicts, marker, polling state, and enabled/paused state. `SetupRoot` first acquires an authoritative SQLite `BEGIN IMMEDIATE` ownership reservation, then establishes the local marker, then commits the durable root row. This serializes overlapping root creation across independent CLI/GUI processes without leaving markers behind for deterministic ownership conflicts. Local roots may not overlap each other, and two roots on the same rclone remote may not own overlapping remote paths.
 
 The daemon installs recursive local filesystem watches only as low-latency hints. Every hint runs the same complete root cycle; watcher setup/errors never become authoritative state. A root with `poll_interval_seconds = 0` uses the daemon safety default of 60 seconds, so periodic repair remains enabled even when no watcher event arrives. Disabled roots remain configured and are resumed without restarting the daemon.
 
@@ -43,14 +43,40 @@ The daemon installs recursive local filesystem watches only as low-latency hints
 - Durable operation records represent semantic external side effects. A `running` operation has unknown outcome after a crash and is never blindly replayed.
 - The embedded `rclone-pkudisk` backend remains responsible for OAuth, PKU Disk API semantics, byte transfer, multipart upload, and transport retries.
 
+## CLI
+
+`pkudisk-sync` owns its SQLite state and rclone configuration instead of reading the user's global rclone config. Show the platform-specific paths first:
+
+```bash
+pkudisk-sync paths
+```
+
+Configure a PKU Disk remote in the printed `rclone_config` file using the compatible `rclone-pkudisk` binary, for example:
+
+```bash
+rclone-pkudisk config --config /path/from/pkudisk-sync-paths/rclone.conf
+```
+
+Then select independent directory pairs and run the foreground daemon:
+
+```bash
+pkudisk-sync root add --local ~/Seafile/Data --remote pkudisk:Personal/Data
+pkudisk-sync root list
+pkudisk-sync root pause 1
+pkudisk-sync root resume 1
+pkudisk-sync daemon
+```
+
+`root add` refuses a local symlink root and refuses a remote name that is not configured as a `pkudisk` remote in the app-owned rclone config. `--poll 0` uses the daemon's 60-second repair default. The foreground daemon combines filesystem hints with full repair scans and, by default, blocks a cycle proposing more than 100 deletions. The fractional guard is disabled by default so ordinary deletes in small roots are not blocked; enable it explicitly with `--max-delete-fraction` when desired. At least one delete threshold must remain enabled.
+
 ## Planned implementation order
 
 1. Pure domain model and three-way planner.
 2. SQLite baseline / operation-intent / conflict persistence, including multiple selected sync roots.
 3. Deletion guards and crash-recovery decision model.
 4. In-process executor using the Go rclone / `rclone-pkudisk` APIs directly. **Implemented.**
-5. Native watchers and continuous multi-root daemon. **Core implemented; product CLI/service wiring remains.**
-6. Per-user service packaging and CLI/UI polish.
+5. Native watchers and continuous multi-root daemon. **Implemented with foreground CLI.**
+6. Per-user service packaging and CLI/UI polish. **Service installers and richer UX remain.**
 
 ## Development
 
