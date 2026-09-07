@@ -43,6 +43,64 @@ func TestOpenCreatesSchemaAndSyncRootsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDeleteSyncRootRequiresPausedIdleRootAndCascadesState(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	root := createTestRoot(t, s)
+	if err := s.DeleteSyncRoot(ctx, root.ID); err == nil {
+		t.Fatal("enabled sync root was removed")
+	}
+	if err := s.SetSyncRootEnabled(ctx, root.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	op, err := s.CreateOperation(ctx, domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationEnsureRemote,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "pending.txt",
+		ExpectedLocal:  localFile(1, 1),
+		ExpectedRemote: domain.RemoteExpectation{Absent: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSyncRoot(ctx, root.ID); err == nil {
+		t.Fatal("sync root with pending operation was removed")
+	}
+	if err := s.DeleteOperation(ctx, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutBaseline(ctx, domain.Baseline{
+		SyncRootID: root.ID,
+		RelPath:    "kept.txt",
+		Local:      localFile(1, 1),
+		Remote:     remoteFile("doc", "rev", 1),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateConflict(ctx, domain.Conflict{
+		SyncRootID: root.ID,
+		RelPath:    "conflict.txt",
+		Kind:       domain.ConflictBothModified,
+		Local:      localFile(1, 1),
+		Remote:     remoteFile("doc-conflict", "rev-conflict", 2),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSyncRoot(ctx, root.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.GetSyncRoot(ctx, root.ID); err != nil || ok {
+		t.Fatalf("removed root still present: ok=%v err=%v", ok, err)
+	}
+	if baselines, err := s.ListBaselines(ctx, root.ID); err != nil || len(baselines) != 0 {
+		t.Fatalf("cascaded baselines = %+v err=%v", baselines, err)
+	}
+	if conflicts, err := s.ListConflicts(ctx, root.ID, false); err != nil || len(conflicts) != 0 {
+		t.Fatalf("cascaded conflicts = %+v err=%v", conflicts, err)
+	}
+}
+
 func TestBaselineRoundTripAndUpsert(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)

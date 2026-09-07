@@ -219,6 +219,66 @@ func TestStatusAndConflictListExposeDurableAttentionState(t *testing.T) {
 	}
 }
 
+func TestRootRemoveRequiresStoppedDaemonAndPausedRootAndKeepsData(t *testing.T) {
+	ctx := context.Background()
+	paths := cliTestPaths(t)
+	var stdout bytes.Buffer
+	app := New(paths, &stdout, &bytes.Buffer{})
+	app.installRcloneConfig = func(string) error { return nil }
+	app.validateRemote = func(string) error { return nil }
+	app.newUUID = func() (string, error) { return "remove-cli-uuid", nil }
+	localRoot := t.TempDir()
+	userFile := filepath.Join(localRoot, "keep.txt")
+	if err := os.WriteFile(userFile, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Run(ctx, []string{"root", "add", "--local", localRoot, "--remote", "pkudisk:Personal/RemoveCLI"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Run(ctx, []string{"root", "remove", "1"}); err == nil || !strings.Contains(err.Error(), "must be paused") {
+		t.Fatalf("enabled root remove error = %v", err)
+	}
+	if err := app.Run(ctx, []string{"root", "pause", "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.PrepareRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	held, err := daemonlock.Acquire(paths.RuntimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removeErr := app.Run(ctx, []string{"root", "remove", "1"})
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if removeErr == nil || !strings.Contains(removeErr.Error(), "stopped") {
+		t.Fatalf("root remove while daemon lease held = %v", removeErr)
+	}
+
+	stdout.Reset()
+	if err := app.Run(ctx, []string{"root", "remove", "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "data left unchanged") {
+		t.Fatalf("root remove output = %q", stdout.String())
+	}
+	if _, err := os.ReadFile(userFile); err != nil {
+		t.Fatalf("root remove deleted user data: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(localRoot, rootmarker.FileName)); !os.IsNotExist(err) {
+		t.Fatalf("root remove left marker: %v", err)
+	}
+	state, err := store.Open(ctx, paths.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	if _, ok, err := state.GetSyncRoot(ctx, 1); err != nil || ok {
+		t.Fatalf("removed root still in store: ok=%v err=%v", ok, err)
+	}
+}
+
 func TestRootAddValidatesRemoteBeforeCreatingRootState(t *testing.T) {
 	paths := cliTestPaths(t)
 	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})

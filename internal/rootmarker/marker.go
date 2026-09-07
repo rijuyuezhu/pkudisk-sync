@@ -82,6 +82,19 @@ func Check(localRoot, uuid string) error {
 	return nil
 }
 
+// Remove deletes only a marker that currently proves the expected root UUID.
+// It never removes any other local content.
+func Remove(localRoot, uuid string) error {
+	if err := Check(localRoot, uuid); err != nil {
+		return err
+	}
+	marker := filepath.Join(localRoot, FileName)
+	if err := os.Remove(marker); err != nil {
+		return fmt.Errorf("remove sync root marker: %w", err)
+	}
+	return nil
+}
+
 func validateInputs(localRoot, uuid string) error {
 	if strings.TrimSpace(localRoot) == "" {
 		return fmt.Errorf("local root must not be empty")

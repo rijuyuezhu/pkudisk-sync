@@ -56,3 +56,46 @@ func SetupRoot(ctx context.Context, state *store.Store, root domain.SyncRoot) (d
 	}
 	return stored, nil
 }
+
+// RemoveRoot unregisters one selected directory pair without deleting any
+// local or remote user content. The caller must separately exclude a running
+// daemon for the duration of this workflow.
+func RemoveRoot(ctx context.Context, state *store.Store, id int64) (domain.SyncRoot, error) {
+	setupRootMu.Lock()
+	defer setupRootMu.Unlock()
+
+	if state == nil {
+		return domain.SyncRoot{}, fmt.Errorf("state store must not be nil")
+	}
+	root, ok, err := state.GetSyncRoot(ctx, id)
+	if err != nil {
+		return domain.SyncRoot{}, err
+	}
+	if !ok {
+		return domain.SyncRoot{}, fmt.Errorf("sync root %d not found", id)
+	}
+	if root.Enabled {
+		return domain.SyncRoot{}, fmt.Errorf("sync root %d must be paused before removal", id)
+	}
+	operations, err := state.ListOperations(ctx, id)
+	if err != nil {
+		return domain.SyncRoot{}, err
+	}
+	if len(operations) != 0 {
+		return domain.SyncRoot{}, fmt.Errorf("sync root %d has %d pending operations; reconcile or recover them before removal", id, len(operations))
+	}
+	if err := rootmarker.Remove(root.LocalRoot, root.UUID); err != nil {
+		return domain.SyncRoot{}, fmt.Errorf("remove sync root marker: %w", err)
+	}
+	if err := state.DeleteSyncRoot(ctx, id); err != nil {
+		restoreErr := rootmarker.Ensure(root.LocalRoot, root.UUID)
+		if restoreErr != nil {
+			return domain.SyncRoot{}, errors.Join(
+				fmt.Errorf("unregister sync root after marker removal: %w", err),
+				fmt.Errorf("restore sync root marker: %w", restoreErr),
+			)
+		}
+		return domain.SyncRoot{}, fmt.Errorf("unregister sync root after marker removal: %w", err)
+	}
+	return root, nil
+}

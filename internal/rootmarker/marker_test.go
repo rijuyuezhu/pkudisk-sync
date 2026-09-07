@@ -22,6 +22,25 @@ func TestEnsureAndCheck(t *testing.T) {
 	}
 }
 
+func TestRemoveOnlyDeletesMatchingMarker(t *testing.T) {
+	root := t.TempDir()
+	if err := Ensure(root, "root-uuid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Remove(root, "other-uuid"); err == nil {
+		t.Fatal("Remove accepted mismatched marker UUID")
+	}
+	if err := Check(root, "root-uuid"); err != nil {
+		t.Fatalf("mismatched Remove changed marker: %v", err)
+	}
+	if err := Remove(root, "root-uuid"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, FileName)); !os.IsNotExist(err) {
+		t.Fatalf("matching marker remains after Remove: %v", err)
+	}
+}
+
 func TestEnsureRefusesUnexpectedReservedPath(t *testing.T) {
 	root := t.TempDir()
 	marker := filepath.Join(root, FileName)

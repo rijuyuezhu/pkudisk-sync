@@ -107,6 +107,7 @@ func (a *Application) printUsage() {
 	fmt.Fprintln(a.stdout, "  root list                          List selected directory pairs")
 	fmt.Fprintln(a.stdout, "  root pause ID                      Pause one selected pair")
 	fmt.Fprintln(a.stdout, "  root resume ID                     Resume one selected pair")
+	fmt.Fprintln(a.stdout, "  root remove ID                     Unregister one paused pair without deleting data")
 	fmt.Fprintln(a.stdout, "  daemon                             Run the foreground sync daemon")
 	fmt.Fprintln(a.stdout, "  service install|start|stop|status  Manage the current user's background daemon")
 	fmt.Fprintln(a.stdout, "  service uninstall                  Remove the current user's background daemon")
@@ -327,7 +328,7 @@ func (a *Application) serviceManager() (userservice.Manager, error) {
 
 func (a *Application) runRoot(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("root requires one of: add, list, pause, resume")
+		return fmt.Errorf("root requires one of: add, list, pause, resume, remove")
 	}
 	switch args[0] {
 	case "add":
@@ -338,6 +339,8 @@ func (a *Application) runRoot(ctx context.Context, args []string) error {
 		return a.runRootEnabled(ctx, args[1:], false)
 	case "resume":
 		return a.runRootEnabled(ctx, args[1:], true)
+	case "remove":
+		return a.runRootRemove(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown root command %q", args[0])
 	}
@@ -478,6 +481,36 @@ func (a *Application) runRootEnabled(ctx context.Context, args []string, enabled
 		action = "resumed"
 	}
 	fmt.Fprintf(a.stdout, "%s root %d\n", action, id)
+	return nil
+}
+
+func (a *Application) runRootRemove(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("root remove requires exactly one root ID")
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil || id <= 0 {
+		return fmt.Errorf("invalid sync root ID %q", args[0])
+	}
+	if err := a.paths.PrepareRuntime(); err != nil {
+		return err
+	}
+	lease, err := daemonlock.Acquire(a.paths.RuntimeDir)
+	if err != nil {
+		return fmt.Errorf("root remove requires the foreground daemon and user service to be stopped: %w", err)
+	}
+	defer lease.Close()
+
+	state, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer state.Close()
+	removed, err := daemon.RemoveRoot(ctx, state, id)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(a.stdout, "removed root %d\t%s\t<->\t%s:%s\t(data left unchanged)\n", removed.ID, removed.LocalRoot, removed.RemoteName, removed.RemoteRoot)
 	return nil
 }
 

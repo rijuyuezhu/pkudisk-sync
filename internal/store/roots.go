@@ -207,6 +207,39 @@ func (s *Store) SetSyncRootEnabled(ctx context.Context, id int64, enabled bool) 
 	return nil
 }
 
+// DeleteSyncRoot removes one paused, idle root and lets SQLite cascade its
+// baseline/conflict history. It never performs filesystem or remote mutations.
+// The guarded DELETE is the final authority in case another process changes
+// the root after a caller's earlier preflight.
+func (s *Store) DeleteSyncRoot(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return fmt.Errorf("sync root ID must be positive")
+	}
+	result, err := s.db.ExecContext(ctx, `
+DELETE FROM sync_roots
+WHERE id = ?
+  AND enabled = 0
+  AND NOT EXISTS (
+      SELECT 1 FROM operations WHERE operations.sync_root_id = sync_roots.id
+  )`, id)
+	if err != nil {
+		return fmt.Errorf("delete idle sync root: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read deleted sync root count: %w", err)
+	}
+	if rows == 1 {
+		return nil
+	}
+	if _, ok, getErr := s.GetSyncRoot(ctx, id); getErr != nil {
+		return getErr
+	} else if !ok {
+		return fmt.Errorf("sync root %d not found", id)
+	}
+	return fmt.Errorf("sync root %d must be paused and have no pending operations before removal", id)
+}
+
 // MarkSyncRootInitialized permanently closes the non-destructive initial-pairing
 // phase for one root. Callers must do this only after a complete initial
 // reconciliation has no unresolved conflicts/content checks and every external
