@@ -3,6 +3,7 @@ module github.com/rijuyuezhu/pkudisk-sync
 go 1.26.0
 
 require (
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/rclone/rclone v1.75.1
 	github.com/rijuyuezhu/rclone-pkudisk v1.75.1-pkudisk.2.0.20260907160413-cd624f111055
 	golang.org/x/sys v0.47.0
