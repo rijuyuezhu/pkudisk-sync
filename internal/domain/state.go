@@ -2,6 +2,8 @@ package domain
 
 import (
 	"fmt"
+	"path"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -25,11 +27,20 @@ func (r SyncRoot) Validate() error {
 	if strings.TrimSpace(r.LocalRoot) == "" {
 		return fmt.Errorf("local root must not be empty")
 	}
+	if !filepath.IsAbs(r.LocalRoot) {
+		return fmt.Errorf("local root %q must be absolute", r.LocalRoot)
+	}
+	if filepath.Clean(r.LocalRoot) != r.LocalRoot {
+		return fmt.Errorf("local root %q must be canonical", r.LocalRoot)
+	}
 	if strings.TrimSpace(r.RemoteName) == "" {
 		return fmt.Errorf("remote name must not be empty")
 	}
 	if strings.TrimSpace(r.RemoteRoot) == "" {
 		return fmt.Errorf("remote root must not be empty")
+	}
+	if path.Clean(r.RemoteRoot) != r.RemoteRoot || strings.HasPrefix(r.RemoteRoot, "/") || r.RemoteRoot == "." || strings.HasPrefix(r.RemoteRoot, "../") {
+		return fmt.Errorf("remote root %q must be a canonical relative path", r.RemoteRoot)
 	}
 	if r.PollIntervalSeconds < 0 {
 		return fmt.Errorf("poll interval must be non-negative")

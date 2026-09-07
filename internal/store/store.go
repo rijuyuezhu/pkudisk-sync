@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -14,8 +15,9 @@ const schemaVersion = 1
 // Store is the durable semantic authority for sync roots, committed baselines,
 // external-side-effect intents, and conflicts.
 type Store struct {
-	db  *sql.DB
-	now func() time.Time
+	db         *sql.DB
+	now        func() time.Time
+	syncRootMu sync.Mutex
 }
 
 // Open opens or creates a SQLite state database and applies schema migrations.
