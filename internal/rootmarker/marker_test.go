@@ -40,6 +40,24 @@ func TestEnsureRefusesUnexpectedReservedPath(t *testing.T) {
 	}
 }
 
+func TestEnsureRejectsSymlinkRoot(t *testing.T) {
+	parent := t.TempDir()
+	realRoot := filepath.Join(parent, "real")
+	if err := os.Mkdir(realRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(parent, "link")
+	if err := os.Symlink(realRoot, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := Ensure(link, "root-uuid"); err == nil {
+		t.Fatal("symlink sync root was accepted")
+	}
+	if _, err := os.Lstat(filepath.Join(realRoot, FileName)); !os.IsNotExist(err) {
+		t.Fatalf("rejected symlink root created marker in target: %v", err)
+	}
+}
+
 func TestCheckRejectsMarkerSymlink(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target")

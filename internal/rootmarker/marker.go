@@ -56,12 +56,12 @@ func Check(localRoot, uuid string) error {
 	if err := validateInputs(localRoot, uuid); err != nil {
 		return err
 	}
-	rootInfo, err := os.Stat(localRoot)
+	rootInfo, err := os.Lstat(localRoot)
 	if err != nil {
 		return fmt.Errorf("stat sync root: %w", err)
 	}
-	if !rootInfo.IsDir() {
-		return fmt.Errorf("sync root %q is not a directory", localRoot)
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return fmt.Errorf("sync root %q must be a real directory", localRoot)
 	}
 
 	marker := filepath.Join(localRoot, FileName)

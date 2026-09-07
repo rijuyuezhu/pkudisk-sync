@@ -33,7 +33,7 @@ func TestSetupRootCreatesMarkerAndDurableRoot(t *testing.T) {
 	}
 }
 
-func TestSetupRootPreflightsOwnershipBeforeCreatingMarker(t *testing.T) {
+func TestSetupRootReservesOwnershipBeforeCreatingMarker(t *testing.T) {
 	ctx := context.Background()
 	state := openDaemonTestStore(t)
 	first := daemonTestRoot(t, "root-1", "Personal/Data")

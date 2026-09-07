@@ -11,44 +11,119 @@ import (
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
 )
 
-// ValidateSyncRootCandidate performs the no-side-effect validation used by the
-// product setup workflow before it creates the local root marker.
-func (s *Store) ValidateSyncRootCandidate(ctx context.Context, root domain.SyncRoot) error {
-	if err := validateNewSyncRoot(root); err != nil {
-		return err
-	}
-	s.syncRootMu.Lock()
-	defer s.syncRootMu.Unlock()
-	return s.checkSyncRootOwnership(ctx, root)
+// SyncRootCreateReservation holds SQLite's writer reservation across the
+// product-level marker setup. Close rolls the transaction back unless Commit
+// has completed successfully.
+type SyncRootCreateReservation struct {
+	conn     *sql.Conn
+	root     domain.SyncRoot
+	finished bool
+	muUnlock func()
 }
 
-func (s *Store) CreateSyncRoot(ctx context.Context, root domain.SyncRoot) (domain.SyncRoot, error) {
+// PrepareSyncRootCreate performs the authoritative ownership check under
+// SQLite BEGIN IMMEDIATE. Callers may establish external prerequisites (the
+// root marker) while this reservation is held, then Commit the durable row.
+func (s *Store) PrepareSyncRootCreate(ctx context.Context, root domain.SyncRoot) (*SyncRootCreateReservation, error) {
 	if err := validateNewSyncRoot(root); err != nil {
-		return domain.SyncRoot{}, err
+		return nil, err
 	}
 	s.syncRootMu.Lock()
-	defer s.syncRootMu.Unlock()
-	if err := s.checkSyncRootOwnership(ctx, root); err != nil {
-		return domain.SyncRoot{}, err
+	unlocked := false
+	unlock := func() {
+		if !unlocked {
+			unlocked = true
+			s.syncRootMu.Unlock()
+		}
+	}
+
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		unlock()
+		return nil, fmt.Errorf("acquire sync root write connection: %w", err)
+	}
+	fail := func(err error) (*SyncRootCreateReservation, error) {
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		_ = conn.Close()
+		unlock()
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		_ = conn.Close()
+		unlock()
+		return nil, fmt.Errorf("begin sync root write transaction: %w", err)
+	}
+	roots, err := listSyncRoots(ctx, conn)
+	if err != nil {
+		return fail(err)
+	}
+	if err := checkSyncRootOwnershipAgainst(roots, root); err != nil {
+		return fail(err)
 	}
 	if root.CreatedAt.IsZero() {
 		root.CreatedAt = s.now()
 	} else {
 		root.CreatedAt = root.CreatedAt.UTC()
 	}
+	return &SyncRootCreateReservation{conn: conn, root: root, muUnlock: unlock}, nil
+}
 
-	result, err := s.db.ExecContext(ctx, `
+// Commit inserts the prepared root and commits the SQLite transaction. If this
+// returns an error, callers must treat the durable outcome as uncertain and
+// preserve any external prerequisite already established.
+func (r *SyncRootCreateReservation) Commit(ctx context.Context) (domain.SyncRoot, error) {
+	if r == nil || r.conn == nil || r.finished {
+		return domain.SyncRoot{}, fmt.Errorf("sync root create reservation is not active")
+	}
+	result, err := r.conn.ExecContext(ctx, `
 INSERT INTO sync_roots(uuid, local_root, remote_name, remote_root, enabled, initialized, poll_interval_seconds, created_at_ns)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-		root.UUID, root.LocalRoot, root.RemoteName, root.RemoteRoot, boolInt(root.Enabled), boolInt(root.Initialized), root.PollIntervalSeconds, root.CreatedAt.UnixNano())
+		r.root.UUID, r.root.LocalRoot, r.root.RemoteName, r.root.RemoteRoot, boolInt(r.root.Enabled), boolInt(r.root.Initialized), r.root.PollIntervalSeconds, r.root.CreatedAt.UnixNano())
 	if err != nil {
 		return domain.SyncRoot{}, fmt.Errorf("insert sync root: %w", err)
 	}
-	root.ID, err = result.LastInsertId()
+	r.root.ID, err = result.LastInsertId()
 	if err != nil {
 		return domain.SyncRoot{}, fmt.Errorf("read sync root ID: %w", err)
 	}
+	if _, err := r.conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return domain.SyncRoot{}, fmt.Errorf("commit sync root: %w", err)
+	}
+	root := r.root
+	r.finish()
 	return root, nil
+}
+
+func (r *SyncRootCreateReservation) Close() error {
+	if r == nil || r.finished {
+		return nil
+	}
+	_, rollbackErr := r.conn.ExecContext(context.Background(), "ROLLBACK")
+	r.finish()
+	if rollbackErr != nil {
+		return fmt.Errorf("rollback sync root create reservation: %w", rollbackErr)
+	}
+	return nil
+}
+
+func (r *SyncRootCreateReservation) finish() {
+	if r.finished {
+		return
+	}
+	r.finished = true
+	_ = r.conn.Close()
+	if r.muUnlock != nil {
+		r.muUnlock()
+	}
+}
+
+func (s *Store) CreateSyncRoot(ctx context.Context, root domain.SyncRoot) (domain.SyncRoot, error) {
+	reservation, err := s.PrepareSyncRootCreate(ctx, root)
+	if err != nil {
+		return domain.SyncRoot{}, err
+	}
+	defer reservation.Close()
+	return reservation.Commit(ctx)
 }
 
 func validateNewSyncRoot(root domain.SyncRoot) error {
@@ -82,7 +157,15 @@ FROM sync_roots WHERE id = ?`, id)
 }
 
 func (s *Store) ListSyncRoots(ctx context.Context) ([]domain.SyncRoot, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return listSyncRoots(ctx, s.db)
+}
+
+type rowsQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func listSyncRoots(ctx context.Context, q rowsQuerier) ([]domain.SyncRoot, error) {
+	rows, err := q.QueryContext(ctx, `
 SELECT id, uuid, local_root, remote_name, remote_root, enabled, initialized, poll_interval_seconds, created_at_ns
 FROM sync_roots ORDER BY id`)
 	if err != nil {
@@ -144,6 +227,10 @@ func (s *Store) checkSyncRootOwnership(ctx context.Context, candidate domain.Syn
 	if err != nil {
 		return err
 	}
+	return checkSyncRootOwnershipAgainst(roots, candidate)
+}
+
+func checkSyncRootOwnershipAgainst(roots []domain.SyncRoot, candidate domain.SyncRoot) error {
 	for _, existing := range roots {
 		if localRootsOverlap(existing.LocalRoot, candidate.LocalRoot) {
 			return fmt.Errorf("local sync root %q overlaps configured root %q", candidate.LocalRoot, existing.LocalRoot)

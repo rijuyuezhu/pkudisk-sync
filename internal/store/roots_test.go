@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
@@ -78,7 +79,67 @@ func TestCreateSyncRootRejectsOverlappingOwnership(t *testing.T) {
 	}
 }
 
-func TestValidateSyncRootCandidateRejectsOverlapWithoutMutation(t *testing.T) {
+func TestCreateSyncRootSerializesOwnershipAcrossStoreInstances(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	firstStore, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStore.Close()
+	secondStore, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+
+	localBase := t.TempDir()
+	first := testSyncRoot("one", filepath.Join(localBase, "one"), "pkudisk", "Personal/Shared")
+	second := testSyncRoot("two", filepath.Join(localBase, "two"), "pkudisk", "Personal/Shared/Child")
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, attempt := range []struct {
+		store *Store
+		root  domain.SyncRoot
+	}{{firstStore, first}, {secondStore, second}} {
+		wg.Add(1)
+		go func(attempt struct {
+			store *Store
+			root  domain.SyncRoot
+		}) {
+			defer wg.Done()
+			<-start
+			_, err := attempt.store.CreateSyncRoot(ctx, attempt.root)
+			results <- err
+		}(attempt)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	successes := 0
+	failures := 0
+	for err := range results {
+		if err == nil {
+			successes++
+		} else {
+			failures++
+		}
+	}
+	if successes != 1 || failures != 1 {
+		t.Fatalf("concurrent ownership results: successes=%d failures=%d", successes, failures)
+	}
+	roots, err := firstStore.ListSyncRoots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 1 {
+		t.Fatalf("durable roots after concurrent overlap = %+v", roots)
+	}
+}
+
+func TestPrepareSyncRootCreateRejectsOverlapWithoutMutation(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 	base := filepath.Join(t.TempDir(), "roots")
@@ -87,15 +148,17 @@ func TestValidateSyncRootCandidateRejectsOverlapWithoutMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	candidate := testSyncRoot("two", filepath.Join(base, "Work"), "pkudisk", "Personal/Data/Child")
-	if err := s.ValidateSyncRootCandidate(ctx, candidate); err == nil {
-		t.Fatal("overlapping candidate passed ownership preflight")
+	reservation, err := s.PrepareSyncRootCreate(ctx, candidate)
+	if err == nil {
+		_ = reservation.Close()
+		t.Fatal("overlapping candidate acquired ownership reservation")
 	}
 	roots, err := s.ListSyncRoots(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(roots) != 1 || roots[0].UUID != existing.UUID {
-		t.Fatalf("candidate preflight mutated durable roots: %+v", roots)
+		t.Fatalf("candidate reservation mutated durable roots: %+v", roots)
 	}
 }
 
