@@ -16,6 +16,7 @@ type SyncRoot struct {
 	RemoteName          string
 	RemoteRoot          string
 	Enabled             bool
+	Initialized         bool
 	PollIntervalSeconds int64
 	CreatedAt           time.Time
 }

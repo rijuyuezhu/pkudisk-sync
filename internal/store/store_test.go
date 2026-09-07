@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -29,7 +30,7 @@ func TestOpenCreatesSchemaAndSyncRootsRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("created sync root not found")
 	}
-	if got.UUID != root.UUID || got.LocalRoot != root.LocalRoot || got.RemoteName != root.RemoteName || got.RemoteRoot != root.RemoteRoot || got.Enabled != root.Enabled || got.PollIntervalSeconds != root.PollIntervalSeconds {
+	if got.UUID != root.UUID || got.LocalRoot != root.LocalRoot || got.RemoteName != root.RemoteName || got.RemoteRoot != root.RemoteRoot || got.Enabled != root.Enabled || got.Initialized != root.Initialized || got.PollIntervalSeconds != root.PollIntervalSeconds {
 		t.Fatalf("sync root round trip mismatch: got %+v want %+v", got, root)
 	}
 
@@ -323,5 +324,52 @@ func assertBaselineEqual(t *testing.T, got, want domain.Baseline) {
 	t.Helper()
 	if got != want {
 		t.Fatalf("baseline mismatch:\n got: %+v\nwant: %+v", got, want)
+	}
+}
+
+func TestMigrationV1ToV2KeepsExistingRootsUninitialized(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "state-v1.sqlite3")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, schemaV1); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO sync_roots(uuid, local_root, remote_name, remote_root, enabled, poll_interval_seconds, created_at_ns)
+VALUES('old-root', '/tmp/old-root', 'pkudisk', 'Personal/Old', 1, 60, 1)`); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA user_version = 1"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	root, ok, err := s.GetSyncRoot(ctx, 1)
+	if err != nil || !ok {
+		t.Fatalf("GetSyncRoot() after migration = %+v, %v, %v", root, ok, err)
+	}
+	if root.Initialized {
+		t.Fatal("pre-v2 root was incorrectly treated as fully initialized")
+	}
+	var version int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 {
+		t.Fatalf("schema version after migration = %d, want 2", version)
 	}
 }

@@ -119,3 +119,42 @@ func testSyncRoot(uuid, localRoot, remoteName, remoteRoot string) domain.SyncRoo
 		PollIntervalSeconds: 60,
 	}
 }
+
+func TestSyncRootInitializationLifecycle(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	root := createTestRoot(t, s)
+	if root.Initialized {
+		t.Fatal("new sync root unexpectedly starts initialized")
+	}
+
+	if err := s.MarkSyncRootInitialized(ctx, root.ID); err != nil {
+		t.Fatal(err)
+	}
+	initialized, ok, err := s.GetSyncRoot(ctx, root.ID)
+	if err != nil || !ok {
+		t.Fatalf("get initialized root = %+v, %v, %v", initialized, ok, err)
+	}
+	if !initialized.Initialized {
+		t.Fatal("root did not persist initialized state")
+	}
+
+	if err := s.SetSyncRootEnabled(ctx, root.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	paused, ok, err := s.GetSyncRoot(ctx, root.ID)
+	if err != nil || !ok {
+		t.Fatalf("get paused initialized root = %+v, %v, %v", paused, ok, err)
+	}
+	if paused.Enabled || !paused.Initialized {
+		t.Fatalf("pause changed initialization state: %+v", paused)
+	}
+}
+
+func TestCreateSyncRootRejectsPreinitializedRoot(t *testing.T) {
+	root := testSyncRoot("preinitialized", filepath.Join(t.TempDir(), "Data"), "pkudisk", "Personal/Data")
+	root.Initialized = true
+	if _, err := openTestStore(t).CreateSyncRoot(context.Background(), root); err == nil {
+		t.Fatal("expected preinitialized new root to be rejected")
+	}
+}

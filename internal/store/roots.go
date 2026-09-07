@@ -18,6 +18,9 @@ func (s *Store) CreateSyncRoot(ctx context.Context, root domain.SyncRoot) (domai
 	if root.ID != 0 {
 		return domain.SyncRoot{}, fmt.Errorf("new sync root must not already have an ID")
 	}
+	if root.Initialized {
+		return domain.SyncRoot{}, fmt.Errorf("new sync root must start uninitialized")
+	}
 	s.syncRootMu.Lock()
 	defer s.syncRootMu.Unlock()
 	if err := s.checkSyncRootOwnership(ctx, root); err != nil {
@@ -30,9 +33,9 @@ func (s *Store) CreateSyncRoot(ctx context.Context, root domain.SyncRoot) (domai
 	}
 
 	result, err := s.db.ExecContext(ctx, `
-INSERT INTO sync_roots(uuid, local_root, remote_name, remote_root, enabled, poll_interval_seconds, created_at_ns)
-VALUES(?, ?, ?, ?, ?, ?, ?)`,
-		root.UUID, root.LocalRoot, root.RemoteName, root.RemoteRoot, boolInt(root.Enabled), root.PollIntervalSeconds, root.CreatedAt.UnixNano())
+INSERT INTO sync_roots(uuid, local_root, remote_name, remote_root, enabled, initialized, poll_interval_seconds, created_at_ns)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		root.UUID, root.LocalRoot, root.RemoteName, root.RemoteRoot, boolInt(root.Enabled), boolInt(root.Initialized), root.PollIntervalSeconds, root.CreatedAt.UnixNano())
 	if err != nil {
 		return domain.SyncRoot{}, fmt.Errorf("insert sync root: %w", err)
 	}
@@ -48,7 +51,7 @@ func (s *Store) GetSyncRoot(ctx context.Context, id int64) (domain.SyncRoot, boo
 		return domain.SyncRoot{}, false, fmt.Errorf("sync root ID must be positive")
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, uuid, local_root, remote_name, remote_root, enabled, poll_interval_seconds, created_at_ns
+SELECT id, uuid, local_root, remote_name, remote_root, enabled, initialized, poll_interval_seconds, created_at_ns
 FROM sync_roots WHERE id = ?`, id)
 	root, err := scanSyncRoot(row)
 	if err == sql.ErrNoRows {
@@ -62,7 +65,7 @@ FROM sync_roots WHERE id = ?`, id)
 
 func (s *Store) ListSyncRoots(ctx context.Context) ([]domain.SyncRoot, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, uuid, local_root, remote_name, remote_root, enabled, poll_interval_seconds, created_at_ns
+SELECT id, uuid, local_root, remote_name, remote_root, enabled, initialized, poll_interval_seconds, created_at_ns
 FROM sync_roots ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list sync roots: %w", err)
@@ -101,6 +104,21 @@ func (s *Store) SetSyncRootEnabled(ctx context.Context, id int64, enabled bool) 
 		return fmt.Errorf("sync root %d not found", id)
 	}
 	return nil
+}
+
+// MarkSyncRootInitialized permanently closes the non-destructive initial-pairing
+// phase for one root. Callers must do this only after a complete initial
+// reconciliation has no unresolved conflicts/content checks and every external
+// mutation has been observed and committed.
+func (s *Store) MarkSyncRootInitialized(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return fmt.Errorf("sync root ID must be positive")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE sync_roots SET initialized = 1 WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("mark sync root initialized: %w", err)
+	}
+	return requireOneRow(result, "sync root")
 }
 
 func (s *Store) checkSyncRootOwnership(ctx context.Context, candidate domain.SyncRoot) error {
@@ -145,12 +163,13 @@ type rowScanner interface {
 
 func scanSyncRoot(row rowScanner) (domain.SyncRoot, error) {
 	var root domain.SyncRoot
-	var enabled int
+	var enabled, initialized int
 	var createdNS int64
-	if err := row.Scan(&root.ID, &root.UUID, &root.LocalRoot, &root.RemoteName, &root.RemoteRoot, &enabled, &root.PollIntervalSeconds, &createdNS); err != nil {
+	if err := row.Scan(&root.ID, &root.UUID, &root.LocalRoot, &root.RemoteName, &root.RemoteRoot, &enabled, &initialized, &root.PollIntervalSeconds, &createdNS); err != nil {
 		return domain.SyncRoot{}, err
 	}
 	root.Enabled = enabled != 0
+	root.Initialized = initialized != 0
 	root.CreatedAt = time.Unix(0, createdNS).UTC()
 	return root, nil
 }
