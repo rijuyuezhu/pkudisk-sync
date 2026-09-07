@@ -6,9 +6,11 @@ The project directly embeds the Go `rclone-pkudisk` backend and rclone libraries
 
 ## Status
 
-Development is currently in **Phase B: pure reconciliation engine**. This phase has no filesystem watcher, long-running service, GUI, or live PKU Disk executor. It is intentionally testable using only fake local/remote snapshots and SQLite state.
+The Phase B core is implemented: pure three-way reconciliation, initial merge, SQLite baseline/operation/conflict authority, deletion gates, crash-recovery decisions, and multiple selected sync roots. Work has started on **Phase C: in-process execution**.
 
-The required backend safety contract was merged into `rclone-pkudisk` main at `0ccacea` (`feat(pkudisk): add stateful sync safety contract (#16)`). The Go dependency used by this project must include that commit or a later compatible version.
+The executor directly imports rclone and `rclone-pkudisk`; it starts no rclone subprocess and exposes no internal RC/IPC boundary. A live PKU Disk smoke test has validated expected-absent create, conditional update, stale-revision rejection, expected-absent collision rejection, exact-revision download, and exact-ID delete entirely in-process.
+
+The required backend safety contract was merged into `rclone-pkudisk` main at `0ccacea` (`feat(pkudisk): add stateful sync safety contract (#16)`). The Go dependency is pinned to a pseudo-version containing that commit.
 
 ## Selected directory pairs
 
