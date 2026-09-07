@@ -11,15 +11,20 @@ import (
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
 )
 
+// ValidateSyncRootCandidate performs the no-side-effect validation used by the
+// product setup workflow before it creates the local root marker.
+func (s *Store) ValidateSyncRootCandidate(ctx context.Context, root domain.SyncRoot) error {
+	if err := validateNewSyncRoot(root); err != nil {
+		return err
+	}
+	s.syncRootMu.Lock()
+	defer s.syncRootMu.Unlock()
+	return s.checkSyncRootOwnership(ctx, root)
+}
+
 func (s *Store) CreateSyncRoot(ctx context.Context, root domain.SyncRoot) (domain.SyncRoot, error) {
-	if err := root.Validate(); err != nil {
+	if err := validateNewSyncRoot(root); err != nil {
 		return domain.SyncRoot{}, err
-	}
-	if root.ID != 0 {
-		return domain.SyncRoot{}, fmt.Errorf("new sync root must not already have an ID")
-	}
-	if root.Initialized {
-		return domain.SyncRoot{}, fmt.Errorf("new sync root must start uninitialized")
 	}
 	s.syncRootMu.Lock()
 	defer s.syncRootMu.Unlock()
@@ -44,6 +49,19 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
 		return domain.SyncRoot{}, fmt.Errorf("read sync root ID: %w", err)
 	}
 	return root, nil
+}
+
+func validateNewSyncRoot(root domain.SyncRoot) error {
+	if err := root.Validate(); err != nil {
+		return err
+	}
+	if root.ID != 0 {
+		return fmt.Errorf("new sync root must not already have an ID")
+	}
+	if root.Initialized {
+		return fmt.Errorf("new sync root must start uninitialized")
+	}
+	return nil
 }
 
 func (s *Store) GetSyncRoot(ctx context.Context, id int64) (domain.SyncRoot, bool, error) {
@@ -171,6 +189,9 @@ func scanSyncRoot(row rowScanner) (domain.SyncRoot, error) {
 	root.Enabled = enabled != 0
 	root.Initialized = initialized != 0
 	root.CreatedAt = time.Unix(0, createdNS).UTC()
+	if err := root.Validate(); err != nil {
+		return domain.SyncRoot{}, fmt.Errorf("invalid persisted sync root %d: %w", root.ID, err)
+	}
 	return root, nil
 }
 

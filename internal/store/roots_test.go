@@ -78,6 +78,41 @@ func TestCreateSyncRootRejectsOverlappingOwnership(t *testing.T) {
 	}
 }
 
+func TestValidateSyncRootCandidateRejectsOverlapWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	base := filepath.Join(t.TempDir(), "roots")
+	existing := testSyncRoot("one", filepath.Join(base, "Data"), "pkudisk", "Personal/Data")
+	if _, err := s.CreateSyncRoot(ctx, existing); err != nil {
+		t.Fatal(err)
+	}
+	candidate := testSyncRoot("two", filepath.Join(base, "Work"), "pkudisk", "Personal/Data/Child")
+	if err := s.ValidateSyncRootCandidate(ctx, candidate); err == nil {
+		t.Fatal("overlapping candidate passed ownership preflight")
+	}
+	roots, err := s.ListSyncRoots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 1 || roots[0].UUID != existing.UUID {
+		t.Fatalf("candidate preflight mutated durable roots: %+v", roots)
+	}
+}
+
+func TestListSyncRootsRejectsInvalidPersistedPollInterval(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	localRoot := filepath.Join(t.TempDir(), "Data")
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO sync_roots(uuid, local_root, remote_name, remote_root, enabled, initialized, poll_interval_seconds, created_at_ns)
+VALUES(?, ?, 'pkudisk', 'Personal/Data', 1, 0, ?, 1)`, "bad-poll", localRoot, int64(^uint64(0)>>1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ListSyncRoots(ctx); err == nil {
+		t.Fatal("invalid persisted poll interval was accepted")
+	}
+}
+
 func TestSetSyncRootEnabledPreservesSelection(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)

@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const maxPollIntervalSeconds int64 = (1<<63 - 1) / int64(time.Second)
+
 // SyncRoot is one independently reconciled local/remote root pair.
 type SyncRoot struct {
 	ID                  int64
@@ -45,6 +47,9 @@ func (r SyncRoot) Validate() error {
 	}
 	if r.PollIntervalSeconds < 0 {
 		return fmt.Errorf("poll interval must be non-negative")
+	}
+	if r.PollIntervalSeconds > maxPollIntervalSeconds {
+		return fmt.Errorf("poll interval exceeds time.Duration range")
 	}
 	return nil
 }
