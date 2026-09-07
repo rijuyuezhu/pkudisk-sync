@@ -81,6 +81,10 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 		return nil
 	case "paths":
 		return a.runPaths(args[1:])
+	case "status":
+		return a.runStatus(ctx, args[1:])
+	case "conflict":
+		return a.runConflict(ctx, args[1:])
 	case "root":
 		return a.runRoot(ctx, args[1:])
 	case "daemon":
@@ -97,6 +101,8 @@ func (a *Application) printUsage() {
 	fmt.Fprintln(a.stdout)
 	fmt.Fprintln(a.stdout, "Commands:")
 	fmt.Fprintln(a.stdout, "  paths                              Show app-owned state/config/cache/runtime paths")
+	fmt.Fprintln(a.stdout, "  status                             Summarize roots, operations, and conflicts")
+	fmt.Fprintln(a.stdout, "  conflict list [--root ID]          List unresolved conflicts")
 	fmt.Fprintln(a.stdout, "  root add --local PATH --remote R:P Add one selected directory pair")
 	fmt.Fprintln(a.stdout, "  root list                          List selected directory pairs")
 	fmt.Fprintln(a.stdout, "  root pause ID                      Pause one selected pair")
@@ -115,6 +121,146 @@ func (a *Application) runPaths(args []string) error {
 	fmt.Fprintf(a.stdout, "cache_dir\t%s\n", a.paths.CacheDir)
 	fmt.Fprintf(a.stdout, "runtime_dir\t%s\n", a.paths.RuntimeDir)
 	return nil
+}
+
+func (a *Application) runStatus(ctx context.Context, args []string) error {
+	if len(args) != 0 {
+		return fmt.Errorf("status takes no arguments")
+	}
+	state, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer state.Close()
+	roots, err := state.ListSyncRoots(ctx)
+	if err != nil {
+		return err
+	}
+	w := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "ID\tSTATE\tINIT\tPLANNED\tRUNNING\tRECOVERING\tBLOCKED\tCONFLICTS\tLOCAL\tREMOTE")
+	for _, root := range roots {
+		operations, err := state.ListOperations(ctx, root.ID)
+		if err != nil {
+			return err
+		}
+		conflicts, err := state.ListConflicts(ctx, root.ID, true)
+		if err != nil {
+			return err
+		}
+		counts := map[domain.OperationPhase]int{}
+		for _, operation := range operations {
+			counts[operation.Phase]++
+		}
+		rootState := "paused"
+		if root.Enabled {
+			rootState = "enabled"
+		}
+		initialized := "no"
+		if root.Initialized {
+			initialized = "yes"
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s:%s\n",
+			root.ID,
+			rootState,
+			initialized,
+			counts[domain.OperationPlanned],
+			counts[domain.OperationRunning],
+			counts[domain.OperationRecovering],
+			counts[domain.OperationBlocked],
+			len(conflicts),
+			root.LocalRoot,
+			root.RemoteName,
+			root.RemoteRoot,
+		)
+	}
+	return w.Flush()
+}
+
+func (a *Application) runConflict(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("conflict requires: list")
+	}
+	if args[0] != "list" {
+		return fmt.Errorf("unknown conflict command %q", args[0])
+	}
+	fs := flag.NewFlagSet("conflict list", flag.ContinueOnError)
+	fs.SetOutput(a.stderr)
+	rootID := fs.Int64("root", 0, "limit to one sync root ID")
+	if err := fs.Parse(args[1:]); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("conflict list takes no positional arguments")
+	}
+	if *rootID < 0 {
+		return fmt.Errorf("--root must be a positive root ID")
+	}
+
+	state, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer state.Close()
+	roots, err := state.ListSyncRoots(ctx)
+	if err != nil {
+		return err
+	}
+	if *rootID > 0 {
+		found := false
+		for _, root := range roots {
+			if root.ID == *rootID {
+				roots = []domain.SyncRoot{root}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("sync root %d not found", *rootID)
+		}
+	}
+	w := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "ID\tROOT\tKIND\tPATH\tLOCAL\tREMOTE\tCREATED")
+	for _, root := range roots {
+		conflicts, err := state.ListConflicts(ctx, root.ID, true)
+		if err != nil {
+			return err
+		}
+		for _, conflict := range conflicts {
+			fmt.Fprintf(w, "%d\t%d\t%s\t%s\t%s\t%s\t%s\n",
+				conflict.ID,
+				root.ID,
+				conflict.Kind,
+				conflict.RelPath,
+				describeLocalConflictState(conflict.Local),
+				describeRemoteConflictState(conflict.Remote),
+				conflict.CreatedAt.Local().Format(time.RFC3339),
+			)
+		}
+	}
+	return w.Flush()
+}
+
+func describeLocalConflictState(state domain.LocalFingerprint) string {
+	if !state.Present {
+		return "missing"
+	}
+	if state.Kind == domain.KindFile {
+		return fmt.Sprintf("file:%dB", state.Size)
+	}
+	return string(state.Kind)
+}
+
+func describeRemoteConflictState(state domain.RemoteFingerprint) string {
+	if !state.Present {
+		return "missing"
+	}
+	if state.Kind == domain.KindFile {
+		return fmt.Sprintf("file:%dB@%s", state.Size, state.Rev)
+	}
+	return string(state.Kind)
 }
 
 func (a *Application) runService(ctx context.Context, args []string) error {

@@ -12,6 +12,7 @@ import (
 	"github.com/rijuyuezhu/pkudisk-sync/internal/apppaths"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/daemon"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/daemonlock"
+	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/reconcile"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/rootmarker"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/store"
@@ -100,6 +101,121 @@ func TestRootAddListPauseResume(t *testing.T) {
 	_ = state.Close()
 	if err != nil || !ok || !resumed.Enabled {
 		t.Fatalf("resumed root = %+v, %v, %v", resumed, ok, err)
+	}
+}
+
+func TestStatusAndConflictListExposeDurableAttentionState(t *testing.T) {
+	ctx := context.Background()
+	paths := cliTestPaths(t)
+	var stdout bytes.Buffer
+	app := New(paths, &stdout, &bytes.Buffer{})
+	app.installRcloneConfig = func(string) error { return nil }
+	app.validateRemote = func(string) error { return nil }
+	app.newUUID = func() (string, error) { return "status-root-uuid", nil }
+	localRoot := t.TempDir()
+	if err := app.Run(ctx, []string{"root", "add", "--local", localRoot, "--remote", "pkudisk:Personal/Status"}); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := store.Open(ctx, paths.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := domain.LocalFingerprint{Present: true, Kind: domain.KindFile, Size: 12, MtimeNS: 123}
+	for _, op := range []domain.Operation{
+		{
+			SyncRootID:     1,
+			Kind:           domain.OperationEnsureRemote,
+			EntryKind:      domain.KindFile,
+			SrcPath:        "planned.txt",
+			ExpectedLocal:  local,
+			ExpectedRemote: domain.RemoteExpectation{Absent: true},
+		},
+		{
+			SyncRootID:     1,
+			Kind:           domain.OperationEnsureRemote,
+			EntryKind:      domain.KindFile,
+			SrcPath:        "running.txt",
+			ExpectedLocal:  local,
+			ExpectedRemote: domain.RemoteExpectation{Absent: true},
+			Phase:          domain.OperationRunning,
+			Attempts:       1,
+		},
+		{
+			SyncRootID:     1,
+			Kind:           domain.OperationEnsureRemote,
+			EntryKind:      domain.KindFile,
+			SrcPath:        "recovering.txt",
+			ExpectedLocal:  local,
+			ExpectedRemote: domain.RemoteExpectation{Absent: true},
+			Phase:          domain.OperationRecovering,
+			Attempts:       1,
+			LastError:      "outcome unknown",
+		},
+		{
+			SyncRootID:     1,
+			Kind:           domain.OperationEnsureRemote,
+			EntryKind:      domain.KindFile,
+			SrcPath:        "blocked.txt",
+			ExpectedLocal:  local,
+			ExpectedRemote: domain.RemoteExpectation{Absent: true},
+			Phase:          domain.OperationBlocked,
+			Attempts:       1,
+			LastError:      "needs attention",
+		},
+	} {
+		if _, err := state.CreateOperation(ctx, op); err != nil {
+			_ = state.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := state.CreateConflict(ctx, domain.Conflict{
+		SyncRootID: 1,
+		RelPath:    "conflict.txt",
+		Kind:       domain.ConflictBothModified,
+		Local:      local,
+		Remote: domain.RemoteFingerprint{
+			Present: true,
+			Kind:    domain.KindFile,
+			ID:      "doc-conflict",
+			Rev:     "rev-b",
+			Size:    13,
+		},
+	}); err != nil {
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout.Reset()
+	if err := app.Run(ctx, []string{"status"}); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("status output = %q", stdout.String())
+	}
+	fields := strings.Fields(lines[1])
+	if len(fields) < 10 {
+		t.Fatalf("status row fields = %#v", fields)
+	}
+	if fields[0] != "1" || fields[1] != "enabled" || fields[3] != "1" || fields[4] != "1" || fields[5] != "1" || fields[6] != "1" || fields[7] != "1" {
+		t.Fatalf("status row = %#v", fields)
+	}
+
+	stdout.Reset()
+	if err := app.Run(ctx, []string{"conflict", "list", "--root", "1"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"both-modified", "conflict.txt", "file:12B", "file:13B@rev-b"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("conflict output %q missing %q", stdout.String(), want)
+		}
+	}
+	if err := app.Run(ctx, []string{"conflict", "list", "--root", "999"}); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("unknown root conflict list error = %v", err)
 	}
 }
 

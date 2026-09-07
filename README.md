@@ -62,12 +62,15 @@ Then select independent directory pairs and run the foreground daemon:
 ```bash
 pkudisk-sync root add --local ~/Seafile/Data --remote pkudisk:Personal/Data
 pkudisk-sync root list
+pkudisk-sync status
+pkudisk-sync conflict list
+pkudisk-sync conflict list --root 1
 pkudisk-sync root pause 1
 pkudisk-sync root resume 1
 pkudisk-sync daemon
 ```
 
-`root add` refuses a local symlink root and refuses a remote name that is not configured as a `pkudisk` remote in the app-owned rclone config. `--poll 0` uses the daemon's 60-second repair default. The foreground daemon combines filesystem hints with full repair scans and, by default, blocks a cycle proposing more than 100 deletions. The fractional guard is disabled by default so ordinary deletes in small roots are not blocked; enable it explicitly with `--max-delete-fraction` when desired. At least one delete threshold must remain enabled. Only one daemon may own a user's runtime directory at a time; a second foreground/service instance fails immediately instead of reconciling concurrently.
+`root add` refuses a local symlink root and refuses a remote name that is not configured as a `pkudisk` remote in the app-owned rclone config. `status` and `conflict list` are read-only views of durable SQLite state, so they remain useful offline; they do not contact PKU Disk or mutate conflict records. A conflict is only marked resolved by reconciliation after the conflicting state is actually gone—there is intentionally no bookkeeping-only `conflict resolve` command. `--poll 0` uses the daemon's 60-second repair default. The foreground daemon combines filesystem hints with full repair scans and, by default, blocks a cycle proposing more than 100 deletions. The fractional guard is disabled by default so ordinary deletes in small roots are not blocked; enable it explicitly with `--max-delete-fraction` when desired. At least one delete threshold must remain enabled. Only one daemon may own a user's runtime directory at a time; a second foreground/service instance fails immediately instead of reconciling concurrently.
 
 To run the same daemon as a current-user background service:
 
