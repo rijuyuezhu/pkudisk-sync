@@ -6,7 +6,7 @@ require (
 	github.com/adrg/xdg v0.5.3
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/rclone/rclone v1.75.1
-	github.com/rijuyuezhu/rclone-pkudisk v1.75.1-pkudisk.2.0.20260907160413-cd624f111055
+	github.com/rijuyuezhu/rclone-pkudisk v1.75.1-pkudisk.3
 	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.58.0
 )

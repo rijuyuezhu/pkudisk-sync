@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/rijuyuezhu/pkudisk-sync/internal/apppaths"
+	"github.com/rijuyuezhu/pkudisk-sync/internal/buildinfo"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/daemon"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/daemonlock"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
@@ -82,6 +83,8 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 		return nil
 	case "paths":
 		return a.runPaths(args[1:])
+	case "version":
+		return a.runVersion(args[1:])
 	case "status":
 		return a.runStatus(ctx, args[1:])
 	case "conflict":
@@ -102,6 +105,7 @@ func (a *Application) printUsage() {
 	fmt.Fprintln(a.stdout)
 	fmt.Fprintln(a.stdout, "Commands:")
 	fmt.Fprintln(a.stdout, "  paths                              Show app-owned state/config/cache/runtime paths")
+	fmt.Fprintln(a.stdout, "  version                            Show build version and provenance")
 	fmt.Fprintln(a.stdout, "  status                             Summarize roots, operations, and conflicts")
 	fmt.Fprintln(a.stdout, "  conflict list [--root ID]          List unresolved conflicts")
 	fmt.Fprintln(a.stdout, "  conflict resolve ID --keep-local   Queue exact-state resolution using local data")
@@ -124,6 +128,16 @@ func (a *Application) runPaths(args []string) error {
 	fmt.Fprintf(a.stdout, "rclone_config\t%s\n", a.paths.RcloneConfig)
 	fmt.Fprintf(a.stdout, "cache_dir\t%s\n", a.paths.CacheDir)
 	fmt.Fprintf(a.stdout, "runtime_dir\t%s\n", a.paths.RuntimeDir)
+	return nil
+}
+
+func (a *Application) runVersion(args []string) error {
+	if len(args) != 0 {
+		return fmt.Errorf("version takes no arguments")
+	}
+	fmt.Fprintf(a.stdout, "pkudisk-sync %s\n", buildinfo.Version)
+	fmt.Fprintf(a.stdout, "commit\t%s\n", buildinfo.Commit)
+	fmt.Fprintf(a.stdout, "built\t%s\n", buildinfo.BuildDate)
 	return nil
 }
 

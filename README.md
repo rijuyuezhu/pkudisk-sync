@@ -10,7 +10,7 @@ The Phase B/C core and the first Phase D/E product loop are implemented: pure th
 
 The executor directly imports rclone and `rclone-pkudisk`; it starts no rclone subprocess and exposes no internal RC/IPC boundary. Live PKU Disk smoke tests have validated expected-absent create, conditional update, stale-revision rejection, expected-absent collision rejection, exact-revision download, exact-ID file delete, and guarded exact-ID empty-directory delete. Non-empty remote directories are refused and preserved.
 
-The required backend safety contract is on `rclone-pkudisk` main through `cd624f1`: #16 adds stateful file CAS primitives and #17 adds guarded exact-ID empty-directory delete. The Go dependency is pinned to a pseudo-version containing `cd624f1`.
+The required backend safety contract is released as `rclone-pkudisk v1.75.1-pkudisk.3`: #16 adds stateful file CAS primitives and #17 adds guarded exact-ID empty-directory delete. The Go dependency is pinned to that release tag rather than to a moving pseudo-version.
 
 ## Selected directory pairs
 
@@ -44,6 +44,12 @@ The daemon installs recursive local filesystem watches only as low-latency hints
 - The embedded `rclone-pkudisk` backend remains responsible for OAuth, PKU Disk API semantics, byte transfer, multipart upload, and transport retries.
 
 ## CLI
+
+Portable release archives target Linux, macOS, and Windows on both amd64 and arm64. After extracting an archive, move `pkudisk-sync` (or `pkudisk-sync.exe`) to a stable per-user executable path before installing the background service. Do not run `service install` from a temporary extraction/download directory: the native service definition records the executable's absolute path. Verify the installed binary with:
+
+```bash
+pkudisk-sync version
+```
 
 `pkudisk-sync` owns its SQLite state and rclone configuration instead of reading the user's global rclone config. Show the platform-specific paths first:
 
@@ -102,7 +108,7 @@ pkudisk-sync root remove 1
 3. Deletion guards and crash-recovery decision model.
 4. In-process executor using the Go rclone / `rclone-pkudisk` APIs directly. **Implemented.**
 5. Native watchers and continuous multi-root daemon. **Implemented with foreground CLI.**
-6. Per-user service packaging and CLI/UI polish. **Native Linux/macOS/Windows user-service control is implemented; richer UX and release packaging remain.**
+6. Per-user service packaging and CLI/UI polish. **Native Linux/macOS/Windows user-service control, explicit file-conflict resolution, and a six-target portable release pipeline are implemented; richer GUI UX and signed/native installers remain.**
 
 ## Development
 

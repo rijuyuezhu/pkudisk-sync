@@ -427,6 +427,22 @@ func TestPathsCommand(t *testing.T) {
 	}
 }
 
+func TestVersionCommandUsesDevelopmentDefaults(t *testing.T) {
+	var stdout bytes.Buffer
+	app := New(cliTestPaths(t), &stdout, &bytes.Buffer{})
+	if err := app.Run(context.Background(), []string{"version"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"pkudisk-sync dev", "commit\tunknown", "built\tunknown"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("version output %q missing %q", stdout.String(), want)
+		}
+	}
+	if err := app.Run(context.Background(), []string{"version", "extra"}); err == nil {
+		t.Fatal("version accepted positional arguments")
+	}
+}
+
 func TestDaemonWiresDeletePolicyAndRunner(t *testing.T) {
 	paths := cliTestPaths(t)
 	var stdout, stderr bytes.Buffer
