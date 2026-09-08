@@ -443,6 +443,66 @@ func TestVersionCommandUsesDevelopmentDefaults(t *testing.T) {
 	}
 }
 
+func TestRemoteConfigureUsesAppOwnedConfigAndDefaultsName(t *testing.T) {
+	paths := cliTestPaths(t)
+	var stdout bytes.Buffer
+	app := New(paths, &stdout, &bytes.Buffer{})
+	var gotPath, gotName string
+	app.configureRemote = func(_ context.Context, path, name string) error {
+		gotPath, gotName = path, name
+		return nil
+	}
+	if err := app.Run(context.Background(), []string{"remote", "configure"}); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != paths.RcloneConfig || gotName != "pkudisk" {
+		t.Fatalf("configureRemote path=%q name=%q", gotPath, gotName)
+	}
+	if info, err := os.Stat(filepath.Dir(paths.RcloneConfig)); err != nil || !info.IsDir() {
+		t.Fatalf("config directory was not prepared: info=%v err=%v", info, err)
+	}
+	if !strings.Contains(stdout.String(), "configured PKU Disk remote pkudisk") {
+		t.Fatalf("remote configure output = %q", stdout.String())
+	}
+
+	gotName = ""
+	if err := app.Run(context.Background(), []string{"remote", "configure", "school"}); err != nil {
+		t.Fatal(err)
+	}
+	if gotName != "school" {
+		t.Fatalf("custom remote name = %q", gotName)
+	}
+	if err := app.Run(context.Background(), []string{"remote", "configure", "a", "b"}); err == nil {
+		t.Fatal("remote configure accepted multiple names")
+	}
+}
+
+func TestRemoteConfigureRequiresStoppedDaemon(t *testing.T) {
+	paths := cliTestPaths(t)
+	if err := paths.PrepareRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := daemonlock.Acquire(paths.RuntimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+
+	called := false
+	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
+	app.configureRemote = func(context.Context, string, string) error {
+		called = true
+		return nil
+	}
+	err = app.Run(context.Background(), []string{"remote", "configure"})
+	if err == nil || !strings.Contains(err.Error(), "requires the foreground daemon and user service to be stopped") {
+		t.Fatalf("remote configure error = %v", err)
+	}
+	if called {
+		t.Fatal("remote configuration ran while daemon lease was held")
+	}
+}
+
 func TestDaemonWiresDeletePolicyAndRunner(t *testing.T) {
 	paths := cliTestPaths(t)
 	var stdout, stderr bytes.Buffer

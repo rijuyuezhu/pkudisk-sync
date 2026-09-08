@@ -41,6 +41,7 @@ type Application struct {
 
 	newUUID             func() (string, error)
 	installRcloneConfig func(string) error
+	configureRemote     func(context.Context, string, string) error
 	validateRemote      func(string) error
 	newRunner           func(*store.Store, reconcile.DeletePolicy, daemon.Reporter) (daemonRunner, error)
 	executablePath      func() (string, error)
@@ -60,6 +61,7 @@ func New(paths apppaths.Paths, stdout, stderr io.Writer) *Application {
 		stderr:              stderr,
 		newUUID:             randomUUID,
 		installRcloneConfig: executor.InstallRcloneConfig,
+		configureRemote:     executor.ConfigureRemote,
 		validateRemote: func(name string) error {
 			_, err := executor.RemoteConfig(name)
 			return err
@@ -85,6 +87,8 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 		return a.runPaths(args[1:])
 	case "version":
 		return a.runVersion(args[1:])
+	case "remote":
+		return a.runRemote(ctx, args[1:])
 	case "status":
 		return a.runStatus(ctx, args[1:])
 	case "conflict":
@@ -106,6 +110,7 @@ func (a *Application) printUsage() {
 	fmt.Fprintln(a.stdout, "Commands:")
 	fmt.Fprintln(a.stdout, "  paths                              Show app-owned state/config/cache/runtime paths")
 	fmt.Fprintln(a.stdout, "  version                            Show build version and provenance")
+	fmt.Fprintln(a.stdout, "  remote configure [NAME]            Configure or re-authenticate a PKU Disk remote")
 	fmt.Fprintln(a.stdout, "  status                             Summarize roots, operations, and conflicts")
 	fmt.Fprintln(a.stdout, "  conflict list [--root ID]          List unresolved conflicts")
 	fmt.Fprintln(a.stdout, "  conflict resolve ID --keep-local   Queue exact-state resolution using local data")
@@ -138,6 +143,38 @@ func (a *Application) runVersion(args []string) error {
 	fmt.Fprintf(a.stdout, "pkudisk-sync %s\n", buildinfo.Version)
 	fmt.Fprintf(a.stdout, "commit\t%s\n", buildinfo.Commit)
 	fmt.Fprintf(a.stdout, "built\t%s\n", buildinfo.BuildDate)
+	return nil
+}
+
+func (a *Application) runRemote(ctx context.Context, args []string) error {
+	if len(args) == 0 || args[0] != "configure" {
+		return fmt.Errorf("remote requires: configure [NAME]")
+	}
+	if len(args) > 2 {
+		return fmt.Errorf("remote configure accepts at most one remote name")
+	}
+	name := "pkudisk"
+	if len(args) == 2 {
+		name = strings.TrimSpace(args[1])
+		if name == "" {
+			return fmt.Errorf("remote name must not be empty")
+		}
+	}
+	if err := a.paths.PrepareRuntime(); err != nil {
+		return err
+	}
+	lease, err := daemonlock.Acquire(a.paths.RuntimeDir)
+	if err != nil {
+		return fmt.Errorf("remote configure requires the foreground daemon and user service to be stopped: %w", err)
+	}
+	defer lease.Close()
+	if err := a.paths.PrepareConfig(); err != nil {
+		return err
+	}
+	if err := a.configureRemote(ctx, a.paths.RcloneConfig, name); err != nil {
+		return err
+	}
+	fmt.Fprintf(a.stdout, "configured PKU Disk remote %s in %s\n", name, a.paths.RcloneConfig)
 	return nil
 }
 

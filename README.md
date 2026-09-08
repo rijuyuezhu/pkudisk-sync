@@ -51,16 +51,17 @@ Portable release archives target Linux, macOS, and Windows on both amd64 and arm
 pkudisk-sync version
 ```
 
-`pkudisk-sync` owns its SQLite state and rclone configuration instead of reading the user's global rclone config. Show the platform-specific paths first:
+`pkudisk-sync` owns its SQLite state and rclone configuration instead of reading the user's global rclone config. Configure OAuth directly through the embedded PKU Disk backend; no separate rclone/rclone-pkudisk binary is required:
 
 ```bash
 pkudisk-sync paths
+pkudisk-sync remote configure
 ```
 
-Configure a PKU Disk remote in the printed `rclone_config` file using the compatible `rclone-pkudisk` binary, for example:
+`remote configure` creates or re-authenticates the default remote named `pkudisk` and drives rclone's normal browser OAuth flow in-process. Stop the foreground daemon/user service before running it so the next daemon process loads the newly written token; the command enforces this with the same single-instance lease. A custom remote name is optional:
 
 ```bash
-rclone-pkudisk config --config /path/from/pkudisk-sync-paths/rclone.conf
+pkudisk-sync remote configure school
 ```
 
 Then select independent directory pairs and run the foreground daemon:

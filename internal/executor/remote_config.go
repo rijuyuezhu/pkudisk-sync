@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -71,6 +72,34 @@ func RemoteConfig(remoteName string) (configmap.Mapper, error) {
 		return nil, fmt.Errorf("find embedded pkudisk backend: %w", err)
 	}
 	return fs.ConfigMap(info.Prefix, info.Options, remoteName, nil), nil
+}
+
+// ConfigureRemote interactively creates or re-authenticates one PKU Disk
+// remote in pkudisk-sync's app-owned rclone config. The OAuth/browser flow is
+// driven by rclone and the embedded pkudisk backend directly; no rclone binary
+// or subprocess is involved.
+func ConfigureRemote(ctx context.Context, configPath, remoteName string) error {
+	if remoteName == "" {
+		return fmt.Errorf("remote name must not be empty")
+	}
+	if err := InstallRcloneConfig(configPath); err != nil {
+		return err
+	}
+
+	backendType := config.GetValue(remoteName, "type")
+	switch backendType {
+	case "":
+		if _, err := config.CreateRemote(ctx, remoteName, "pkudisk", nil, config.UpdateRemoteOpt{}); err != nil {
+			return fmt.Errorf("configure PKU Disk remote %q: %w", remoteName, err)
+		}
+	case "pkudisk":
+		if _, err := config.UpdateRemote(ctx, remoteName, nil, config.UpdateRemoteOpt{}); err != nil {
+			return fmt.Errorf("reconfigure PKU Disk remote %q: %w", remoteName, err)
+		}
+	default:
+		return fmt.Errorf("rclone remote %q has type %q, want pkudisk", remoteName, backendType)
+	}
+	return nil
 }
 
 func rcloneConfigInstalled() bool {
