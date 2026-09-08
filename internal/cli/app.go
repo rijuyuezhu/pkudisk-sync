@@ -404,8 +404,14 @@ func (a *Application) runService(ctx context.Context, args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("service requires exactly one of: install, uninstall, start, stop, status")
 	}
-	if (args[0] == "install" || args[0] == "start") && apppaths.OverridesActive() {
-		return fmt.Errorf("service %s requires default pkudisk-sync paths; unset PKUDISK_SYNC_* path overrides first", args[0])
+	if args[0] == "install" || args[0] == "start" {
+		servicePaths, err := a.servicePaths()
+		if err != nil {
+			return fmt.Errorf("resolve service paths: %w", err)
+		}
+		if a.paths != servicePaths {
+			return fmt.Errorf("service %s requires OS-native default pkudisk-sync paths; unset path overrides and restore the normal login environment first", args[0])
+		}
 	}
 	manager, err := a.serviceManager()
 	if err != nil {

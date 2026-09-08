@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -24,12 +25,13 @@ type launchctlManager struct {
 type commandRunnerDarwin func(context.Context, string, ...string) ([]byte, error)
 
 func newPlatformManager(executable string) (Manager, error) {
-	home, err := os.UserHomeDir()
+	current, err := user.Current()
 	if err != nil {
-		return nil, fmt.Errorf("resolve home directory: %w", err)
+		return nil, fmt.Errorf("resolve service user: %w", err)
 	}
+	home := current.HomeDir
 	if home == "" {
-		return nil, fmt.Errorf("home directory is unavailable")
+		return nil, fmt.Errorf("resolve service user home: empty home directory")
 	}
 	domain := "gui/" + strconv.Itoa(os.Getuid())
 	return &launchctlManager{

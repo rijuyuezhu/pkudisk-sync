@@ -17,19 +17,6 @@ const (
 	envRuntimeDir   = "PKUDISK_SYNC_RUNTIME_DIR"
 )
 
-// OverridesActive reports whether this process is using explicit PKUDISK_SYNC_*
-// path overrides. Service install/start reject them, while daemon --service
-// independently re-resolves ServiceDefault so inherited overrides cannot leak
-// into the supervised process.
-func OverridesActive() bool {
-	for _, name := range []string{envStateDB, envRcloneConfig, envCacheDir, envRuntimeDir} {
-		if os.Getenv(name) != "" {
-			return true
-		}
-	}
-	return false
-}
-
 // Paths are all per-user paths owned by pkudisk-sync. The embedded rclone
 // backend deliberately does not use the user's global rclone configuration.
 type Paths struct {
@@ -58,11 +45,16 @@ func Default() (Paths, error) {
 	return p.absolute()
 }
 
-// ServiceDefault returns the paths used by the installed login-managed daemon.
-// It deliberately ignores PKUDISK_SYNC_* overrides because a supervisor may
-// inherit a different environment from the shell that ran `service start`.
+// ServiceDefault returns the OS-native paths used by the installed
+// login-managed daemon. Unlike Default, it deliberately ignores both
+// PKUDISK_SYNC_* and XDG path overrides so a supervisor environment cannot
+// silently select a different lock, state database, or rclone config.
 func ServiceDefault() (Paths, error) {
-	return platformDefaults().absolute()
+	p, err := servicePlatformDefaults()
+	if err != nil {
+		return Paths{}, err
+	}
+	return p.absolute()
 }
 
 func platformDefaults() Paths {

@@ -680,6 +680,7 @@ func TestServiceCommandsWireNativeManager(t *testing.T) {
 	paths := cliTestPaths(t)
 	var stdout bytes.Buffer
 	app := New(paths, &stdout, &bytes.Buffer{})
+	app.servicePaths = func() (apppaths.Paths, error) { return paths, nil }
 	executable := filepath.Join(t.TempDir(), "bin", "pkudisk-sync")
 	if err := os.MkdirAll(filepath.Dir(executable), 0o755); err != nil {
 		t.Fatal(err)
@@ -724,6 +725,7 @@ func TestServiceStartRefusesForegroundDaemonBeforeManagerStart(t *testing.T) {
 	defer held.Close()
 
 	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
+	app.servicePaths = func() (apppaths.Paths, error) { return paths, nil }
 	app.executablePath = func() (string, error) { return filepath.Join(t.TempDir(), "pkudisk-sync"), nil }
 	fake := &fakeServiceManager{}
 	app.newService = func(string) (userservice.Manager, error) { return fake, nil }
@@ -756,6 +758,7 @@ func TestServiceInstallRefusesRunningDaemonBeforeManagerInstall(t *testing.T) {
 	defer held.Close()
 
 	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
+	app.servicePaths = func() (apppaths.Paths, error) { return paths, nil }
 	app.executablePath = func() (string, error) { return filepath.Join(t.TempDir(), "pkudisk-sync"), nil }
 	fake := &fakeServiceManager{}
 	app.newService = func(string) (userservice.Manager, error) { return fake, nil }
@@ -768,17 +771,20 @@ func TestServiceInstallRefusesRunningDaemonBeforeManagerInstall(t *testing.T) {
 	}
 }
 
-func TestServiceInstallAndStartRejectPathOverridesBeforeProvider(t *testing.T) {
+func TestServiceInstallAndStartRejectNonDefaultPathAuthorityBeforeProvider(t *testing.T) {
 	for _, command := range []string{"install", "start"} {
 		t.Run(command, func(t *testing.T) {
-			t.Setenv("PKUDISK_SYNC_STATE_DB", filepath.Join(t.TempDir(), "state.db"))
-			app := New(cliTestPaths(t), &bytes.Buffer{}, &bytes.Buffer{})
+			paths := cliTestPaths(t)
+			servicePaths := paths
+			servicePaths.StateDB = filepath.Join(t.TempDir(), "native", "state.db")
+			app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
+			app.servicePaths = func() (apppaths.Paths, error) { return servicePaths, nil }
 			app.executablePath = func() (string, error) {
-				t.Fatal("service provider resolution ran before override rejection")
+				t.Fatal("service provider resolution ran before path-authority rejection")
 				return "", nil
 			}
 			err := app.Run(context.Background(), []string{"service", command})
-			if err == nil || !strings.Contains(err.Error(), "requires default") {
+			if err == nil || !strings.Contains(err.Error(), "requires OS-native default") {
 				t.Fatalf("service %s error = %v", command, err)
 			}
 		})

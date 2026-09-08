@@ -6,10 +6,13 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/adrg/xdg"
 )
 
 func TestRenderSystemdUnitEscapesExecutablePath(t *testing.T) {
@@ -30,6 +33,31 @@ func TestRenderSystemdUnitEscapesExecutablePath(t *testing.T) {
 		if !strings.Contains(unit, required) {
 			t.Fatalf("unit missing %q:\n%s", required, unit)
 		}
+	}
+}
+
+func TestNewPlatformManagerUsesNativeSystemdUnitPath(t *testing.T) {
+	originalConfigHome := xdg.ConfigHome
+	defer func() { xdg.ConfigHome = originalConfigHome }()
+	base := t.TempDir()
+	xdg.ConfigHome = filepath.Join(base, "xdg-config")
+	t.Setenv("HOME", filepath.Join(base, "fake-home"))
+
+	manager, err := newPlatformManager("/opt/pkudisk-sync")
+	if err != nil {
+		t.Fatal(err)
+	}
+	systemd, ok := manager.(*systemdUserManager)
+	if !ok {
+		t.Fatalf("manager type = %T", manager)
+	}
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(current.HomeDir, ".config", "systemd", "user", systemdUnitName)
+	if systemd.unitPath != want {
+		t.Fatalf("unit path = %q, want native %q", systemd.unitPath, want)
 	}
 }
 

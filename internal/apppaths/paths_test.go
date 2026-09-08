@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/adrg/xdg"
 )
 
 func TestDefaultHonorsExplicitOverrides(t *testing.T) {
@@ -28,7 +30,7 @@ func TestDefaultHonorsExplicitOverrides(t *testing.T) {
 	}
 }
 
-func TestServiceDefaultIgnoresExplicitOverrides(t *testing.T) {
+func TestServiceDefaultIgnoresProcessPathOverrides(t *testing.T) {
 	want, err := ServiceDefault()
 	if err != nil {
 		t.Fatal(err)
@@ -38,26 +40,27 @@ func TestServiceDefaultIgnoresExplicitOverrides(t *testing.T) {
 	t.Setenv(envRcloneConfig, filepath.Join(base, "config", "override.conf"))
 	t.Setenv(envCacheDir, filepath.Join(base, "cache"))
 	t.Setenv(envRuntimeDir, filepath.Join(base, "runtime"))
+	t.Setenv("HOME", filepath.Join(base, "fake-home"))
+	t.Setenv("USERPROFILE", filepath.Join(base, "fake-profile"))
+	t.Setenv("LOCALAPPDATA", filepath.Join(base, "fake-local-app-data"))
+
+	originalState, originalConfig := xdg.StateHome, xdg.ConfigHome
+	originalCache, originalRuntime := xdg.CacheHome, xdg.RuntimeDir
+	defer func() {
+		xdg.StateHome, xdg.ConfigHome = originalState, originalConfig
+		xdg.CacheHome, xdg.RuntimeDir = originalCache, originalRuntime
+	}()
+	xdg.StateHome = filepath.Join(base, "xdg-state")
+	xdg.ConfigHome = filepath.Join(base, "xdg-config")
+	xdg.CacheHome = filepath.Join(base, "xdg-cache")
+	xdg.RuntimeDir = filepath.Join(base, "xdg-runtime")
 
 	got, err := ServiceDefault()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != want {
-		t.Fatalf("ServiceDefault() = %+v with overrides, want %+v", got, want)
-	}
-}
-
-func TestOverridesActive(t *testing.T) {
-	for _, name := range []string{envStateDB, envRcloneConfig, envCacheDir, envRuntimeDir} {
-		t.Setenv(name, "")
-	}
-	if OverridesActive() {
-		t.Fatal("OverridesActive() = true with no overrides")
-	}
-	t.Setenv(envRuntimeDir, filepath.Join(t.TempDir(), "runtime"))
-	if !OverridesActive() {
-		t.Fatal("OverridesActive() = false with runtime override")
+		t.Fatalf("ServiceDefault() = %+v with process overrides, want %+v", got, want)
 	}
 }
 

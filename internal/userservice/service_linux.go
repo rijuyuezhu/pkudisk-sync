@@ -8,10 +8,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
-
-	"github.com/adrg/xdg"
 )
 
 const systemdUnitName = "pkudisk-sync.service"
@@ -25,12 +24,17 @@ type systemdUserManager struct {
 }
 
 func newPlatformManager(executable string) (Manager, error) {
-	if xdg.ConfigHome == "" {
-		return nil, fmt.Errorf("XDG config home is unavailable")
+	current, err := user.Current()
+	if err != nil {
+		return nil, fmt.Errorf("resolve service user: %w", err)
+	}
+	home := current.HomeDir
+	if home == "" {
+		return nil, fmt.Errorf("resolve service user home: empty home directory")
 	}
 	return &systemdUserManager{
 		executable: executable,
-		unitPath:   filepath.Join(xdg.ConfigHome, "systemd", "user", systemdUnitName),
+		unitPath:   filepath.Join(home, ".config", "systemd", "user", systemdUnitName),
 		run:        runCommand,
 	}, nil
 }
