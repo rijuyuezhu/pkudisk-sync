@@ -2,10 +2,13 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/rclone/rclone/fs"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/rootmarker"
 )
@@ -96,4 +99,59 @@ func TestScanLocalRejectsInternalTempDirectory(t *testing.T) {
 	if _, err := exec.ScanLocal(context.Background()); err == nil {
 		t.Fatal("reserved internal temp directory accepted")
 	}
+}
+
+func TestScanRemoteReportsMissingSelectedRootWithoutClaimingCompleteness(t *testing.T) {
+	exec := &RootExecutor{remote: &listOnlyFS{list: func(_ context.Context, dir string) (fs.DirEntries, error) {
+		if dir != "" {
+			t.Fatalf("unexpected list dir %q", dir)
+		}
+		return nil, fs.ErrorDirNotFound
+	}}}
+
+	got, present, err := exec.ScanRemote(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if present {
+		t.Fatal("missing selected remote root reported present")
+	}
+	if len(got) != 0 {
+		t.Fatalf("missing selected remote root returned entries: %+v", got)
+	}
+}
+
+func TestScanRemoteStillFailsWhenListedChildDisappears(t *testing.T) {
+	child := fs.NewDir("child", time.Unix(1, 0)).SetID("child-id")
+	exec := &RootExecutor{remote: &listOnlyFS{list: func(_ context.Context, dir string) (fs.DirEntries, error) {
+		switch dir {
+		case "":
+			return fs.DirEntries{child}, nil
+		case "child":
+			return nil, fs.ErrorDirNotFound
+		default:
+			t.Fatalf("unexpected list dir %q", dir)
+			return nil, nil
+		}
+	}}}
+
+	got, present, err := exec.ScanRemote(context.Background())
+	if err == nil || !errors.Is(err, fs.ErrorDirNotFound) {
+		t.Fatalf("ScanRemote() error = %v, want wrapped ErrorDirNotFound", err)
+	}
+	if !present {
+		t.Fatal("existing selected root reported absent after child disappeared")
+	}
+	if got != nil {
+		t.Fatalf("incomplete remote scan returned a snapshot: %+v", got)
+	}
+}
+
+type listOnlyFS struct {
+	fs.Fs
+	list func(context.Context, string) (fs.DirEntries, error)
+}
+
+func (f *listOnlyFS) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	return f.list(ctx, dir)
 }

@@ -113,6 +113,90 @@ func TestRunRootCycleInitialNestedTreeConvergesAndInitializes(t *testing.T) {
 	}
 }
 
+func TestRunRootCycleInitialMissingRemoteRootAndEmptyLocalStaysDormant(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	data := &fakeDataPlane{
+		local:             make(map[string]domain.LocalFingerprint),
+		remote:            make(map[string]domain.RemoteFingerprint),
+		remoteRootMissing: true,
+	}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Initial || result.Initialized || !result.Skipped || result.Applied != 0 {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	assertRootInitialized(t, state, root.ID, false)
+	if len(data.calls) != 0 {
+		t.Fatalf("dormant empty root performed mutations: %v", data.calls)
+	}
+}
+
+func TestRunRootCycleInitialMissingRemoteRootCanCreateIt(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	data := &fakeDataPlane{
+		local:             map[string]domain.LocalFingerprint{"new.txt": localFileFP(3, 30)},
+		remote:            make(map[string]domain.RemoteFingerprint),
+		remoteRootMissing: true,
+	}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Initial || !result.Initialized || result.Applied != 1 {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if data.remoteRootMissing {
+		t.Fatal("successful initial upload did not establish the remote root")
+	}
+	if got := strings.Join(data.calls, ","); got != "upload:new.txt" {
+		t.Fatalf("calls = %q", got)
+	}
+	assertRootInitialized(t, state, root.ID, true)
+}
+
+func TestRunRootCycleInitializedMissingRemoteRootFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	data := &fakeDataPlane{
+		local:  map[string]domain.LocalFingerprint{"keep.txt": localFileFP(4, 40)},
+		remote: make(map[string]domain.RemoteFingerprint),
+	}
+	first, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10})
+	if err != nil || !first.Initialized {
+		t.Fatalf("initial cycle = %+v err=%v", first, err)
+	}
+	callsBefore := len(data.calls)
+	data.remote = make(map[string]domain.RemoteFingerprint)
+	data.remoteRootMissing = true
+
+	second, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10})
+	if err == nil || !strings.Contains(err.Error(), "selected remote root is missing after initialization") {
+		t.Fatalf("missing initialized root error = %v", err)
+	}
+	if second.Applied != 0 || second.Blocked {
+		t.Fatalf("missing initialized root result = %+v", second)
+	}
+	if len(data.calls) != callsBefore {
+		t.Fatalf("missing initialized root performed mutations: %v", data.calls[callsBefore:])
+	}
+	if _, ok := data.local["keep.txt"]; !ok {
+		t.Fatal("missing initialized remote root deleted local data")
+	}
+	operations, listErr := state.ListOperations(ctx, root.ID)
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(operations) != 0 {
+		t.Fatalf("missing initialized root journaled operations: %+v", operations)
+	}
+}
+
 func TestRunRootCycleInitialEqualContentCommitsWithoutMutation(t *testing.T) {
 	ctx := context.Background()
 	state, root := newCycleRoot(t, true, false)
@@ -634,6 +718,7 @@ func assertRootInitialized(t *testing.T, state *store.Store, rootID int64, want 
 type fakeDataPlane struct {
 	local                map[string]domain.LocalFingerprint
 	remote               map[string]domain.RemoteFingerprint
+	remoteRootMissing    bool
 	contentEqual         map[string]bool
 	calls                []string
 	scans                int
@@ -658,9 +743,9 @@ func (f *fakeDataPlane) ScanLocal(context.Context) (map[string]domain.LocalFinge
 	return cloneLocal(f.local), nil
 }
 
-func (f *fakeDataPlane) ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, error) {
+func (f *fakeDataPlane) ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error) {
 	f.scans++
-	return cloneRemote(f.remote), nil
+	return cloneRemote(f.remote), !f.remoteRootMissing, nil
 }
 
 func (f *fakeDataPlane) ObserveLocalEntry(_ context.Context, rel string) (domain.LocalFingerprint, error) {
@@ -684,6 +769,7 @@ func (f *fakeDataPlane) Upload(_ context.Context, rel string, local domain.Local
 		return domain.RemoteFingerprint{}, fmt.Errorf("upload precondition mismatch for %q", rel)
 	}
 	f.calls = append(f.calls, "upload:"+rel)
+	f.remoteRootMissing = false
 	f.revCounter++
 	id := remote.ID
 	if remote.Absent {
@@ -708,6 +794,7 @@ func (f *fakeDataPlane) EnsureRemoteDir(_ context.Context, rel string, expected 
 		return fmt.Errorf("remote dir precondition mismatch for %q", rel)
 	}
 	f.calls = append(f.calls, "ensure-remote-dir:"+rel)
+	f.remoteRootMissing = false
 	f.remote[rel] = remoteDirFP("dir:" + rel)
 	return nil
 }

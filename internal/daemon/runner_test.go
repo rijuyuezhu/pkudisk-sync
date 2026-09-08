@@ -451,8 +451,8 @@ type stubDataPlane struct{}
 func (stubDataPlane) ScanLocal(context.Context) (map[string]domain.LocalFingerprint, error) {
 	return nil, nil
 }
-func (stubDataPlane) ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, error) {
-	return nil, nil
+func (stubDataPlane) ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error) {
+	return nil, true, nil
 }
 func (stubDataPlane) ObserveLocalEntry(context.Context, string) (domain.LocalFingerprint, error) {
 	return domain.LocalFingerprint{}, nil

@@ -19,7 +19,7 @@ const maxCyclePasses = 8
 // reconciliation cycle. executor.RootExecutor implements this interface.
 type DataPlane interface {
 	ScanLocal(context.Context) (map[string]domain.LocalFingerprint, error)
-	ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, error)
+	ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error)
 	ObserveLocalEntry(context.Context, string) (domain.LocalFingerprint, error)
 	ObserveRemoteEntry(context.Context, string) (domain.RemoteFingerprint, error)
 	CompareFileContent(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (bool, error)
@@ -86,7 +86,7 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 		return result, err
 	}
 	if len(operations) > 0 {
-		preflight, err := scanCompleteSnapshot(ctx, data)
+		preflight, _, err := scanCompleteSnapshot(ctx, data, root.Initialized)
 		if err != nil {
 			return result, fmt.Errorf("operation recovery namespace preflight: %w", err)
 		}
@@ -129,7 +129,7 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 			return result, nil
 		}
 
-		snapshot, err := scanCompleteSnapshot(ctx, data)
+		snapshot, remoteRootPresent, err := scanCompleteSnapshot(ctx, data, root.Initialized)
 		if err != nil {
 			return result, err
 		}
@@ -142,6 +142,15 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 		baselines, err := state.ListBaselines(ctx, root.ID)
 		if err != nil {
 			return result, err
+		}
+		// A brand-new empty local root has no entry mutation that could create a
+		// missing remote boundary. Keep it dormant and uninitialized instead of
+		// recording a false "both empty" baseline state. The watcher will retry
+		// as soon as local content appears; an externally created remote root also
+		// lets a later cycle initialize normally.
+		if !root.Initialized && !remoteRootPresent && len(snapshot.Local) == 0 && len(baselines) == 0 {
+			result.Skipped = true
+			return result, nil
 		}
 		plan, err := reconcile.PlanFullSnapshot(root.ID, !root.Initialized, baselines, snapshot, deletePolicy)
 		if err != nil {
@@ -231,14 +240,17 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 	return result, fmt.Errorf("sync root %d did not stabilize after %d passes", rootID, maxCyclePasses)
 }
 
-func scanCompleteSnapshot(ctx context.Context, data DataPlane) (reconcile.Snapshot, error) {
+func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot bool) (reconcile.Snapshot, bool, error) {
 	local, err := data.ScanLocal(ctx)
 	if err != nil {
-		return reconcile.Snapshot{}, fmt.Errorf("complete local scan: %w", err)
+		return reconcile.Snapshot{}, false, fmt.Errorf("complete local scan: %w", err)
 	}
-	remote, err := data.ScanRemote(ctx)
+	remote, remoteRootPresent, err := data.ScanRemote(ctx)
 	if err != nil {
-		return reconcile.Snapshot{}, fmt.Errorf("complete remote scan: %w", err)
+		return reconcile.Snapshot{}, remoteRootPresent, fmt.Errorf("complete remote scan: %w", err)
+	}
+	if requireRemoteRoot && !remoteRootPresent {
+		return reconcile.Snapshot{}, false, fmt.Errorf("complete remote scan: selected remote root is missing after initialization")
 	}
 	return reconcile.Snapshot{
 		Local:          local,
@@ -247,7 +259,7 @@ func scanCompleteSnapshot(ctx context.Context, data DataPlane) (reconcile.Snapsh
 		LocalComplete:  true,
 		RemoteComplete: true,
 		RootHealthy:    true,
-	}, nil
+	}, remoteRootPresent, nil
 }
 
 func recoverExistingOperations(ctx context.Context, state *store.Store, data DataPlane, operations []domain.Operation) (blocked bool, recovered int, err error) {

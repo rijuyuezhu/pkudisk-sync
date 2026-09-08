@@ -79,46 +79,54 @@ func (e *RootExecutor) ScanLocal(ctx context.Context) (map[string]domain.LocalFi
 
 // ScanRemote recursively lists the configured PKU Disk root using the backend's
 // normal List implementation. No ListR/sub_objects dependency is required.
-func (e *RootExecutor) ScanRemote(ctx context.Context) (map[string]domain.RemoteFingerprint, error) {
-	entries := make(map[string]domain.RemoteFingerprint)
-	if err := e.scanRemoteDir(ctx, "", entries); err != nil {
-		return nil, err
+// rootPresent distinguishes a genuinely empty root from a selected root that
+// does not exist yet; callers may tolerate the latter only during initial
+// non-destructive pairing. Missing children inside an existing root remain
+// scan errors because omission from a complete snapshot has deletion semantics.
+func (e *RootExecutor) ScanRemote(ctx context.Context) (entries map[string]domain.RemoteFingerprint, rootPresent bool, err error) {
+	entries = make(map[string]domain.RemoteFingerprint)
+	rootPresent, err = e.scanRemoteDir(ctx, "", entries)
+	if err != nil {
+		return nil, rootPresent, err
 	}
-	return entries, nil
+	return entries, rootPresent, nil
 }
 
-func (e *RootExecutor) scanRemoteDir(ctx context.Context, dir string, out map[string]domain.RemoteFingerprint) error {
+func (e *RootExecutor) scanRemoteDir(ctx context.Context, dir string, out map[string]domain.RemoteFingerprint) (bool, error) {
 	listed, err := e.remote.List(ctx, dir)
 	if errors.Is(err, fs.ErrorDirNotFound) {
-		return fmt.Errorf("remote sync root or directory %q is missing: %w", dir, err)
+		if dir == "" {
+			return false, nil
+		}
+		return true, fmt.Errorf("remote directory %q disappeared during complete scan: %w", dir, err)
 	}
 	if err != nil {
-		return fmt.Errorf("list remote directory %q: %w", dir, err)
+		return false, fmt.Errorf("list remote directory %q: %w", dir, err)
 	}
 	for _, entry := range listed {
 		if err := ctx.Err(); err != nil {
-			return err
+			return true, err
 		}
 		rel := entry.Remote()
 		if err := domain.ValidateRelPath(rel); err != nil {
-			return fmt.Errorf("remote listing returned invalid path: %w", err)
+			return true, fmt.Errorf("remote listing returned invalid path: %w", err)
 		}
 		base := filepath.Base(filepath.FromSlash(rel))
 		if rel == rootmarker.FileName || isInternalTempName(base) {
-			return fmt.Errorf("remote sync root contains reserved internal path %q", rel)
+			return true, fmt.Errorf("remote sync root contains reserved internal path %q", rel)
 		}
 
 		switch typed := entry.(type) {
 		case fs.Object:
 			fingerprint, err := remoteFileFingerprint(ctx, typed)
 			if err != nil {
-				return fmt.Errorf("remote file %q: %w", rel, err)
+				return true, fmt.Errorf("remote file %q: %w", rel, err)
 			}
 			out[rel] = fingerprint
 		case fs.Directory:
 			id := strings.TrimSpace(typed.ID())
 			if id == "" {
-				return fmt.Errorf("remote directory %q has no object ID", rel)
+				return true, fmt.Errorf("remote directory %q has no object ID", rel)
 			}
 			out[rel] = domain.RemoteFingerprint{
 				Present: true,
@@ -126,14 +134,14 @@ func (e *RootExecutor) scanRemoteDir(ctx context.Context, dir string, out map[st
 				ID:      id,
 				MtimeUS: typed.ModTime(ctx).UnixMicro(),
 			}
-			if err := e.scanRemoteDir(ctx, rel, out); err != nil {
-				return err
+			if _, err := e.scanRemoteDir(ctx, rel, out); err != nil {
+				return true, err
 			}
 		default:
-			return fmt.Errorf("remote path %q has unsupported listing type %T", rel, entry)
+			return true, fmt.Errorf("remote path %q has unsupported listing type %T", rel, entry)
 		}
 	}
-	return nil
+	return true, nil
 }
 
 func isInternalTempName(name string) bool {
