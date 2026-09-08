@@ -18,7 +18,7 @@ const maxCyclePasses = 8
 // DataPlane is the narrow in-process execution surface needed by one complete
 // reconciliation cycle. executor.RootExecutor implements this interface.
 type DataPlane interface {
-	ScanLocal(context.Context) (map[string]domain.LocalFingerprint, []string, error)
+	ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, error)
 	ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error)
 	ObserveLocalEntry(context.Context, string) (domain.LocalFingerprint, error)
 	ObserveRemoteEntry(context.Context, string) (domain.RemoteFingerprint, error)
@@ -88,7 +88,11 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 		return result, err
 	}
 	if len(operations) > 0 {
-		preflight, _, err := scanCompleteSnapshot(ctx, data, root.Initialized)
+		peerRoots, err := configuredPeerLocalRoots(ctx, state, root.ID)
+		if err != nil {
+			return result, err
+		}
+		preflight, _, err := scanCompleteSnapshot(ctx, data, root.Initialized, operations, peerRoots)
 		if err != nil {
 			return result, fmt.Errorf("operation recovery namespace preflight: %w", err)
 		}
@@ -131,7 +135,11 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 			return result, nil
 		}
 
-		snapshot, remoteRootPresent, err := scanCompleteSnapshot(ctx, data, root.Initialized)
+		peerRoots, err := configuredPeerLocalRoots(ctx, state, root.ID)
+		if err != nil {
+			return result, err
+		}
+		snapshot, remoteRootPresent, err := scanCompleteSnapshot(ctx, data, root.Initialized, nil, peerRoots)
 		if err != nil {
 			return result, err
 		}
@@ -246,8 +254,22 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 	return result, fmt.Errorf("sync root %d did not stabilize after %d passes", rootID, maxCyclePasses)
 }
 
-func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot bool) (reconcile.Snapshot, bool, error) {
-	local, excluded, err := data.ScanLocal(ctx)
+func configuredPeerLocalRoots(ctx context.Context, state *store.Store, rootID int64) ([]string, error) {
+	roots, err := state.ListSyncRoots(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list sync roots for physical ownership: %w", err)
+	}
+	peers := make([]string, 0, len(roots))
+	for _, root := range roots {
+		if root.ID != rootID {
+			peers = append(peers, root.LocalRoot)
+		}
+	}
+	return peers, nil
+}
+
+func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot bool, operations []domain.Operation, peerLocalRoots []string) (reconcile.Snapshot, bool, error) {
+	local, excluded, err := data.ScanLocal(ctx, operations, peerLocalRoots)
 	if err != nil {
 		return reconcile.Snapshot{}, false, fmt.Errorf("complete local scan: %w", err)
 	}

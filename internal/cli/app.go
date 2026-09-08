@@ -96,6 +96,8 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 		return a.runRemote(ctx, args[1:])
 	case "status":
 		return a.runStatus(ctx, args[1:])
+	case "operation":
+		return a.runOperation(ctx, args[1:])
 	case "conflict":
 		return a.runConflict(ctx, args[1:])
 	case "root":
@@ -117,6 +119,10 @@ Commands:
   version                            Show build version and provenance
   remote configure                   Configure or re-authenticate the PKU Disk account
   status                             Summarize roots, operations, and conflicts
+  operation list [--root ID]         List durable operation intents
+  operation show ID                  Show one operation including recovery detail
+  operation resolve ID --retry       Re-enter guarded recovery for one blocked operation
+  operation resolve ID --restore-recovery Restore a preserved local artifact, then recover
   conflict list [--root ID]          List unresolved conflicts
   conflict resolve ID --keep-local   Queue exact-state resolution using local data
   conflict resolve ID --keep-remote  Queue exact-state resolution using remote data
@@ -230,6 +236,171 @@ func (a *Application) runStatus(ctx context.Context, args []string) error {
 		}
 	}
 	return w.Flush()
+}
+
+func (a *Application) runOperation(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("operation requires one of: list, show, resolve")
+	}
+	switch args[0] {
+	case "list":
+		return a.runOperationList(ctx, args[1:])
+	case "show":
+		return a.runOperationShow(ctx, args[1:])
+	case "resolve":
+		return a.runOperationResolve(ctx, args[1:])
+	default:
+		return fmt.Errorf("unknown operation command %q", args[0])
+	}
+}
+
+func (a *Application) runOperationList(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("operation list", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	rootID := flags.Int64("root", 0, "sync root ID")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *rootID < 0 {
+		return fmt.Errorf("operation list accepts only optional --root ID")
+	}
+	state, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = state.Close() }()
+
+	var operations []domain.Operation
+	if *rootID > 0 {
+		if _, ok, err := state.GetSyncRoot(ctx, *rootID); err != nil {
+			return err
+		} else if !ok {
+			return fmt.Errorf("sync root %d not found", *rootID)
+		}
+		operations, err = state.ListOperations(ctx, *rootID)
+		if err != nil {
+			return err
+		}
+	} else {
+		roots, err := state.ListSyncRoots(ctx)
+		if err != nil {
+			return err
+		}
+		for _, root := range roots {
+			rootOps, err := state.ListOperations(ctx, root.ID)
+			if err != nil {
+				return err
+			}
+			operations = append(operations, rootOps...)
+		}
+	}
+
+	w := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(w, "ID\tROOT\tPHASE\tKIND\tENTRY\tPATH\tATTEMPTS\tLAST_ERROR"); err != nil {
+		return err
+	}
+	for _, op := range operations {
+		if _, err := fmt.Fprintf(w, "%d\t%d\t%s\t%s\t%s\t%s\t%d\t%s\n",
+			op.ID, op.SyncRootID, op.Phase, op.Kind, op.EntryKind, op.SrcPath, op.Attempts, op.LastError); err != nil {
+			return err
+		}
+	}
+	return w.Flush()
+}
+
+func (a *Application) runOperationShow(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("operation show requires exactly one operation ID")
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil || id <= 0 {
+		return fmt.Errorf("invalid operation ID %q", args[0])
+	}
+	state, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = state.Close() }()
+	op, ok, err := state.GetOperation(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("operation %d not found", id)
+	}
+	recoveryPath, _ := executor.RecoveryArtifactPath(op)
+	w := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
+	fields := [][2]string{
+		{"id", strconv.FormatInt(op.ID, 10)},
+		{"root", strconv.FormatInt(op.SyncRootID, 10)},
+		{"phase", string(op.Phase)},
+		{"kind", string(op.Kind)},
+		{"entry_kind", string(op.EntryKind)},
+		{"path", op.SrcPath},
+		{"local_target", op.LocalTargetPath},
+		{"recovery_artifact", recoveryPath},
+		{"attempts", strconv.Itoa(op.Attempts)},
+		{"last_error", op.LastError},
+		{"created", op.CreatedAt.Format(time.RFC3339Nano)},
+		{"updated", op.UpdatedAt.Format(time.RFC3339Nano)},
+	}
+	for _, field := range fields {
+		if _, err := fmt.Fprintf(w, "%s\t%s\n", field[0], field[1]); err != nil {
+			return err
+		}
+	}
+	return w.Flush()
+}
+
+func (a *Application) runOperationResolve(ctx context.Context, args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("operation resolve requires ID and exactly one of --retry or --restore-recovery")
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil || id <= 0 {
+		return fmt.Errorf("invalid operation ID %q", args[0])
+	}
+	action := args[1]
+	if action != "--retry" && action != "--restore-recovery" {
+		return fmt.Errorf("operation resolve requires exactly one of --retry or --restore-recovery")
+	}
+	if err := a.paths.PrepareRuntime(); err != nil {
+		return err
+	}
+	lease, err := daemonlock.Acquire(a.paths.RuntimeDir)
+	if err != nil {
+		return fmt.Errorf("operation resolve requires the foreground daemon and user service to be stopped: %w", err)
+	}
+	defer func() { _ = lease.Close() }()
+	state, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = state.Close() }()
+	op, ok, err := state.GetOperation(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("operation %d not found", id)
+	}
+	if op.Phase != domain.OperationBlocked {
+		return fmt.Errorf("operation %d is %s, not blocked", id, op.Phase)
+	}
+
+	detail := "manual retry requested; normal guarded recovery must re-prove safety"
+	if action == "--restore-recovery" {
+		recoveryPath, err := executor.RestoreLocalRecoveryArtifact(ctx, op)
+		if err != nil {
+			return err
+		}
+		detail = fmt.Sprintf("manual recovery restored prior local state from %q; guarded recovery must re-prove safety", recoveryPath)
+	}
+	if err := state.RetryBlockedOperation(ctx, id, detail); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(a.stdout, "operation %d queued for guarded recovery\n", id)
+	return err
 }
 
 func (a *Application) runConflict(ctx context.Context, args []string) error {

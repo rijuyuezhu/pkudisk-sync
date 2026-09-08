@@ -18,10 +18,31 @@ import (
 // RootExecutor is the in-process data plane for one selected sync-root pair.
 // It owns no reconciliation state and starts no subprocesses.
 type RootExecutor struct {
-	root      domain.SyncRoot
-	local     fs.Fs
-	remote    fs.Fs
-	remotePKU *pkudisk.Fs
+	root            domain.SyncRoot
+	local           fs.Fs
+	remote          fs.Fs
+	remotePKU       remoteCommander
+	copyObjectFn    func(context.Context, fs.Fs, fs.Object, string, fs.Object) (fs.Object, error)
+	copyFileFn      func(context.Context, fs.Fs, fs.Fs, string, string) error
+	observeRemoteFn func(context.Context, string) (domain.RemoteFingerprint, error)
+}
+
+type remoteCommander interface {
+	Command(context.Context, string, []string, map[string]string) (any, error)
+}
+
+func (e *RootExecutor) copyObject(ctx context.Context, dst fs.Object, remote string, src fs.Object) (fs.Object, error) {
+	if e.copyObjectFn != nil {
+		return e.copyObjectFn(ctx, e.remote, dst, remote, src)
+	}
+	return operations.Copy(ctx, e.remote, dst, remote, src)
+}
+
+func (e *RootExecutor) copyFile(ctx context.Context, dst, src fs.Fs, dstRemote, srcRemote string) error {
+	if e.copyFileFn != nil {
+		return e.copyFileFn(ctx, dst, src, dstRemote, srcRemote)
+	}
+	return operations.CopyFile(ctx, dst, src, dstRemote, srcRemote)
 }
 
 // MoveResult is the exact object identity returned by PKU Disk after a
@@ -112,7 +133,7 @@ func (e *RootExecutor) Upload(ctx context.Context, relPath string, expectedLocal
 	}
 
 	copyCtx := uploadContext(ctx, expectedRemote.ID, expectedRemote.Rev, expectedRemote.Absent)
-	newDst, err := operations.Copy(copyCtx, e.remote, dst, relPath, src)
+	newDst, err := e.copyObject(copyCtx, dst, relPath, src)
 	if err != nil {
 		return domain.RemoteFingerprint{}, fmt.Errorf("upload %q: %w", relPath, err)
 	}
@@ -147,7 +168,7 @@ func (e *RootExecutor) DownloadToTemp(ctx context.Context, relPath, tempRelPath 
 	}
 
 	copyCtx := downloadContext(ctx, expected.ID, expected.Rev)
-	if err := operations.CopyFile(copyCtx, e.local, e.remote, tempRelPath, relPath); err != nil {
+	if err := e.copyFile(copyCtx, e.local, e.remote, tempRelPath, relPath); err != nil {
 		return fmt.Errorf("download %q: %w", relPath, err)
 	}
 	return nil
@@ -177,7 +198,7 @@ func (e *RootExecutor) downloadToPhysicalTemp(ctx context.Context, relPath, temp
 		return fmt.Errorf("open local temporary directory %q: %w", parent, err)
 	}
 	copyCtx := downloadContext(ctx, expected.ID, expected.Rev)
-	if err := operations.CopyFile(copyCtx, localFS, e.remote, filepath.Base(tempPath), relPath); err != nil {
+	if err := e.copyFile(copyCtx, localFS, e.remote, filepath.Base(tempPath), relPath); err != nil {
 		return fmt.Errorf("download %q: %w", relPath, err)
 	}
 	return nil

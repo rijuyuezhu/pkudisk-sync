@@ -792,7 +792,7 @@ func (f *cancelUploadDataPlane) Upload(ctx context.Context, _ string, _ domain.L
 	return domain.RemoteFingerprint{}, ctx.Err()
 }
 
-func (f *fakeDataPlane) ScanLocal(context.Context) (map[string]domain.LocalFingerprint, []string, error) {
+func (f *fakeDataPlane) ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, error) {
 	f.scans++
 	return cloneLocal(f.local), nil, nil
 }

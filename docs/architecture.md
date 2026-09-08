@@ -21,7 +21,7 @@ A sync root is one explicit mapping:
 <absolute local directory>  <->  pkudisk:<remote directory>
 ```
 
-One daemon can own multiple independent roots. Local roots may not overlap each other, and selected remote paths may not overlap. v0.1 intentionally uses one app-owned PKU Disk authentication profile named `pkudisk`; a config alias is not treated as account identity.
+One daemon can own multiple independent roots. Local roots may not overlap each other, and selected remote paths may not overlap. This ownership rule is physical as well as lexical: a followed symlink may not enter another configured local root, and one physical filesystem object may not be expanded under two logical paths in the same complete scan. Any such alias/ownership ambiguity fails the scan closed. v0.1 intentionally uses one app-owned PKU Disk authentication profile named `pkudisk`; a config alias is not treated as account identity.
 
 Each root has its own:
 
@@ -84,15 +84,23 @@ Examples of fail-closed behavior include:
 
 The backend safety contract is pinned through the `rclone-pkudisk` version in `go.mod`; downstream code must not assume stronger remote semantics than that dependency exposes.
 
+AnyShare delete is weaker than upload/download CAS. The pinned backend revalidates an exact file `docid` and expected revision immediately before deletion, but the AnyShare delete request itself accepts only the object ID, not a revision precondition. There is therefore an unavoidable narrow TOCTOU window between the last revision check and the server-side delete. Directory deletion likewise checks that the exact observed directory is empty before issuing the exact-ID delete, but a concurrent child create can race that final request. These are explicit API limitations; multi-writer remote deployments cannot claim strict revision-CAS deletion.
+
 ### Followed symlinks and physical local targets
 
-The synchronization namespace remains lexical even when a root uses the default `follow` policy, but a local mutation is applied to the resolved physical target rather than replacing the symlink object. A followed target may live outside the selected root or on a different filesystem.
+The synchronization namespace remains lexical even when a root uses the default `follow` policy, but a local mutation is applied to the resolved physical target rather than replacing the symlink object. A followed target may live outside the selected root or on a different filesystem, but it may not cross into another configured root.
 
 Before a local create/update/delete can enter `running`, the syncer resolves and durably pins its canonical absolute physical target in the operation journal. File staging and preservation slots are then created in that target's physical parent directory, keeping no-replace rename operations on the same filesystem.
 
 For replacement or deletion of an existing target, the executor first atomically moves the exact expected target to an operation-ID-specific recovery slot and validates the object that actually moved. A symlink retarget between planning and execution therefore fails its physical-identity fence rather than mutating the new target. If a process loss leaves the recovery slot behind, restart detects that journaled artifact and blocks automatic replay while preserving the data and its exact location.
 
 `ignore` is modeled as an excluded namespace rather than absence. Reconciliation skips the excluded prefix and descendants entirely, including deletion-gate accounting. `reject` instead makes the local observation incomplete by returning an error. Follow-mode cycles and aliases to a physical ancestor are excluded so recursive traversal cannot loop.
+
+A followed link whose final referent is missing is also non-authoritative for that lexical prefix. A single `ENOENT` cannot distinguish an intentional referent delete from a temporarily unavailable external mount, so dangling followed targets never grant remote deletion authority. Propagating a deliberate referent deletion requires stronger durable referent-health/identity evidence than v0.1 currently records.
+
+Complete scans also enforce one logical owner per physical file/directory identity. Sibling aliases, hard links to the same file, or a symlink expansion that would claim an object already reached through another logical path fail closed instead of creating independent baselines/journals for one physical object.
+
+Operation staging/recovery files are internal only when a durable local-mutation operation explicitly owns their exact physical path. A filename that merely resembles `.pkudisk-sync-tmp-op-<id>-download` or `...-recovery` is not silently hidden; without matching journal ownership it is a reserved-namespace error. The remote scanner rejects the same reserved namespace, keeping local and remote authority symmetric.
 
 ## Deletion safety
 

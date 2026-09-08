@@ -7,9 +7,10 @@ import (
 )
 
 // resolveFollowedLocalPath resolves symlinks while optionally allowing the
-// final physical leaf to be absent. That absent-leaf case is what lets a
-// dangling final symlink remain an authoritative virtual deletion and later be
-// recreated without replacing the symlink object itself.
+// final physical leaf to be absent. The scanner treats that state as excluded,
+// not deletion evidence; callers that already have independent mutation
+// authority can still use the resolved missing target to recreate it without
+// replacing the symlink object itself.
 func resolveFollowedLocalPath(name string, allowMissingLeaf bool) (resolved string, present bool, err error) {
 	resolved, err = filepath.EvalSymlinks(name)
 	if err == nil {

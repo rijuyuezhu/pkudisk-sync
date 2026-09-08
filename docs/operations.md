@@ -1,6 +1,6 @@
 # Operations guide
 
-This guide covers day-to-day configuration, recovery, and native background-service behavior. The project is currently preparing its first v0.1 release; until a release is published, build from source.
+This guide covers day-to-day configuration, recovery, and native background-service behavior. The current public pre-release is `v0.1.0-alpha.1`; newer development commits may still require building from source until another release is published.
 
 ## Build from source
 
@@ -62,7 +62,7 @@ pkudisk-sync root add \
 
 The modes are:
 
-- `follow` — dereference file and directory symlinks into the synchronized virtual namespace, including links whose targets are outside the selected local root. Remote updates and deletes mutate the resolved target while preserving the symlink object. If a followed target is deleted, the dangling final link remains and can be rehydrated if that remote path later reappears. Cycles and links back to a physical ancestor are excluded instead of traversed.
+- `follow` — dereference file and directory symlinks into the synchronized virtual namespace, including links whose targets are outside the selected local root. Remote updates and deletes mutate the resolved target while preserving the symlink object. A dangling/unavailable final referent is excluded rather than treated as local deletion evidence; this prevents a missing external mount from authorizing remote deletion. Cycles and links back to a physical ancestor are excluded instead of traversed. A followed target may not enter another configured sync root, and duplicate logical aliases to one physical object fail closed.
 - `reject` — any symlink makes the complete local scan fail closed.
 - `ignore` — the symlink path and its virtual subtree are excluded from the local namespace for that cycle. Excluded paths carry no download or deletion authority, so ignoring a link cannot be mistaken for deleting it.
 
@@ -106,6 +106,7 @@ Useful inspection commands can be run from another shell:
 ```bash
 pkudisk-sync status
 pkudisk-sync conflict list
+pkudisk-sync operation list
 ```
 
 Only one daemon can own the current user's runtime lease. Starting a second foreground daemon fails rather than creating two synchronization writers.
@@ -128,6 +129,31 @@ pkudisk-sync root resume 1
 ```
 
 Pause is durable. The daemon cancels an active worker and waits for it to unwind before a later resume may start a replacement. If cancellation occurs after a mutation entered the durable `running` phase, restart/resume uses normal postcondition recovery rather than replaying the mutation blindly.
+
+### Blocked operation recovery
+
+When crash recovery cannot prove a safe automatic action, the durable operation becomes `blocked`. Inspect the exact intent and diagnostic first:
+
+```bash
+pkudisk-sync operation list --root 1
+pkudisk-sync operation show 42
+```
+
+`operation show` includes the semantic operation, pinned physical local target, deterministic recovery-artifact location (when applicable), attempts, and the last recovery error.
+
+Stop the foreground daemon/user service before an explicit recovery action. `--retry` does **not** blindly replay the mutation; it returns the blocked intent to the normal guarded recovery state machine, which must again prove the previous postcondition or validate that retry preconditions still hold:
+
+```bash
+pkudisk-sync operation resolve 42 --retry
+```
+
+If `operation show` reports that pre-mutation local data is preserved in a recovery artifact, restore it only with:
+
+```bash
+pkudisk-sync operation resolve 42 --restore-recovery
+```
+
+This action requires the artifact to still match the journaled expected local fingerprint, requires the pinned target to be absent, restores with no-replace rename semantics, verifies the restored target, and then returns the operation to guarded recovery. It never overwrites a newly created target. There is intentionally no `operation delete` escape hatch.
 
 ## Conflicts
 
@@ -201,6 +227,7 @@ When synchronization stops or blocks:
 3. Check whether the root is paused.
 4. Verify authentication with `pkudisk-sync remote configure` if the token is known to be expired or replaced; stop the daemon first.
 5. Treat an initialized missing remote root as an error to investigate, not as a delete request.
-6. Do not manually remove operation/conflict rows from SQLite to "unstick" a root; those records are part of crash-safety authority.
+6. If `BLOCKED` is non-zero, use `pkudisk-sync operation list` and `operation show ID` before taking action.
+7. Do not manually remove operation/conflict rows from SQLite to "unstick" a root; those records are part of crash-safety authority.
 
 For semantic details, see [architecture.md](architecture.md).

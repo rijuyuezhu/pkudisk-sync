@@ -412,6 +412,53 @@ func TestConflictRoundTripAndResolution(t *testing.T) {
 	}
 }
 
+func TestRetryBlockedOperationOnlyTransitionsBlockedIntent(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	root := createTestRoot(t, s)
+	blocked, err := s.CreateOperation(ctx, domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationDeleteRemote,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "blocked.txt",
+		ExpectedRemote: domain.RemoteExpectation{ID: "doc", Rev: "rev"},
+		Phase:          domain.OperationBlocked,
+		Attempts:       2,
+		LastError:      "needs attention",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RetryBlockedOperation(ctx, blocked.ID, "manual retry"); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.GetOperation(ctx, blocked.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetOperation() = %+v ok=%v err=%v", got, ok, err)
+	}
+	if got.Phase != domain.OperationRecovering || got.Attempts != 2 || got.LastError != "manual retry" {
+		t.Fatalf("retried operation = %+v", got)
+	}
+
+	planned, err := s.CreateOperation(ctx, domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationDeleteRemote,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "planned.txt",
+		ExpectedRemote: domain.RemoteExpectation{ID: "doc2", Rev: "rev2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RetryBlockedOperation(ctx, planned.ID, "must fail"); err == nil {
+		t.Fatal("RetryBlockedOperation accepted a non-blocked operation")
+	}
+	got, ok, err = s.GetOperation(ctx, planned.ID)
+	if err != nil || !ok || got.Phase != domain.OperationPlanned {
+		t.Fatalf("planned operation changed: %+v ok=%v err=%v", got, ok, err)
+	}
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	ctx := context.Background()

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/rijuyuezhu/pkudisk-sync/internal/daemon"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/daemonlock"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
+	"github.com/rijuyuezhu/pkudisk-sync/internal/executor"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/reconcile"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/rootmarker"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/store"
@@ -267,6 +269,156 @@ func TestStatusAndConflictListExposeDurableAttentionState(t *testing.T) {
 	}
 	if err := app.Run(ctx, []string{"conflict", "list", "--root", "999"}); err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("unknown root conflict list error = %v", err)
+	}
+}
+
+func TestOperationListShowAndRetryExposeBlockedRecoveryState(t *testing.T) {
+	ctx := context.Background()
+	paths := cliTestPaths(t)
+	var stdout bytes.Buffer
+	app := New(paths, &stdout, &bytes.Buffer{})
+	app.installRcloneConfig = func(string) error { return nil }
+	app.validateRemote = func(string) error { return nil }
+	app.newUUID = func() (string, error) { return "operation-root-uuid", nil }
+	localRoot := t.TempDir()
+	if err := app.Run(ctx, []string{"root", "add", "--local", localRoot, "--remote", "pkudisk:Personal/Operation"}); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := store.Open(ctx, paths.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(localRoot, "blocked.txt")
+	op, err := state.CreateOperation(ctx, domain.Operation{
+		SyncRootID:      1,
+		Kind:            domain.OperationDeleteLocal,
+		EntryKind:       domain.KindFile,
+		SrcPath:         "blocked.txt",
+		LocalTargetPath: target,
+		ExpectedLocal:   domain.LocalFingerprint{Present: true, Kind: domain.KindFile, Size: 7, MtimeNS: 11},
+		ExpectedRemote:  domain.RemoteExpectation{Absent: true},
+		Phase:           domain.OperationBlocked,
+		Attempts:        1,
+		LastError:       "manual recovery required",
+	})
+	if err != nil {
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout.Reset()
+	if err := app.Run(ctx, []string{"operation", "list", "--root", "1"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"blocked", "delete-local", "blocked.txt", "manual recovery required"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("operation list output %q missing %q", stdout.String(), want)
+		}
+	}
+	if err := app.Run(ctx, []string{"operation", "list", "--root", "999"}); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("unknown root operation list error = %v", err)
+	}
+
+	stdout.Reset()
+	if err := app.Run(ctx, []string{"operation", "show", strconv.FormatInt(op.ID, 10)}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{target, "recovery_artifact", "manual recovery required", "blocked"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("operation show output %q missing %q", stdout.String(), want)
+		}
+	}
+
+	stdout.Reset()
+	if err := app.Run(ctx, []string{"operation", "resolve", strconv.FormatInt(op.ID, 10), "--retry"}); err != nil {
+		t.Fatal(err)
+	}
+	state, err = store.Open(ctx, paths.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	got, ok, err := state.GetOperation(ctx, op.ID)
+	if err != nil || !ok || got.Phase != domain.OperationRecovering || got.Attempts != 1 {
+		t.Fatalf("retried operation = %+v ok=%v err=%v", got, ok, err)
+	}
+}
+
+func TestOperationRestoreRecoveryRestoresArtifactAndQueuesGuardedRecovery(t *testing.T) {
+	ctx := context.Background()
+	paths := cliTestPaths(t)
+	var stdout bytes.Buffer
+	app := New(paths, &stdout, &bytes.Buffer{})
+	app.installRcloneConfig = func(string) error { return nil }
+	app.validateRemote = func(string) error { return nil }
+	app.newUUID = func() (string, error) { return "restore-operation-root-uuid", nil }
+	localRoot := t.TempDir()
+	if err := app.Run(ctx, []string{"root", "add", "--local", localRoot, "--remote", "pkudisk:Personal/RestoreOperation"}); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(localRoot, "recover.txt")
+	if err := os.WriteFile(target, []byte("prior"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := domain.LocalFingerprint{Present: true, Kind: domain.KindFile, Size: info.Size(), MtimeNS: info.ModTime().UnixNano()}
+	state, err := store.Open(ctx, paths.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := state.CreateOperation(ctx, domain.Operation{
+		SyncRootID:      1,
+		Kind:            domain.OperationDeleteLocal,
+		EntryKind:       domain.KindFile,
+		SrcPath:         "recover.txt",
+		LocalTargetPath: target,
+		ExpectedLocal:   expected,
+		ExpectedRemote:  domain.RemoteExpectation{Absent: true},
+		Phase:           domain.OperationBlocked,
+		Attempts:        1,
+		LastError:       "local data preserved",
+	})
+	if err != nil {
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	artifact, ok := executor.RecoveryArtifactPath(op)
+	if !ok {
+		t.Fatal("blocked local operation has no recovery artifact path")
+	}
+	if err := os.Rename(target, artifact); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout.Reset()
+	if err := app.Run(ctx, []string{"operation", "resolve", strconv.FormatInt(op.ID, 10), "--restore-recovery"}); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(target)
+	if err != nil || string(contents) != "prior" {
+		t.Fatalf("restored target = %q err=%v", contents, err)
+	}
+	if _, err := os.Lstat(artifact); !os.IsNotExist(err) {
+		t.Fatalf("recovery artifact remains after CLI restore: %v", err)
+	}
+	state, err = store.Open(ctx, paths.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	got, ok, err := state.GetOperation(ctx, op.ID)
+	if err != nil || !ok || got.Phase != domain.OperationRecovering || got.Attempts != 1 || !strings.Contains(got.LastError, "restored prior local state") {
+		t.Fatalf("restored operation = %+v ok=%v err=%v", got, ok, err)
 	}
 }
 

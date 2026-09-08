@@ -56,6 +56,9 @@ func (e *RootExecutor) ObserveRemoteEntry(ctx context.Context, relPath string) (
 	if err := domain.ValidateRelPath(relPath); err != nil {
 		return domain.RemoteFingerprint{}, err
 	}
+	if e.observeRemoteFn != nil {
+		return e.observeRemoteFn(ctx, relPath)
+	}
 	parent, _ := path.Split(relPath)
 	parent = strings.TrimSuffix(parent, "/")
 	entries, err := e.remote.List(ctx, parent)
@@ -440,6 +443,63 @@ func (e *RootExecutor) LocalRecoveryArtifact(ctx context.Context, op domain.Oper
 		return recoveryPath, false, fmt.Errorf("stat local recovery artifact %q: %w", recoveryPath, err)
 	}
 	return recoveryPath, true, nil
+}
+
+// RecoveryArtifactPath returns the deterministic recovery-slot path for a
+// journaled local mutation without inspecting the filesystem.
+func RecoveryArtifactPath(op domain.Operation) (string, bool) {
+	if op.ID <= 0 || op.LocalTargetPath == "" || (op.Kind != domain.OperationEnsureLocal && op.Kind != domain.OperationDeleteLocal) {
+		return "", false
+	}
+	return operationPhysicalTempPath(op.LocalTargetPath, op.ID, "recovery"), true
+}
+
+// RestoreLocalRecoveryArtifact restores a preserved pre-mutation local object
+// to its pinned physical target using no-replace semantics. It never overwrites
+// a current target and only restores an artifact that still matches the
+// operation's expected pre-mutation local fingerprint.
+func RestoreLocalRecoveryArtifact(ctx context.Context, op domain.Operation) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if op.Phase != domain.OperationBlocked {
+		return "", fmt.Errorf("operation %d is %s, not blocked", op.ID, op.Phase)
+	}
+	if !op.ExpectedLocal.Present {
+		return "", fmt.Errorf("operation %d has no expected prior local object to restore", op.ID)
+	}
+	recoveryPath, ok := RecoveryArtifactPath(op)
+	if !ok {
+		return "", fmt.Errorf("operation %d has no pinned local recovery artifact path", op.ID)
+	}
+	artifact, err := observePhysicalLocalEntry(ctx, recoveryPath)
+	if err != nil {
+		return recoveryPath, err
+	}
+	if !artifact.Present {
+		return recoveryPath, fmt.Errorf("local recovery artifact %q does not exist", recoveryPath)
+	}
+	if !domain.LocalEquivalent(artifact, op.ExpectedLocal) {
+		return recoveryPath, fmt.Errorf("local recovery artifact %q no longer matches operation %d expected local state", recoveryPath, op.ID)
+	}
+	current, err := observePhysicalLocalEntry(ctx, op.LocalTargetPath)
+	if err != nil {
+		return recoveryPath, err
+	}
+	if current.Present {
+		return recoveryPath, fmt.Errorf("refusing to restore %q because pinned local target %q already exists", recoveryPath, op.LocalTargetPath)
+	}
+	if err := movePathNoReplace(recoveryPath, op.LocalTargetPath); err != nil {
+		return recoveryPath, fmt.Errorf("restore local recovery artifact %q: %w", recoveryPath, err)
+	}
+	restored, err := observePhysicalLocalEntry(ctx, op.LocalTargetPath)
+	if err != nil {
+		return recoveryPath, err
+	}
+	if !domain.LocalEquivalent(restored, op.ExpectedLocal) {
+		return recoveryPath, fmt.Errorf("restored local target %q does not match operation %d expected local state", op.LocalTargetPath, op.ID)
+	}
+	return recoveryPath, nil
 }
 
 // CommitDownloadedTemp performs the local half of conditional download commit.
