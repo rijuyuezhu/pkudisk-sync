@@ -70,3 +70,51 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
         run: go build ./cmd/pkudisk-sync
+
+  windows-service:
+    name: Windows per-user service smoke
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.6'
+          cache: true
+      - name: Build pkudisk-sync
+        shell: pwsh
+        run: go build -o pkudisk-sync.exe ./cmd/pkudisk-sync
+      - name: Exercise Scheduled Task lifecycle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Invoke-Sync {
+            param([Parameter(ValueFromRemainingArguments = $true)][string[]] $Arguments)
+            $output = & .\pkudisk-sync.exe @Arguments 2>&1
+            $code = $LASTEXITCODE
+            $output | Out-Host
+            if ($code -ne 0) {
+              throw "pkudisk-sync $($Arguments -join ' ') failed with exit code $code"
+            }
+            return $output
+          }
+
+          $installed = $false
+          try {
+            Invoke-Sync service install | Out-Null
+            $installed = $true
+            Invoke-Sync service start | Out-Null
+            Start-Sleep -Seconds 2
+            $status = (Invoke-Sync service status | Out-String).Trim()
+            if ($status -notmatch '(?i)^running$') {
+              throw "scheduled task did not reach Running state: $status"
+            }
+            Invoke-Sync service stop | Out-Null
+          }
+          finally {
+            if ($installed) {
+              & .\pkudisk-sync.exe service stop 2>&1 | Out-Host
+              & .\pkudisk-sync.exe service uninstall 2>&1 | Out-Host
+            }
+          }
