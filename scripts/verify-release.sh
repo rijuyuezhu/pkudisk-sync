@@ -73,6 +73,10 @@ for file in BUILDINFO.txt README.md "$binary_name"; do
     exit 1
   fi
 done
+if [[ $goos != windows && ! -x "$package_dir/$binary_name" ]]; then
+  echo "release binary is not executable after extraction: $binary_name" >&2
+  exit 1
+fi
 
 buildinfo="$package_dir/BUILDINFO.txt"
 grep -Fxq "release: $release" "$buildinfo" || {

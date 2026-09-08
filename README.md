@@ -45,7 +45,7 @@ The daemon installs recursive local filesystem watches only as low-latency hints
 
 ## CLI
 
-Portable release archives target Linux, macOS, and Windows on both amd64 and arm64. After extracting an archive, move `pkudisk-sync` (or `pkudisk-sync.exe`) to a stable per-user executable path before installing the background service. Do not run `service install` from a temporary extraction/download directory: the native service definition records the executable's absolute path. Verify the installed binary with:
+Portable release archives target Linux, macOS, and Windows on both amd64 and arm64. After extracting an archive, move `pkudisk-sync` (or `pkudisk-sync.exe`) to a stable per-user executable path before installing the background service. Do not run `service install` from a temporary extraction/download directory: the native service definition records the executable's absolute path. v0.1 portable binaries are not yet platform-signed: macOS may require a one-time Gatekeeper approval in System Settings → Privacy & Security after the first attempted launch; Windows may show a SmartScreen warning, while Smart App Control or enterprise policy can block an unsigned binary entirely. Verify the release `SHA256SUMS` before approving a downloaded binary; do not disable Gatekeeper/SmartScreen globally. On macOS, roots under privacy-protected locations such as Desktop, Documents, Downloads, iCloud Drive, network volumes, or removable volumes may also require explicit Files & Folders or Full Disk Access permission for the installed executable/LaunchAgent. Signed/notarized native installers and smoother permission onboarding remain future packaging work. Verify the installed binary with:
 
 ```bash
 pkudisk-sync version
