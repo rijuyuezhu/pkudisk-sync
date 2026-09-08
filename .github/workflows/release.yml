@@ -134,6 +134,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      actions: read
       contents: write
     steps:
       - uses: actions/checkout@v7
@@ -143,11 +144,16 @@ jobs:
         with:
           go-version: '1.26.6'
           cache: true
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: release-*
-          path: dist
-          merge-multiple: true
+      - name: Download build artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          while IFS= read -r target; do
+            [[ -z $target ]] && continue
+            artifact="release-${target//\//-}"
+            gh run download "$GITHUB_RUN_ID" --name "$artifact" --dir dist
+          done < scripts/release-targets.txt
       - name: Verify artifacts and create checksums
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
