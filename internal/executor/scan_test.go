@@ -10,9 +10,8 @@ import (
 	"github.com/rijuyuezhu/pkudisk-sync/internal/rootmarker"
 )
 
-func TestScanLocalIncludesOrdinaryTreeAndExcludesInternalFiles(t *testing.T) {
+func TestScanLocalIncludesOrdinaryTreeAndExcludesRootMarker(t *testing.T) {
 	root := t.TempDir()
-	internalTemp := tempNamePrefix + "0123456789abcdef01234567"
 	ordinaryPrefixFile := tempNamePrefix + "notes"
 	if err := os.Mkdir(filepath.Join(root, "docs"), 0o755); err != nil {
 		t.Fatal(err)
@@ -22,9 +21,6 @@ func TestScanLocalIncludesOrdinaryTreeAndExcludesInternalFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, rootmarker.FileName), []byte("uuid\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "docs", internalTemp), []byte("temp"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "docs", ordinaryPrefixFile), []byte("user"), 0o600); err != nil {
@@ -48,11 +44,20 @@ func TestScanLocalIncludesOrdinaryTreeAndExcludesInternalFiles(t *testing.T) {
 	if _, ok := got[rootmarker.FileName]; ok {
 		t.Fatal("root marker leaked into snapshot")
 	}
-	if _, ok := got["docs/"+internalTemp]; ok {
-		t.Fatal("internal temp leaked into snapshot")
-	}
 	if got["docs/"+ordinaryPrefixFile].Kind != domain.KindFile {
 		t.Fatalf("ordinary prefix file was silently filtered: %+v", got)
+	}
+}
+
+func TestScanLocalRejectsStaleInternalTempFile(t *testing.T) {
+	root := t.TempDir()
+	name := tempNamePrefix + "0123456789abcdef01234567"
+	if err := os.WriteFile(filepath.Join(root, name), []byte("preserve"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	if _, err := exec.ScanLocal(context.Background()); err == nil {
+		t.Fatal("stale internal temp file was silently omitted from a complete snapshot")
 	}
 }
 

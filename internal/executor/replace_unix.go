@@ -1,9 +1,9 @@
-//go:build !windows
+//go:build !windows && !linux && !darwin
 
 package executor
 
-import "os"
+import "fmt"
 
-func replaceFile(src, dst string) error {
-	return os.Rename(src, dst)
+func movePathNoReplace(src, dst string) error {
+	return fmt.Errorf("atomic no-replace rename is unsupported on this platform")
 }

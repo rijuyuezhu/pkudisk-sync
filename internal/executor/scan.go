@@ -43,10 +43,7 @@ func (e *RootExecutor) ScanLocal(ctx context.Context) (map[string]domain.LocalFi
 			return nil
 		}
 		if isInternalTempName(entry.Name()) {
-			if entry.IsDir() {
-				return fmt.Errorf("reserved internal temp path %q is a directory", rel)
-			}
-			return nil
+			return fmt.Errorf("reserved internal temp path %q remains in the sync root; a prior local mutation may need recovery", rel)
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("unsupported symlink in sync root: %q", rel)

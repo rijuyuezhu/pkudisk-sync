@@ -177,9 +177,81 @@ func (e *RootExecutor) DeleteLocal(ctx context.Context, relPath string, expected
 	if !domain.LocalEquivalent(current, expected) {
 		return fmt.Errorf("local delete precondition failed for %q", relPath)
 	}
-	fullPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
-	if err := os.Remove(fullPath); err != nil {
-		return fmt.Errorf("delete local %s %q: %w", expected.Kind, relPath, err)
+	recoveryRel, err := e.preserveExpectedLocalEntry(ctx, relPath, expected)
+	if err != nil {
+		return err
+	}
+	recoveryPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(recoveryRel))
+	if err := ctx.Err(); err != nil {
+		return e.restorePreservedLocalEntry(relPath, recoveryRel, err)
+	}
+	if err := os.Remove(recoveryPath); err != nil {
+		return e.restorePreservedLocalEntry(relPath, recoveryRel, fmt.Errorf("delete local %s %q: %w", expected.Kind, relPath, err))
+	}
+	return nil
+}
+
+// preserveExpectedLocalEntry atomically moves the current path into a unique
+// same-directory recovery slot before validating the object that was actually
+// moved. This closes the path-level Lstat->rename/unlink race: a concurrent
+// save-by-rename is preserved rather than overwritten or deleted.
+func (e *RootExecutor) preserveExpectedLocalEntry(ctx context.Context, relPath string, expected domain.LocalFingerprint) (string, error) {
+	recoveryRel, err := newTempRelPath(relPath)
+	if err != nil {
+		return "", err
+	}
+	srcPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
+	recoveryPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(recoveryRel))
+	if err := movePathNoReplace(srcPath, recoveryPath); err != nil {
+		return "", fmt.Errorf("preserve local entry %q before mutation: %w", relPath, err)
+	}
+
+	observed, observeErr := e.ObserveLocalEntry(ctx, recoveryRel)
+	if observeErr == nil && domain.LocalEquivalent(observed, expected) {
+		return recoveryRel, nil
+	}
+	primary := observeErr
+	if primary == nil {
+		primary = fmt.Errorf("local mutation precondition failed for %q after preserving the actual path target", relPath)
+	}
+	if restoreErr := movePathNoReplace(recoveryPath, srcPath); restoreErr != nil {
+		return "", errors.Join(primary, fmt.Errorf("local data is preserved at %q because restoring %q failed: %w", recoveryRel, relPath, restoreErr))
+	}
+	return "", primary
+}
+
+func (e *RootExecutor) restorePreservedLocalEntry(relPath, recoveryRel string, primary error) error {
+	recoveryPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(recoveryRel))
+	dstPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
+	if restoreErr := movePathNoReplace(recoveryPath, dstPath); restoreErr != nil {
+		return errors.Join(primary, fmt.Errorf("local data is preserved at %q because restoring %q failed: %w", recoveryRel, relPath, restoreErr))
+	}
+	return primary
+}
+
+func (e *RootExecutor) installDownloadedTemp(ctx context.Context, relPath, tempRelPath string, expectedLocal domain.LocalFingerprint) error {
+	tempPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(tempRelPath))
+	dstPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
+	if !expectedLocal.Present {
+		if err := movePathNoReplace(tempPath, dstPath); err != nil {
+			return fmt.Errorf("install downloaded file %q without replacing a concurrent local create: %w", relPath, err)
+		}
+		return nil
+	}
+
+	recoveryRel, err := e.preserveExpectedLocalEntry(ctx, relPath, expectedLocal)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return e.restorePreservedLocalEntry(relPath, recoveryRel, err)
+	}
+	if err := movePathNoReplace(tempPath, dstPath); err != nil {
+		return e.restorePreservedLocalEntry(relPath, recoveryRel, fmt.Errorf("install downloaded file %q without replacing a concurrent local write: %w", relPath, err))
+	}
+	recoveryPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(recoveryRel))
+	if err := os.Remove(recoveryPath); err != nil {
+		return fmt.Errorf("download installed at %q but could not remove preserved prior file %q: %w", relPath, recoveryRel, err)
 	}
 	return nil
 }
@@ -230,9 +302,7 @@ func (e *RootExecutor) CommitDownloadedTemp(ctx context.Context, relPath, tempRe
 		return domain.LocalFingerprint{}, fmt.Errorf("download temp %q is not a regular file", tempRelPath)
 	}
 
-	tempPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(tempRelPath))
-	dstPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
-	if err := replaceFile(tempPath, dstPath); err != nil {
+	if err := e.installDownloadedTemp(ctx, relPath, tempRelPath, expectedLocal); err != nil {
 		return domain.LocalFingerprint{}, fmt.Errorf("replace local file %q: %w", relPath, err)
 	}
 	return temp, nil

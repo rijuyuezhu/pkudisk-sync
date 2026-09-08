@@ -4,7 +4,7 @@ package executor
 
 import "golang.org/x/sys/windows"
 
-func replaceFile(src, dst string) error {
+func movePathNoReplace(src, dst string) error {
 	srcp, err := windows.UTF16PtrFromString(src)
 	if err != nil {
 		return err
@@ -13,5 +13,5 @@ func replaceFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	return windows.MoveFileEx(srcp, dstp, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
+	return windows.MoveFileEx(srcp, dstp, windows.MOVEFILE_WRITE_THROUGH)
 }
