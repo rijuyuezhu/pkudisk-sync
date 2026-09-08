@@ -84,11 +84,96 @@ jobs:
           /tmp/pkudisk-sync version | grep -Fx "pkudisk-sync $RELEASE_TAG"
           /tmp/pkudisk-sync version | grep -Fx "$(printf 'commit\t%s' "$commit")"
 
+  native-windows:
+    name: Windows native release gate
+    needs: metadata
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: '.go-version'
+          cache: true
+      - name: Run native Windows tests
+        shell: pwsh
+        run: go test ./...
+      - name: Build pkudisk-sync
+        shell: pwsh
+        run: go build -o pkudisk-sync.exe ./cmd/pkudisk-sync
+      - name: Exercise Scheduled Task lifecycle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Invoke-Sync {
+            param([Parameter(ValueFromRemainingArguments = $true)][string[]] $Arguments)
+            $output = & .\pkudisk-sync.exe @Arguments 2>&1
+            $code = $LASTEXITCODE
+            $output | Out-Host
+            if ($code -ne 0) {
+              throw "pkudisk-sync $($Arguments -join ' ') failed with exit code $code"
+            }
+            return $output
+          }
+
+          function Wait-SyncStatus {
+            param([string] $Expected)
+            $status = ''
+            for ($i = 0; $i -lt 30; $i++) {
+              $status = (Invoke-Sync service status | Out-String).Trim()
+              if ($status -eq $Expected) {
+                return
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            throw "scheduled task did not reach $Expected state: $status"
+          }
+
+          $installed = $false
+          try {
+            Invoke-Sync service install | Out-Null
+            $installed = $true
+            Wait-SyncStatus 'inactive'
+            Invoke-Sync service start | Out-Null
+            Wait-SyncStatus 'active'
+            Invoke-Sync service stop | Out-Null
+            Wait-SyncStatus 'inactive'
+            Invoke-Sync service uninstall | Out-Null
+            $installed = $false
+            Wait-SyncStatus 'not-installed'
+          }
+          finally {
+            if ($installed) {
+              & .\pkudisk-sync.exe service stop 2>&1 | Out-Host
+              & .\pkudisk-sync.exe service uninstall 2>&1 | Out-Host
+            }
+          }
+
+  native-macos:
+    name: macOS native release gate
+    needs: metadata
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: '.go-version'
+          cache: true
+      - run: go test ./...
+
   build:
     name: Build ${{ matrix.target }}
     needs:
       - metadata
       - quality
+      - native-windows
+      - native-macos
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:

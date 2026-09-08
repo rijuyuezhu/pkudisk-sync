@@ -715,7 +715,11 @@ func TestRunRootCycleMissingMarkerBlocksBeforeScan(t *testing.T) {
 func TestRunRootCycleBlocksChangedFollowedDirectoryIdentity(t *testing.T) {
 	ctx := context.Background()
 	state, root := newCycleRoot(t, true, false)
-	if err := state.InitializeSyncRoot(ctx, root.ID, map[string]string{"link": "linux:1:1"}); err != nil {
+	claims := map[string]domain.FollowedPhysicalClaim{"link": fakeFollowedClaim(domain.KindDir, "linux:1:1", "link")}
+	if ok, detail, err := state.ReserveFollowedPhysicalClaims(ctx, root.ID, claims); err != nil || !ok {
+		t.Fatalf("reserve initial followed claim = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+	if err := state.InitializeSyncRoot(ctx, root.ID, claims); err != nil {
 		t.Fatal(err)
 	}
 	for _, baseline := range []domain.Baseline{
@@ -727,15 +731,15 @@ func TestRunRootCycleBlocksChangedFollowedDirectoryIdentity(t *testing.T) {
 		}
 	}
 	data := &fakeDataPlane{
-		local:               map[string]domain.LocalFingerprint{"link": localDirFP()},
-		remote:              map[string]domain.RemoteFingerprint{"link": remoteDirFP("dir-link"), "link/a.txt": remoteFileFP("doc-a", "rev-a", 3)},
-		followedDirectories: map[string]string{"link": "linux:2:2"},
+		local:          map[string]domain.LocalFingerprint{"link": localDirFP()},
+		remote:         map[string]domain.RemoteFingerprint{"link": remoteDirFP("dir-link"), "link/a.txt": remoteFileFP("doc-a", "rev-a", 3)},
+		followedClaims: map[string]domain.FollowedPhysicalClaim{"link": {Kind: domain.KindDir, Identity: "linux:2:2"}},
 	}
 	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Blocked || result.BlockReason != "followed-directory-identity-changed" || !strings.Contains(result.BlockDetail, "changed physical identity") {
+	if !result.Blocked || result.BlockReason != "followed-physical-authority-blocked" || !strings.Contains(result.BlockDetail, "changed physical identity") {
 		t.Fatalf("cycle result = %+v", result)
 	}
 	if len(data.calls) != 0 {
@@ -749,7 +753,11 @@ func TestRunRootCycleBlocksChangedFollowedDirectoryIdentity(t *testing.T) {
 func TestRunRootCycleKeepsUnavailableFollowedDirectoryNonAuthoritative(t *testing.T) {
 	ctx := context.Background()
 	state, root := newCycleRoot(t, true, false)
-	if err := state.InitializeSyncRoot(ctx, root.ID, map[string]string{"link": "linux:1:1"}); err != nil {
+	claims := map[string]domain.FollowedPhysicalClaim{"link": fakeFollowedClaim(domain.KindDir, "linux:1:1", "link")}
+	if ok, detail, err := state.ReserveFollowedPhysicalClaims(ctx, root.ID, claims); err != nil || !ok {
+		t.Fatalf("reserve initial followed claim = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+	if err := state.InitializeSyncRoot(ctx, root.ID, claims); err != nil {
 		t.Fatal(err)
 	}
 	baseline := domain.Baseline{
@@ -782,20 +790,73 @@ func TestRunRootCycleBlocksNewFollowedDirectoryAfterInitialization(t *testing.T)
 	ctx := context.Background()
 	state, root := newCycleRoot(t, true, true)
 	data := &fakeDataPlane{
-		local:               map[string]domain.LocalFingerprint{"link": localDirFP()},
-		remote:              map[string]domain.RemoteFingerprint{"link": remoteDirFP("dir-link")},
-		followedDirectories: map[string]string{"link": "linux:1:1"},
+		local:          map[string]domain.LocalFingerprint{"link": localDirFP()},
+		remote:         map[string]domain.RemoteFingerprint{"link": remoteDirFP("dir-link")},
+		followedClaims: map[string]domain.FollowedPhysicalClaim{"link": {Kind: domain.KindDir, Identity: "linux:1:1"}},
 	}
 	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Blocked || result.BlockReason != "followed-directory-identity-changed" || !strings.Contains(result.BlockDetail, "no durable physical identity") {
+	if !result.Blocked || result.BlockReason != "followed-physical-authority-blocked" || !strings.Contains(result.BlockDetail, "no durable physical ownership claim") {
 		t.Fatalf("cycle result = %+v", result)
 	}
 	if len(data.calls) != 0 {
 		t.Fatalf("new followed boundary reached mutation path: %+v", data.calls)
 	}
+}
+
+func TestRunRootCycleBlocksCrossRootSharedFollowedPhysicalClaimBeforeMutation(t *testing.T) {
+	ctx := context.Background()
+	state, rootA := newCycleRoot(t, true, false)
+	localB := filepath.Join(t.TempDir(), "root-b")
+	if err := os.Mkdir(localB, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rootB, err := state.CreateSyncRoot(ctx, domain.SyncRoot{
+		UUID:                "cycle-root-uuid-b",
+		LocalRoot:           localB,
+		RemoteName:          domain.AppRemoteName,
+		RemoteRoot:          "Personal/Sync-B",
+		Enabled:             true,
+		PollIntervalSeconds: 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rootmarker.Ensure(rootB.LocalRoot, rootB.UUID); err != nil {
+		t.Fatal(err)
+	}
+	shared := domain.FollowedPhysicalClaim{Kind: domain.KindDir, Identity: "linux:49:shared"}
+	dataA := &fakeDataPlane{
+		local:          map[string]domain.LocalFingerprint{"link": localDirFP()},
+		remote:         map[string]domain.RemoteFingerprint{"link": remoteDirFP("dir-a")},
+		followedClaims: map[string]domain.FollowedPhysicalClaim{"link": shared},
+	}
+	resultA, err := RunRootCycle(ctx, rootA.ID, state, dataA, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resultA.Blocked || !resultA.Initialized {
+		t.Fatalf("first physical owner did not initialize cleanly: %+v", resultA)
+	}
+
+	dataB := &fakeDataPlane{
+		local:          map[string]domain.LocalFingerprint{"link": localDirFP()},
+		remote:         map[string]domain.RemoteFingerprint{"link": remoteDirFP("dir-b")},
+		followedClaims: map[string]domain.FollowedPhysicalClaim{"link": shared},
+	}
+	resultB, err := RunRootCycle(ctx, rootB.ID, state, dataB, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resultB.Blocked || resultB.BlockReason != "followed-physical-authority-blocked" || !strings.Contains(resultB.BlockDetail, "already owned by sync root") {
+		t.Fatalf("second physical owner was not blocked: %+v", resultB)
+	}
+	if len(dataB.calls) != 0 {
+		t.Fatalf("ownership-conflicted root reached mutation path: %+v", dataB.calls)
+	}
+	assertRootInitialized(t, state, rootB.ID, false)
 }
 
 func TestRunRootCycleCleansStaleRecoveryAfterProvenPostcondition(t *testing.T) {
@@ -896,7 +957,7 @@ func assertRootInitialized(t *testing.T, state *store.Store, rootID int64, want 
 type fakeDataPlane struct {
 	local                map[string]domain.LocalFingerprint
 	remote               map[string]domain.RemoteFingerprint
-	followedDirectories  map[string]string
+	followedClaims       map[string]domain.FollowedPhysicalClaim
 	excluded             []string
 	remoteRootMissing    bool
 	contentEqual         map[string]bool
@@ -933,9 +994,9 @@ func (f *cancelUploadDataPlane) Upload(ctx context.Context, _ string, _ domain.L
 	return domain.RemoteFingerprint{}, ctx.Err()
 }
 
-func (f *fakeDataPlane) ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]string, error) {
+func (f *fakeDataPlane) ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]domain.FollowedPhysicalClaim, error) {
 	f.scans++
-	return cloneLocal(f.local), append([]string(nil), f.excluded...), cloneStringsMap(f.followedDirectories), nil
+	return cloneLocal(f.local), append([]string(nil), f.excluded...), cloneFollowedClaims(f.followedClaims), nil
 }
 
 func (f *fakeDataPlane) ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error) {
@@ -1103,12 +1164,23 @@ func cloneLocal(in map[string]domain.LocalFingerprint) map[string]domain.LocalFi
 	return out
 }
 
-func cloneStringsMap(in map[string]string) map[string]string {
-	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
+func cloneFollowedClaims(in map[string]domain.FollowedPhysicalClaim) map[string]domain.FollowedPhysicalClaim {
+	out := make(map[string]domain.FollowedPhysicalClaim, len(in))
+	for rel, claim := range in {
+		if claim.TargetPath == "" {
+			claim.TargetPath = fakeFollowedTarget(rel)
+		}
+		out[rel] = claim
 	}
 	return out
+}
+
+func fakeFollowedTarget(rel string) string {
+	return filepath.Join(os.TempDir(), "pkudisk-sync-fake-followed", filepath.FromSlash(rel))
+}
+
+func fakeFollowedClaim(kind domain.EntryKind, identity, rel string) domain.FollowedPhysicalClaim {
+	return domain.FollowedPhysicalClaim{Kind: kind, Identity: identity, TargetPath: fakeFollowedTarget(rel)}
 }
 
 func cloneRemote(in map[string]domain.RemoteFingerprint) map[string]domain.RemoteFingerprint {

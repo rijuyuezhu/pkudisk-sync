@@ -28,7 +28,7 @@ If available, also run `golangci-lint run ./...` with the pinned toolchain.
 
 Then build and verify every target in `scripts/release-targets.txt`. Verification must use the exact clean source commit; a `-dirty` provenance string is appropriate for candidate testing but not for a published artifact.
 
-For service-manager changes, also run the affected native lifecycle test. Cross-compilation alone is not sufficient evidence that systemd, launchd, or Windows Task Scheduler behavior is correct.
+For service-manager changes, also run the affected native lifecycle test before tagging when that platform is available. Cross-compilation alone is not sufficient evidence that systemd, launchd, or Windows Task Scheduler behavior is correct. The GitHub release workflow provides the authoritative publish gate: for the exact tag SHA it always reruns macOS `go test ./...` and Windows `go test ./...` plus the Scheduled Task lifecycle before release archives are allowed to build.
 
 ## Artifact contents
 
@@ -50,6 +50,6 @@ Do not advise users to disable Gatekeeper, SmartScreen, or equivalent protection
 
 ## GitHub workflow
 
-`.github/workflows/release.yml` runs only for a release tag and builds the same six-target matrix from repository authorities. Creating the repository or pushing `main` does not create a release by itself.
+`.github/workflows/release.yml` runs only for a release tag. It validates tag metadata/main ancestry, runs the Ubuntu quality gate, independently runs native macOS and Windows gates for that exact tag SHA, and only then builds the six-target archive matrix. Publishing depends on those gated builds. It intentionally does not rely on branch protection or on an earlier `main` CI run. Creating the repository or pushing `main` does not create a release by itself.
 
 When `VERSION` contains a pre-release suffix such as `-alpha.1`, the workflow publishes the GitHub Release with the pre-release flag. A plain version such as `0.1.0` publishes a normal release.

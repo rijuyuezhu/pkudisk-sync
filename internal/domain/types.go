@@ -14,6 +14,16 @@ const (
 	KindDir  EntryKind = "dir"
 )
 
+// FollowedPhysicalClaim is the durable physical ownership identity for one
+// symlink target that is intentionally followed into the lexical sync
+// namespace. Both file and directory targets participate in the same global
+// ownership domain across configured roots.
+type FollowedPhysicalClaim struct {
+	Kind       EntryKind
+	Identity   string
+	TargetPath string
+}
+
 // LocalFingerprint is the local state used by reconciliation and local-side
 // compare-and-swap checks. Directory mtimes are deliberately not part of
 // directory equality; child entries represent directory contents.

@@ -21,7 +21,7 @@ A sync root is one explicit mapping:
 <absolute local directory>  <->  pkudisk:<remote directory>
 ```
 
-One daemon can own multiple independent roots. Local roots may not overlap each other, and selected remote paths may not overlap. Within one complete root scan, one physical filesystem identity may be owned by only one logical path, and followed symlinks that resolve directly inside another configured root are rejected. v0.1 does **not** maintain a daemon-wide device/inode registry across roots, so cross-root bind-mount aliases and cross-root hard links are unsupported and must not be used to select overlapping physical data. v0.1 intentionally uses one app-owned PKU Disk authentication profile named `pkudisk`; a config alias is not treated as account identity.
+One daemon can own multiple independent roots. Local roots may not overlap each other, and selected remote paths may not overlap. Within one complete root scan, one physical filesystem identity may be owned by only one logical path. In addition, every followed symlink target (file or directory) is reserved in the shared SQLite authority before planning or mutation: the same current physical identity or canonical physical target pathname cannot be owned by two configured roots. Followed symlinks that resolve directly inside another configured root are also rejected. Ordinary cross-root bind-mount or hard-link overlap that does not pass through a followed symlink remains unsupported rather than globally enumerated. v0.1 intentionally uses one app-owned PKU Disk authentication profile named `pkudisk`; a config alias is not treated as account identity.
 
 Each root has its own:
 
@@ -33,7 +33,7 @@ Each root has its own:
 - enabled/paused state;
 - initialization state;
 - symlink policy;
-- durable physical identities for followed-directory boundaries.
+- durable physical ownership claims for followed symlink targets.
 
 ## Three-way reconciliation
 
@@ -89,7 +89,7 @@ AnyShare delete is weaker than upload/download CAS. The pinned backend revalidat
 
 ### Followed symlinks and physical local targets
 
-The synchronization namespace remains lexical even when a root uses the default `follow` policy, but a local mutation is applied to the resolved physical target rather than replacing the symlink object. A followed target may live outside the selected root or on a different filesystem. Direct resolution into another configured root is rejected; cross-root bind-mount and hard-link aliases that do not preserve pathname ancestry are unsupported in v0.1 rather than claimed as globally deduplicated.
+The synchronization namespace remains lexical even when a root uses the default `follow` policy, but a local mutation is applied to the resolved physical target rather than replacing the symlink object. A followed target may live outside the selected root or on a different filesystem. Before any planner decision or external mutation, every followed file/directory target reserves a daemon-wide physical claim in SQLite. A second configured root cannot follow the same current filesystem object or the same canonical target pathname. Direct resolution into another configured root is rejected as an earlier lexical/physical boundary check. Ordinary cross-root bind-mount and hard-link overlap that is not reached through a followed symlink remains unsupported in v0.1.
 
 Before a local create/update/delete can enter `running`, the syncer resolves and durably pins its canonical absolute physical target in the operation journal. File staging and preservation slots are then created in that target's physical parent directory, keeping no-replace rename operations on the same filesystem.
 
@@ -97,9 +97,9 @@ For replacement or deletion of an existing target, the executor first atomically
 
 `ignore` is modeled as an excluded namespace rather than absence. Reconciliation skips the excluded prefix and descendants entirely, including deletion-gate accounting. The scanner applies this policy from `Lstat` before resolving the symlink, so an ignored link never gains authority merely because its target is another root or temporarily unavailable. `reject` instead makes the local observation incomplete by returning an error. Follow-mode cycles and aliases to a physical ancestor are excluded so recursive traversal cannot loop.
 
-A followed link whose final referent is missing is non-authoritative for that lexical prefix. A single `ENOENT` cannot distinguish an intentional referent delete from a temporarily unavailable external mount, so dangling followed targets never grant remote deletion authority. For followed **directory** boundaries, the successful initial pairing also records a durable platform physical identity (device+inode on Linux/macOS; volume+file ID on Windows). Later scans must prove the same identity before descendants regain deletion authority. A different identity at the same pathname, or a newly introduced followed-directory boundary on an initialized root, blocks reconciliation and requires deliberate re-pairing instead of being learned automatically. An unavailable boundary remains excluded while its prior durable identity is retained.
+A followed link whose final referent is missing is non-authoritative for that lexical prefix. A single `ENOENT` cannot distinguish an intentional referent delete from a temporarily unavailable external mount, so dangling followed targets never grant remote deletion authority. Every followed file/directory stores a durable global ownership claim. For followed **directories**, successful initial pairing fixes the platform physical identity (device+inode on Linux/macOS; volume+file ID on Windows); later scans must prove the same identity before descendants regain deletion authority. A different directory identity at the same pathname, or a newly introduced followed path on an initialized root, blocks reconciliation and requires deliberate re-pairing. For followed **files**, normal atomic-save patterns may replace the file inode/file-ID, so the current identity may advance only while the canonical target pathname remains the same and global identity/path ownership remains uncontested. An unavailable followed target remains excluded while its prior durable ownership claim is retained.
 
-Complete scans also enforce one logical owner per physical file/directory identity **within that root scan**. Sibling aliases, hard links to the same file, or a symlink expansion that would claim an object already reached through another logical path fail closed instead of creating independent baselines/journals for one physical object. This is intentionally not described as a daemon-wide guarantee across separate configured roots.
+Complete scans also enforce one logical owner per physical file/directory identity within a root scan. Sibling aliases, hard links to the same file, or a symlink expansion that would claim an object already reached through another logical path fail closed instead of creating independent baselines/journals for one physical object. Followed symlink targets have the additional daemon/store-wide claim described above, so two roots cannot independently follow the same ordinary external file or directory. The implementation still does not globally enumerate arbitrary non-symlink bind-mount/hard-link overlap between separately selected roots.
 
 Operation staging/recovery files are internal only when a durable local-mutation operation explicitly owns their exact physical path. A filename that merely resembles `.pkudisk-sync-tmp-op-<id>-download` or `...-recovery` is not silently hidden; without matching journal ownership it is a reserved-namespace error. The remote scanner rejects the same reserved namespace, keeping local and remote authority symmetric.
 

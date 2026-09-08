@@ -91,7 +91,7 @@ See [releasing.md](releasing.md) for the complete release checklist.
 
 ## Native service validation
 
-Cross-compilation is not enough for filesystem or service-manager changes. CI runs the full Go test suite natively on Linux, macOS, and Windows; the Windows job additionally exercises the per-user Scheduled Task lifecycle. Release-target cross-compilation remains a separate packaging/provenance check.
+Cross-compilation is not enough for filesystem or service-manager changes. CI runs the full Go test suite natively on Linux, macOS, and Windows; the Windows job additionally exercises the per-user Scheduled Task lifecycle. Release-target cross-compilation remains a separate packaging/provenance check. The tag-triggered release workflow independently reruns native macOS tests and native Windows tests plus the Scheduled Task lifecycle for the exact tag SHA before any release archive can be published; release safety does not depend on branch-protection configuration or a previous CI run.
 
 For Windows, the expected product lifecycle is:
 

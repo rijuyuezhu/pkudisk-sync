@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -571,7 +572,7 @@ VALUES('old-root', ?, 'pkudisk', 'Personal/Old', 1, 60, 1)`, oldRoot); err != ni
 	}
 }
 
-func TestMigrationV3ToV4AddsFollowedDirectoryBoundaryAuthority(t *testing.T) {
+func TestMigrationV3ToCurrentAddsFollowedPhysicalClaimAuthority(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()
 	dbPath := filepath.Join(base, "state-v3.sqlite3")
@@ -612,7 +613,7 @@ VALUES('v3-root', ?, 'pkudisk', 'Personal/V3', 1, 1, 'follow', 60, 1)`, filepath
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	boundaries, err := s.ListFollowedDirectoryBoundaries(ctx, 1)
+	boundaries, err := s.ListFollowedPhysicalClaims(ctx, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,7 +624,98 @@ VALUES('v3-root', ?, 'pkudisk', 'Personal/V3', 1, 1, 'follow', 60, 1)`, filepath
 	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Fatalf("schema version after v3 migration = %d, want 4", version)
+	if version != schemaVersion {
+		t.Fatalf("schema version after v3 migration = %d, want %d", version, schemaVersion)
+	}
+}
+
+func TestMigrationV4ToV5PreservesDuplicateLegacyClaimsButBlocksBothOwners(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	dbPath := filepath.Join(base, "state-v4-duplicate.sqlite3")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, schemaV1); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`ALTER TABLE sync_roots ADD COLUMN initialized INTEGER NOT NULL DEFAULT 0 CHECK (initialized IN (0, 1))`,
+		`ALTER TABLE sync_roots ADD COLUMN symlink_mode TEXT NOT NULL DEFAULT 'follow' CHECK (symlink_mode IN ('follow', 'reject', 'ignore'))`,
+		`ALTER TABLE operations ADD COLUMN local_target_path TEXT NOT NULL DEFAULT ''`,
+		`CREATE TABLE followed_directory_boundaries (
+            sync_root_id INTEGER NOT NULL,
+            rel_path TEXT NOT NULL,
+            physical_identity TEXT NOT NULL,
+            PRIMARY KEY(sync_root_id, rel_path),
+            FOREIGN KEY(sync_root_id) REFERENCES sync_roots(id) ON DELETE CASCADE
+        )`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	for _, row := range []struct {
+		uuid, localRoot, remoteRoot string
+	}{
+		{"v4-root-a", filepath.Join(base, "root-a"), "Personal/V4-A"},
+		{"v4-root-b", filepath.Join(base, "root-b"), "Personal/V4-B"},
+	} {
+		if _, err := db.ExecContext(ctx, `
+INSERT INTO sync_roots(uuid, local_root, remote_name, remote_root, enabled, initialized, symlink_mode, poll_interval_seconds, created_at_ns)
+VALUES(?, ?, 'pkudisk', ?, 1, 1, 'follow', 60, 1)`, row.uuid, row.localRoot, row.remoteRoot); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	for rootID, relPath := range map[int64]string{1: "link-a", 2: "link-b"} {
+		if _, err := db.ExecContext(ctx, `
+INSERT INTO followed_directory_boundaries(sync_root_id, rel_path, physical_identity)
+VALUES(?, ?, 'linux:49:shared')`, rootID, relPath); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA user_version = 4"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("v4 duplicate ownership migration should remain inspectable: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	for rootID, relPath := range map[int64]string{1: "link-a", 2: "link-b"} {
+		claims, err := s.ListFollowedPhysicalClaims(ctx, rootID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim := claims[relPath]
+		if claim.Kind != domain.KindDir || claim.Identity != "linux:49:shared" || claim.TargetPath != "" {
+			t.Fatalf("migrated root %d claim = %+v", rootID, claim)
+		}
+		claim.TargetPath = filepath.Join(base, "shared-current")
+		observed := map[string]domain.FollowedPhysicalClaim{relPath: claim}
+		ok, detail, err := s.ReserveFollowedPhysicalClaims(ctx, rootID, observed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok || !strings.Contains(detail, "already owned by sync root") {
+			t.Fatalf("legacy duplicate root %d was not blocked: ok=%v detail=%q", rootID, ok, detail)
+		}
+	}
+	var version int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("schema version after v4 migration = %d, want %d", version, schemaVersion)
 	}
 }
