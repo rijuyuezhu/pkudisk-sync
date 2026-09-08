@@ -33,6 +33,93 @@ func TestSetupRootCreatesMarkerAndDurableRoot(t *testing.T) {
 	}
 }
 
+func TestSetupRootCanonicalizesSymlinkedParent(t *testing.T) {
+	ctx := context.Background()
+	state := openDaemonTestStore(t)
+	base := t.TempDir()
+	realParent := filepath.Join(base, "real")
+	realRoot := filepath.Join(realParent, "selected")
+	if err := os.MkdirAll(realRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	aliasParent := filepath.Join(base, "alias")
+	if err := os.Symlink(realParent, aliasParent); err != nil {
+		t.Fatal(err)
+	}
+	root := daemonTestRoot(t, "canonical-root", "Personal/Canonical")
+	root.LocalRoot = filepath.Join(aliasParent, "selected")
+
+	stored, err := SetupRoot(ctx, state, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(root.LocalRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.LocalRoot != resolved {
+		t.Fatalf("stored local root = %q, want physical path %q", stored.LocalRoot, resolved)
+	}
+	if err := rootmarker.Check(resolved, root.UUID); err != nil {
+		t.Fatalf("marker not established on physical root: %v", err)
+	}
+}
+
+func TestSetupRootRejectsOverlapThroughSymlinkedParent(t *testing.T) {
+	ctx := context.Background()
+	state := openDaemonTestStore(t)
+	base := t.TempDir()
+	realRoot := filepath.Join(base, "real")
+	child := filepath.Join(realRoot, "child")
+	if err := os.MkdirAll(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	first := daemonTestRoot(t, "root-physical", "Personal/One")
+	first.LocalRoot = realRoot
+	if _, err := SetupRoot(ctx, state, first); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(base, "alias")
+	if err := os.Symlink(realRoot, alias); err != nil {
+		t.Fatal(err)
+	}
+	second := daemonTestRoot(t, "root-alias-child", "Personal/Two")
+	second.LocalRoot = filepath.Join(alias, "child")
+
+	if _, err := SetupRoot(ctx, state, second); err == nil {
+		t.Fatal("physical child overlap through symlinked parent was accepted")
+	}
+	if _, err := os.Lstat(filepath.Join(child, rootmarker.FileName)); !os.IsNotExist(err) {
+		t.Fatalf("rejected alias overlap created nested marker: %v", err)
+	}
+	roots, err := state.ListSyncRoots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roots) != 1 || roots[0].UUID != first.UUID {
+		t.Fatalf("rejected alias overlap changed durable ownership: %+v", roots)
+	}
+}
+
+func TestSetupRootStillRejectsFinalSymlink(t *testing.T) {
+	ctx := context.Background()
+	state := openDaemonTestStore(t)
+	base := t.TempDir()
+	realRoot := filepath.Join(base, "real")
+	if err := os.Mkdir(realRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(base, "alias")
+	if err := os.Symlink(realRoot, alias); err != nil {
+		t.Fatal(err)
+	}
+	root := daemonTestRoot(t, "symlink-root", "Personal/Symlink")
+	root.LocalRoot = alias
+	if _, err := SetupRoot(ctx, state, root); err == nil {
+		t.Fatal("final symlink root was accepted")
+	}
+}
+
 func TestSetupRootReservesOwnershipBeforeCreatingMarker(t *testing.T) {
 	ctx := context.Background()
 	state := openDaemonTestStore(t)

@@ -79,6 +79,29 @@ func TestCreateSyncRootRejectsOverlappingOwnership(t *testing.T) {
 	}
 }
 
+func TestLocalRootsOverlapUsesPlatformNamespaceSemantics(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "Roots")
+	caseChild := filepath.Join(filepath.Dir(base), "roots", "Child")
+	if !localRootsOverlapForOS(base, caseChild, "darwin") {
+		t.Fatal("darwin case alias was not treated as overlapping")
+	}
+	if !localRootsOverlapForOS(base, caseChild, "windows") {
+		t.Fatal("windows case alias was not treated as overlapping")
+	}
+	if localRootsOverlapForOS(base, caseChild, "linux") {
+		t.Fatal("linux distinct case spellings were treated as overlapping")
+	}
+
+	composed := filepath.Join(t.TempDir(), "caf\u00e9")
+	decomposedChild := filepath.Join(filepath.Dir(composed), "cafe\u0301", "Child")
+	if !localRootsOverlapForOS(composed, decomposedChild, "darwin") {
+		t.Fatal("darwin normalization alias was not treated as overlapping")
+	}
+	if localRootsOverlapForOS(composed, decomposedChild, "linux") {
+		t.Fatal("linux normalization-distinct spellings were treated as overlapping")
+	}
+}
+
 func TestCreateSyncRootSerializesOwnershipAcrossStoreInstances(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "state.db")

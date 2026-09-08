@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
@@ -41,6 +42,11 @@ func setupRoot(ctx context.Context, state *store.Store, root domain.SyncRoot, re
 	if state == nil {
 		return domain.SyncRoot{}, fmt.Errorf("state store must not be nil")
 	}
+	canonicalLocalRoot, err := canonicalizeLocalRoot(root.LocalRoot)
+	if err != nil {
+		return domain.SyncRoot{}, err
+	}
+	root.LocalRoot = canonicalLocalRoot
 	reservation, err := state.PrepareSyncRootCreate(ctx, root)
 	if err != nil {
 		return domain.SyncRoot{}, fmt.Errorf("reserve sync root ownership: %w", err)
@@ -92,6 +98,39 @@ func setupRoot(ctx context.Context, state *store.Store, root domain.SyncRoot, re
 		return domain.SyncRoot{}, fmt.Errorf("register sync root after marker established: %w", err)
 	}
 	return stored, nil
+}
+
+// canonicalizeLocalRoot resolves symlinks in ancestor components before the
+// SQLite ownership reservation. The final user-selected path itself must still
+// be a real directory, preserving the root-marker contract while preventing a
+// symlinked parent from making two lexical roots refer to the same subtree.
+func canonicalizeLocalRoot(localRoot string) (string, error) {
+	if localRoot == "" || !filepath.IsAbs(localRoot) || filepath.Clean(localRoot) != localRoot {
+		return "", fmt.Errorf("local root %q must be a canonical absolute path", localRoot)
+	}
+	info, err := os.Lstat(localRoot)
+	if err != nil {
+		return "", fmt.Errorf("stat local root %q: %w", localRoot, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", fmt.Errorf("local root %q must be a real directory", localRoot)
+	}
+	resolved, err := filepath.EvalSymlinks(localRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve physical local root %q: %w", localRoot, err)
+	}
+	resolved = filepath.Clean(resolved)
+	if !filepath.IsAbs(resolved) {
+		return "", fmt.Errorf("resolved local root %q is not absolute", resolved)
+	}
+	resolvedInfo, err := os.Lstat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("stat resolved local root %q: %w", resolved, err)
+	}
+	if resolvedInfo.Mode()&os.ModeSymlink != 0 || !resolvedInfo.IsDir() {
+		return "", fmt.Errorf("resolved local root %q must be a real directory", resolved)
+	}
+	return resolved, nil
 }
 
 // RemoveRoot unregisters one selected directory pair without deleting any

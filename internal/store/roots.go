@@ -5,8 +5,11 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
+
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
 )
@@ -276,7 +279,24 @@ func checkSyncRootOwnershipAgainst(roots []domain.SyncRoot, candidate domain.Syn
 }
 
 func localRootsOverlap(a, b string) bool {
+	return localRootsOverlapForOS(a, b, runtime.GOOS)
+}
+
+func localRootsOverlapForOS(a, b, targetOS string) bool {
+	a = localRootComparisonPath(a, targetOS)
+	b = localRootComparisonPath(b, targetOS)
 	return localRootContains(a, b) || localRootContains(b, a)
+}
+
+func localRootComparisonPath(value, targetOS string) string {
+	switch targetOS {
+	case "windows":
+		return strings.ToLower(value)
+	case "darwin":
+		return strings.ToLower(norm.NFC.String(value))
+	default:
+		return value
+	}
 }
 
 func localRootContains(parent, child string) bool {
