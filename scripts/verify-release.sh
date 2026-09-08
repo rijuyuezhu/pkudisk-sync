@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 4 ]]; then
-  echo "usage: $0 ARCHIVE GOOS/GOARCH RELEASE SOURCE_COMMIT" >&2
+if [[ $# -ne 5 ]]; then
+  echo "usage: $0 ARCHIVE GOOS/GOARCH RELEASE SOURCE_COMMIT GO_VERSION" >&2
   exit 2
 fi
 
@@ -10,6 +10,7 @@ archive=$1
 target=$2
 release=$3
 source_commit=$4
+expected_go=$5
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
 if [[ ! -f $archive ]]; then
@@ -20,8 +21,8 @@ if ! grep -Fxq -- "$target" "$root/scripts/release-targets.txt"; then
   echo "unsupported release target: $target" >&2
   exit 1
 fi
-if [[ -z $release || -z $source_commit ]]; then
-  echo "release and source commit must not be empty" >&2
+if [[ -z $release || -z $source_commit || -z $expected_go ]]; then
+  echo "release, source commit and Go version must not be empty" >&2
   exit 1
 fi
 for command in unzip go; do
@@ -91,6 +92,17 @@ grep -Fxq "source-commit: $source_commit" "$buildinfo" || {
   echo "BUILDINFO source commit does not match $source_commit" >&2
   exit 1
 }
+grep -Fq "go: go version go${expected_go} " "$buildinfo" || {
+  echo "BUILDINFO Go toolchain does not match go${expected_go}" >&2
+  exit 1
+}
+
+binary_version=$(go version "$package_dir/$binary_name")
+binary_go=${binary_version##* }
+if [[ $binary_go != "go${expected_go}" ]]; then
+  echo "binary Go toolchain does not match go${expected_go}: $binary_version" >&2
+  exit 1
+fi
 
 module_info="$stage/module-info.txt"
 go version -m "$package_dir/$binary_name" > "$module_info"
