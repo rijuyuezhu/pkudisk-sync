@@ -736,6 +736,38 @@ func TestServiceStartRefusesForegroundDaemonBeforeManagerStart(t *testing.T) {
 	}
 }
 
+func TestServiceInstallRefusesRunningDaemonBeforeManagerInstall(t *testing.T) {
+	for _, name := range []string{
+		"PKUDISK_SYNC_STATE_DB",
+		"PKUDISK_SYNC_RCLONE_CONFIG",
+		"PKUDISK_SYNC_CACHE_DIR",
+		"PKUDISK_SYNC_RUNTIME_DIR",
+	} {
+		t.Setenv(name, "")
+	}
+	paths := cliTestPaths(t)
+	if err := paths.PrepareRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	held, err := daemonlock.Acquire(paths.RuntimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
+	app.executablePath = func() (string, error) { return filepath.Join(t.TempDir(), "pkudisk-sync"), nil }
+	fake := &fakeServiceManager{}
+	app.newService = func(string) (userservice.Manager, error) { return fake, nil }
+	err = app.Run(context.Background(), []string{"service", "install"})
+	if err == nil || !errors.Is(err, daemonlock.ErrAlreadyRunning) || !strings.Contains(err.Error(), "user service") {
+		t.Fatalf("service install error = %v", err)
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("service manager install was invoked despite occupied daemon lease: %v", fake.calls)
+	}
+}
+
 func TestServiceInstallAndStartRejectPathOverridesBeforeProvider(t *testing.T) {
 	for _, command := range []string{"install", "start"} {
 		t.Run(command, func(t *testing.T) {

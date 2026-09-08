@@ -413,8 +413,22 @@ func (a *Application) runService(ctx context.Context, args []string) error {
 	}
 	switch args[0] {
 	case "install":
-		if err := manager.Install(ctx); err != nil {
+		if err := a.paths.PrepareRuntime(); err != nil {
 			return err
+		}
+		lease, err := daemonlock.Acquire(a.paths.RuntimeDir)
+		if err != nil {
+			if errors.Is(err, daemonlock.ErrAlreadyRunning) {
+				return fmt.Errorf("service install requires the foreground daemon and user service to be stopped: %w", err)
+			}
+			return fmt.Errorf("preflight service install daemon lease: %w", err)
+		}
+		if err := manager.Install(ctx); err != nil {
+			_ = lease.Close()
+			return err
+		}
+		if err := lease.Close(); err != nil {
+			return fmt.Errorf("release service install daemon lease preflight: %w", err)
 		}
 		fmt.Fprintln(a.stdout, "service installed")
 	case "uninstall":

@@ -73,11 +73,15 @@ func (m *launchctlManager) Start(ctx context.Context) error {
 	if err := m.requireInstalled(); err != nil {
 		return err
 	}
+	// launchd caches ProgramArguments when a plist is bootstrapped. Reinstalling
+	// the plist from a new executable path is therefore not enough by itself:
+	// unload any existing inactive job so bootstrap below always reads the
+	// current on-disk definition. The CLI daemon-lease preflight prevents this
+	// path from racing a live sync process.
 	if _, err := m.run(ctx, "launchctl", "print", m.target); err == nil {
-		if _, err := m.run(ctx, "launchctl", "kickstart", "-k", m.target); err != nil {
-			return fmt.Errorf("restart launch agent: %w", err)
+		if _, err := m.run(ctx, "launchctl", "bootout", m.target); err != nil {
+			return fmt.Errorf("boot out launch agent before start: %w", err)
 		}
-		return nil
 	}
 	if _, err := m.run(ctx, "launchctl", "bootstrap", m.domain, m.plistPath); err != nil {
 		return fmt.Errorf("bootstrap launch agent: %w", err)
