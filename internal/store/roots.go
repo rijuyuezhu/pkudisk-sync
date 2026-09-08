@@ -271,7 +271,7 @@ func checkSyncRootOwnershipAgainst(roots []domain.SyncRoot, candidate domain.Syn
 		if localRootsOverlap(existing.LocalRoot, candidate.LocalRoot) {
 			return fmt.Errorf("local sync root %q overlaps configured root %q", candidate.LocalRoot, existing.LocalRoot)
 		}
-		if existing.RemoteName == candidate.RemoteName && remoteRootsOverlap(existing.RemoteRoot, candidate.RemoteRoot) {
+		if remoteRootsOverlap(existing.RemoteRoot, candidate.RemoteRoot) {
 			return fmt.Errorf("remote sync root %q:%q overlaps configured root %q:%q", candidate.RemoteName, candidate.RemoteRoot, existing.RemoteName, existing.RemoteRoot)
 		}
 	}

@@ -49,11 +49,6 @@ func TestCreateSyncRootRejectsOverlappingOwnership(t *testing.T) {
 			wantErr:   true,
 		},
 		{
-			name:      "same remote path under different remote config is independent",
-			existing:  testSyncRoot("one", filepath.Join(localBase, "Data"), "pkudisk-a", "Personal/Sync"),
-			candidate: testSyncRoot("two", filepath.Join(localBase, "Work"), "pkudisk-b", "Personal/Sync"),
-		},
-		{
 			name:      "disabled root still owns its namespace",
 			existing:  testSyncRoot("one", filepath.Join(localBase, "Data"), "pkudisk", "Personal/Sync"),
 			candidate: testSyncRoot("two", filepath.Join(localBase, "Work"), "pkudisk", "Personal/Sync/sub"),

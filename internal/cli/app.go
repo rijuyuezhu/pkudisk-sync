@@ -110,12 +110,12 @@ func (a *Application) printUsage() {
 	fmt.Fprintln(a.stdout, "Commands:")
 	fmt.Fprintln(a.stdout, "  paths                              Show app-owned state/config/cache/runtime paths")
 	fmt.Fprintln(a.stdout, "  version                            Show build version and provenance")
-	fmt.Fprintln(a.stdout, "  remote configure [NAME]            Configure or re-authenticate a PKU Disk remote")
+	fmt.Fprintln(a.stdout, "  remote configure                   Configure or re-authenticate the PKU Disk account")
 	fmt.Fprintln(a.stdout, "  status                             Summarize roots, operations, and conflicts")
 	fmt.Fprintln(a.stdout, "  conflict list [--root ID]          List unresolved conflicts")
 	fmt.Fprintln(a.stdout, "  conflict resolve ID --keep-local   Queue exact-state resolution using local data")
 	fmt.Fprintln(a.stdout, "  conflict resolve ID --keep-remote  Queue exact-state resolution using remote data")
-	fmt.Fprintln(a.stdout, "  root add --local PATH --remote R:P Add one selected directory pair")
+	fmt.Fprintln(a.stdout, "  root add --local PATH --remote pkudisk:P Add one selected directory pair")
 	fmt.Fprintln(a.stdout, "  root list                          List selected directory pairs")
 	fmt.Fprintln(a.stdout, "  root pause ID                      Pause one selected pair")
 	fmt.Fprintln(a.stdout, "  root resume ID                     Resume one selected pair")
@@ -148,17 +148,10 @@ func (a *Application) runVersion(args []string) error {
 
 func (a *Application) runRemote(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] != "configure" {
-		return fmt.Errorf("remote requires: configure [NAME]")
+		return fmt.Errorf("remote requires: configure")
 	}
-	if len(args) > 2 {
-		return fmt.Errorf("remote configure accepts at most one remote name")
-	}
-	name := "pkudisk"
-	if len(args) == 2 {
-		name = strings.TrimSpace(args[1])
-		if name == "" {
-			return fmt.Errorf("remote name must not be empty")
-		}
+	if len(args) != 1 {
+		return fmt.Errorf("remote configure takes no remote name; v0.1 uses the single app-owned remote %q", domain.AppRemoteName)
 	}
 	if err := a.paths.PrepareRuntime(); err != nil {
 		return err
@@ -171,10 +164,10 @@ func (a *Application) runRemote(ctx context.Context, args []string) error {
 	if err := a.paths.PrepareConfig(); err != nil {
 		return err
 	}
-	if err := a.configureRemote(ctx, a.paths.RcloneConfig, name); err != nil {
+	if err := a.configureRemote(ctx, a.paths.RcloneConfig, domain.AppRemoteName); err != nil {
 		return err
 	}
-	fmt.Fprintf(a.stdout, "configured PKU Disk remote %s in %s\n", name, a.paths.RcloneConfig)
+	fmt.Fprintf(a.stdout, "configured PKU Disk remote %s in %s\n", domain.AppRemoteName, a.paths.RcloneConfig)
 	return nil
 }
 
@@ -525,6 +518,9 @@ func (a *Application) runRootAdd(ctx context.Context, args []string) error {
 	remoteName, remoteRoot, err := parseRemoteSpec(*remoteArg)
 	if err != nil {
 		return err
+	}
+	if remoteName != domain.AppRemoteName {
+		return fmt.Errorf("remote name %q is unsupported; v0.1 uses the single app-owned remote %q", remoteName, domain.AppRemoteName)
 	}
 	if err := a.paths.PrepareConfig(); err != nil {
 		return err

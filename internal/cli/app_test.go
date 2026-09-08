@@ -478,7 +478,7 @@ func TestVersionCommandUsesDevelopmentDefaults(t *testing.T) {
 	}
 }
 
-func TestRemoteConfigureUsesAppOwnedConfigAndDefaultsName(t *testing.T) {
+func TestRemoteConfigureUsesSingleAppOwnedRemote(t *testing.T) {
 	paths := cliTestPaths(t)
 	var stdout bytes.Buffer
 	app := New(paths, &stdout, &bytes.Buffer{})
@@ -501,14 +501,33 @@ func TestRemoteConfigureUsesAppOwnedConfigAndDefaultsName(t *testing.T) {
 	}
 
 	gotName = ""
-	if err := app.Run(context.Background(), []string{"remote", "configure", "school"}); err != nil {
-		t.Fatal(err)
+	if err := app.Run(context.Background(), []string{"remote", "configure", "school"}); err == nil || !strings.Contains(err.Error(), "single app-owned remote") {
+		t.Fatalf("custom remote configure error = %v", err)
 	}
-	if gotName != "school" {
-		t.Fatalf("custom remote name = %q", gotName)
+	if gotName != "" {
+		t.Fatalf("custom remote name reached configureRemote: %q", gotName)
 	}
-	if err := app.Run(context.Background(), []string{"remote", "configure", "a", "b"}); err == nil {
-		t.Fatal("remote configure accepted multiple names")
+}
+
+func TestRootAddRejectsNonAppRemoteBeforeConfigMutation(t *testing.T) {
+	paths := cliTestPaths(t)
+	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
+	installed := false
+	validated := false
+	app.installRcloneConfig = func(string) error {
+		installed = true
+		return nil
+	}
+	app.validateRemote = func(string) error {
+		validated = true
+		return nil
+	}
+	err := app.Run(context.Background(), []string{"root", "add", "--local", t.TempDir(), "--remote", "school:Personal/Data"})
+	if err == nil || !strings.Contains(err.Error(), "single app-owned remote") {
+		t.Fatalf("root add error = %v", err)
+	}
+	if installed || validated {
+		t.Fatalf("unsupported remote reached config surface: installed=%v validated=%v", installed, validated)
 	}
 }
 

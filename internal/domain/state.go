@@ -10,6 +10,11 @@ import (
 
 const maxPollIntervalSeconds int64 = (1<<63 - 1) / int64(time.Second)
 
+// AppRemoteName is the single app-owned PKU Disk authentication authority in
+// v0.1. Multiple selected roots share this profile; multiple accounts/profiles
+// need an explicit stable account-identity model before they can be safe.
+const AppRemoteName = "pkudisk"
+
 // SyncRoot is one independently reconciled local/remote root pair.
 type SyncRoot struct {
 	ID                  int64
@@ -38,6 +43,9 @@ func (r SyncRoot) Validate() error {
 	}
 	if strings.TrimSpace(r.RemoteName) == "" {
 		return fmt.Errorf("remote name must not be empty")
+	}
+	if r.RemoteName != AppRemoteName {
+		return fmt.Errorf("remote name %q is unsupported; v0.1 uses the single app-owned remote %q", r.RemoteName, AppRemoteName)
 	}
 	if strings.TrimSpace(r.RemoteRoot) == "" {
 		return fmt.Errorf("remote root must not be empty")

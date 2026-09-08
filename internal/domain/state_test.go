@@ -29,6 +29,7 @@ func TestSyncRootValidateCanonicalPaths(t *testing.T) {
 		{name: "absolute remote root", edit: func(r *SyncRoot) { r.RemoteRoot = "/Personal/Sync" }},
 		{name: "unclean remote root", edit: func(r *SyncRoot) { r.RemoteRoot = "Personal/x/../Sync" }},
 		{name: "escaping remote root", edit: func(r *SyncRoot) { r.RemoteRoot = "../Sync" }},
+		{name: "alternate remote name", edit: func(r *SyncRoot) { r.RemoteName = "school" }},
 		{name: "negative poll interval", edit: func(r *SyncRoot) { r.PollIntervalSeconds = -1 }},
 		{name: "overflowing poll interval", edit: func(r *SyncRoot) { r.PollIntervalSeconds = maxPollIntervalSeconds + 1 }},
 	}
