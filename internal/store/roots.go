@@ -282,14 +282,7 @@ WHERE id = ?
 // reconciliation has no unresolved conflicts/content checks and every external
 // mutation has been observed and committed.
 func (s *Store) MarkSyncRootInitialized(ctx context.Context, id int64) error {
-	if id <= 0 {
-		return fmt.Errorf("sync root ID must be positive")
-	}
-	result, err := s.db.ExecContext(ctx, `UPDATE sync_roots SET initialized = 1 WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("mark sync root initialized: %w", err)
-	}
-	return requireOneRow(result, "sync root")
+	return s.InitializeSyncRoot(ctx, id, nil)
 }
 
 func checkSyncRootOwnershipAgainst(roots []domain.SyncRoot, candidate domain.SyncRoot) error {

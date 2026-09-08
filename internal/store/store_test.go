@@ -570,3 +570,60 @@ VALUES('old-root', ?, 'pkudisk', 'Personal/Old', 1, 60, 1)`, oldRoot); err != ni
 		t.Fatalf("schema version after migration = %d, want %d", version, schemaVersion)
 	}
 }
+
+func TestMigrationV3ToV4AddsFollowedDirectoryBoundaryAuthority(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	dbPath := filepath.Join(base, "state-v3.sqlite3")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, schemaV1); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`ALTER TABLE sync_roots ADD COLUMN initialized INTEGER NOT NULL DEFAULT 0 CHECK (initialized IN (0, 1))`,
+		`ALTER TABLE sync_roots ADD COLUMN symlink_mode TEXT NOT NULL DEFAULT 'follow' CHECK (symlink_mode IN ('follow', 'reject', 'ignore'))`,
+		`ALTER TABLE operations ADD COLUMN local_target_path TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO sync_roots(uuid, local_root, remote_name, remote_root, enabled, initialized, symlink_mode, poll_interval_seconds, created_at_ns)
+VALUES('v3-root', ?, 'pkudisk', 'Personal/V3', 1, 1, 'follow', 60, 1)`, filepath.Join(base, "root")); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA user_version = 3"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	boundaries, err := s.ListFollowedDirectoryBoundaries(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(boundaries) != 0 {
+		t.Fatalf("v3 migration invented followed directory identities: %+v", boundaries)
+	}
+	var version int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 4 {
+		t.Fatalf("schema version after v3 migration = %d, want 4", version)
+	}
+}

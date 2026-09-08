@@ -712,6 +712,137 @@ func TestRunRootCycleMissingMarkerBlocksBeforeScan(t *testing.T) {
 	}
 }
 
+func TestRunRootCycleBlocksChangedFollowedDirectoryIdentity(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	if err := state.InitializeSyncRoot(ctx, root.ID, map[string]string{"link": "linux:1:1"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, baseline := range []domain.Baseline{
+		{SyncRootID: root.ID, RelPath: "link", Local: localDirFP(), Remote: remoteDirFP("dir-link")},
+		{SyncRootID: root.ID, RelPath: "link/a.txt", Local: localFileFP(3, 30), Remote: remoteFileFP("doc-a", "rev-a", 3)},
+	} {
+		if err := state.PutBaseline(ctx, baseline); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data := &fakeDataPlane{
+		local:               map[string]domain.LocalFingerprint{"link": localDirFP()},
+		remote:              map[string]domain.RemoteFingerprint{"link": remoteDirFP("dir-link"), "link/a.txt": remoteFileFP("doc-a", "rev-a", 3)},
+		followedDirectories: map[string]string{"link": "linux:2:2"},
+	}
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Blocked || result.BlockReason != "followed-directory-identity-changed" || !strings.Contains(result.BlockDetail, "changed physical identity") {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if len(data.calls) != 0 {
+		t.Fatalf("identity change reached mutation path: %+v", data.calls)
+	}
+	if _, ok, err := state.GetBaseline(ctx, root.ID, "link/a.txt"); err != nil || !ok {
+		t.Fatalf("identity change altered descendant baseline: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRunRootCycleKeepsUnavailableFollowedDirectoryNonAuthoritative(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	if err := state.InitializeSyncRoot(ctx, root.ID, map[string]string{"link": "linux:1:1"}); err != nil {
+		t.Fatal(err)
+	}
+	baseline := domain.Baseline{
+		SyncRootID: root.ID,
+		RelPath:    "link/a.txt",
+		Local:      localFileFP(3, 30),
+		Remote:     remoteFileFP("doc-a", "rev-a", 3),
+	}
+	if err := state.PutBaseline(ctx, baseline); err != nil {
+		t.Fatal(err)
+	}
+	data := &fakeDataPlane{
+		local:    make(map[string]domain.LocalFingerprint),
+		remote:   map[string]domain.RemoteFingerprint{"link/a.txt": baseline.Remote},
+		excluded: []string{"link"},
+	}
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Blocked || len(data.calls) != 0 {
+		t.Fatalf("unavailable followed boundary gained authority: result=%+v calls=%+v", result, data.calls)
+	}
+	if _, ok, err := state.GetBaseline(ctx, root.ID, "link/a.txt"); err != nil || !ok {
+		t.Fatalf("excluded boundary changed baseline: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRunRootCycleBlocksNewFollowedDirectoryAfterInitialization(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, true)
+	data := &fakeDataPlane{
+		local:               map[string]domain.LocalFingerprint{"link": localDirFP()},
+		remote:              map[string]domain.RemoteFingerprint{"link": remoteDirFP("dir-link")},
+		followedDirectories: map[string]string{"link": "linux:1:1"},
+	}
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Blocked || result.BlockReason != "followed-directory-identity-changed" || !strings.Contains(result.BlockDetail, "no durable physical identity") {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if len(data.calls) != 0 {
+		t.Fatalf("new followed boundary reached mutation path: %+v", data.calls)
+	}
+}
+
+func TestRunRootCycleCleansStaleRecoveryAfterProvenPostcondition(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, true)
+	baseline := domain.Baseline{
+		SyncRootID: root.ID,
+		RelPath:    "gone.txt",
+		Local:      localFileFP(4, 40),
+		Remote:     remoteFileFP("doc-gone", "rev-gone", 4),
+	}
+	if err := state.PutBaseline(ctx, baseline); err != nil {
+		t.Fatal(err)
+	}
+	op, err := state.CreateOperation(ctx, domain.Operation{
+		SyncRootID:      root.ID,
+		Kind:            domain.OperationDeleteLocal,
+		EntryKind:       domain.KindFile,
+		SrcPath:         "gone.txt",
+		LocalTargetPath: filepath.Join(root.LocalRoot, "gone.txt"),
+		ExpectedLocal:   baseline.Local,
+		ExpectedRemote:  domain.RemoteExpectation{Absent: true},
+		Phase:           domain.OperationRecovering,
+		Attempts:        1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := &recoveryArtifactDataPlane{
+		fakeDataPlane: &fakeDataPlane{local: make(map[string]domain.LocalFingerprint), remote: make(map[string]domain.RemoteFingerprint)},
+		artifact:      filepath.Join(root.LocalRoot, ".pkudisk-sync-tmp-op-stale-recovery"),
+	}
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Blocked || result.Recovered != 1 || !data.cleaned {
+		t.Fatalf("stale recovery did not auto-complete: result=%+v cleaned=%v", result, data.cleaned)
+	}
+	if _, ok, err := state.GetOperation(ctx, op.ID); err != nil || ok {
+		t.Fatalf("completed recovery operation remains: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := state.GetBaseline(ctx, root.ID, "gone.txt"); err != nil || ok {
+		t.Fatalf("completed delete-local baseline remains: ok=%v err=%v", ok, err)
+	}
+}
+
 func newCycleRoot(t *testing.T, marker, initialized bool) (*store.Store, domain.SyncRoot) {
 	t.Helper()
 	ctx := context.Background()
@@ -765,6 +896,8 @@ func assertRootInitialized(t *testing.T, state *store.Store, rootID int64, want 
 type fakeDataPlane struct {
 	local                map[string]domain.LocalFingerprint
 	remote               map[string]domain.RemoteFingerprint
+	followedDirectories  map[string]string
+	excluded             []string
 	remoteRootMissing    bool
 	contentEqual         map[string]bool
 	calls                []string
@@ -782,10 +915,16 @@ type cancelUploadDataPlane struct {
 type recoveryArtifactDataPlane struct {
 	*fakeDataPlane
 	artifact string
+	cleaned  bool
 }
 
 func (f *recoveryArtifactDataPlane) LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error) {
 	return f.artifact, true, nil
+}
+
+func (f *recoveryArtifactDataPlane) CleanupLocalRecoveryArtifact(context.Context, domain.Operation) error {
+	f.cleaned = true
+	return nil
 }
 
 func (f *cancelUploadDataPlane) Upload(ctx context.Context, _ string, _ domain.LocalFingerprint, _ domain.RemoteExpectation) (domain.RemoteFingerprint, error) {
@@ -794,9 +933,9 @@ func (f *cancelUploadDataPlane) Upload(ctx context.Context, _ string, _ domain.L
 	return domain.RemoteFingerprint{}, ctx.Err()
 }
 
-func (f *fakeDataPlane) ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, error) {
+func (f *fakeDataPlane) ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]string, error) {
 	f.scans++
-	return cloneLocal(f.local), nil, nil
+	return cloneLocal(f.local), append([]string(nil), f.excluded...), cloneStringsMap(f.followedDirectories), nil
 }
 
 func (f *fakeDataPlane) ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error) {
@@ -821,6 +960,10 @@ func (f *fakeDataPlane) ResolveLocalMutationTarget(_ context.Context, rel string
 
 func (f *fakeDataPlane) LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error) {
 	return "", false, nil
+}
+
+func (f *fakeDataPlane) CleanupLocalRecoveryArtifact(context.Context, domain.Operation) error {
+	return nil
 }
 
 func (f *fakeDataPlane) CompareFileContent(_ context.Context, rel string, local domain.LocalFingerprint, remote domain.RemoteExpectation) (bool, error) {
@@ -956,6 +1099,14 @@ func cloneLocal(in map[string]domain.LocalFingerprint) map[string]domain.LocalFi
 	out := make(map[string]domain.LocalFingerprint, len(in))
 	for rel, fp := range in {
 		out[rel] = fp
+	}
+	return out
+}
+
+func cloneStringsMap(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
 	}
 	return out
 }

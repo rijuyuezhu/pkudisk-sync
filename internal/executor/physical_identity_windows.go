@@ -32,5 +32,5 @@ func physicalObjectIdentity(path string, _ os.FileInfo) (string, error) {
 		return "", err
 	}
 	index := uint64(data.FileIndexHigh)<<32 | uint64(data.FileIndexLow)
-	return fmt.Sprintf("%d:%d", data.VolumeSerialNumber, index), nil
+	return fmt.Sprintf("windows:%d:%d", data.VolumeSerialNumber, index), nil
 }

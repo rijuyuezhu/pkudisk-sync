@@ -445,6 +445,24 @@ func (e *RootExecutor) LocalRecoveryArtifact(ctx context.Context, op domain.Oper
 	return recoveryPath, true, nil
 }
 
+// CleanupLocalRecoveryArtifact removes an operation-owned stale recovery slot
+// only after the caller has independently proven the desired operation
+// postcondition. It never follows or derives a path from current symlink state;
+// the durable pinned LocalTargetPath is the sole authority.
+func (e *RootExecutor) CleanupLocalRecoveryArtifact(ctx context.Context, op domain.Operation) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	recoveryPath, ok := RecoveryArtifactPath(op)
+	if !ok {
+		return nil
+	}
+	if err := os.Remove(recoveryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove stale local recovery artifact %q: %w", recoveryPath, err)
+	}
+	return nil
+}
+
 // RecoveryArtifactPath returns the deterministic recovery-slot path for a
 // journaled local mutation without inspecting the filesystem.
 func RecoveryArtifactPath(op domain.Operation) (string, bool) {

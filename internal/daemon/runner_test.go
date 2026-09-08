@@ -464,8 +464,8 @@ func (w *fakeWatcher) signal() {
 
 type stubDataPlane struct{}
 
-func (stubDataPlane) ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, error) {
-	return nil, nil, nil
+func (stubDataPlane) ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]string, error) {
+	return nil, nil, nil, nil
 }
 func (stubDataPlane) ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error) {
 	return nil, true, nil
@@ -481,6 +481,9 @@ func (stubDataPlane) ResolveLocalMutationTarget(context.Context, string, domain.
 }
 func (stubDataPlane) LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error) {
 	return "", false, nil
+}
+func (stubDataPlane) CleanupLocalRecoveryArtifact(context.Context, domain.Operation) error {
+	return nil
 }
 func (stubDataPlane) CompareFileContent(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (bool, error) {
 	return false, nil

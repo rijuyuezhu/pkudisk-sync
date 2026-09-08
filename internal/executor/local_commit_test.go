@@ -291,6 +291,39 @@ func TestLocalRecoveryArtifactFindsPinnedOutsideRootSlot(t *testing.T) {
 	}
 }
 
+func TestCleanupLocalRecoveryArtifactRemovesOnlyPinnedOperationSlot(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	op := domain.Operation{
+		ID:              78,
+		Kind:            domain.OperationDeleteLocal,
+		EntryKind:       domain.KindFile,
+		SrcPath:         "target.txt",
+		LocalTargetPath: target,
+	}
+	artifact := operationPhysicalTempPath(target, op.ID, "recovery")
+	if err := os.WriteFile(artifact, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	neighbor := filepath.Join(root, ".pkudisk-sync-tmp-op-79-recovery")
+	if err := os.WriteFile(neighbor, []byte("other"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	if err := exec.CleanupLocalRecoveryArtifact(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(artifact); !os.IsNotExist(err) {
+		t.Fatalf("owned recovery artifact remains: %v", err)
+	}
+	if _, err := os.Stat(neighbor); err != nil {
+		t.Fatalf("cleanup touched unrelated artifact-shaped file: %v", err)
+	}
+	if err := exec.CleanupLocalRecoveryArtifact(context.Background(), op); err != nil {
+		t.Fatalf("cleanup was not idempotent for absent artifact: %v", err)
+	}
+}
+
 func TestRestoreLocalRecoveryArtifactRestoresMatchingArtifactNoReplace(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

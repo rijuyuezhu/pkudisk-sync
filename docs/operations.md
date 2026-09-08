@@ -62,7 +62,7 @@ pkudisk-sync root add \
 
 The modes are:
 
-- `follow` — dereference file and directory symlinks into the synchronized virtual namespace, including links whose targets are outside the selected local root. Remote updates and deletes mutate the resolved target while preserving the symlink object. A dangling/unavailable final referent is excluded rather than treated as local deletion evidence; this prevents a missing external mount from authorizing remote deletion. Cycles and links back to a physical ancestor are excluded instead of traversed. A followed target may not enter another configured sync root, and duplicate logical aliases to one physical object fail closed.
+- `follow` — dereference file and directory symlinks into the synchronized virtual namespace, including links whose targets are outside the selected local root. Remote updates and deletes mutate the resolved target while preserving the symlink object. A dangling/unavailable final referent is excluded rather than treated as local deletion evidence. Followed directory boundaries are additionally fenced by a durable physical identity recorded at successful initial pairing; if the same logical boundary later resolves to a different directory object, or a new followed-directory boundary appears on an initialized root, synchronization blocks instead of inferring descendant deletions. Cycles and links back to a physical ancestor are excluded instead of traversed. Direct entry into another configured root is rejected. Cross-root bind-mount aliases and hard links are unsupported in v0.1 and must not be used to select the same physical data through separate roots.
 - `reject` — any symlink makes the complete local scan fail closed.
 - `ignore` — the symlink path and its virtual subtree are excluded from the local namespace for that cycle. Excluded paths carry no download or deletion authority, so ignoring a link cannot be mistaken for deleting it.
 
@@ -75,6 +75,8 @@ pkudisk-sync root resume 1
 ```
 
 Filesystem watchers deliberately do not follow symlink targets. In particular, a target outside the selected root does not expand the watcher's ownership into another directory tree. Changes there are discovered by the authoritative periodic repair scan; configure a shorter `--poll` interval when lower detection latency is needed.
+
+If a followed directory reports a physical-identity change, first verify whether an external mount disappeared or was replaced. Do not resume automatic sync against the replacement just because the pathname is unchanged. If the replacement is intentional and there are no pending operations, deliberately re-pair the root: record its local/remote selection from `root list`, pause it, stop the daemon/service, `root remove ID`, then add the same pair again. Detach/re-add does not delete local or remote user data; it creates a fresh initial pairing and therefore a new durable boundary identity. If pending operations still exist, do **not** re-pair around them: restore the original physical boundary so those journaled operations can be completed or safely proven first, or leave them blocked for explicit inspection.
 
 `root add` writes an app-owned `.pkudisk-sync-root` marker. If the previous add was interrupted after writing that marker but before committing SQLite state, rerun exactly the intended add with:
 
@@ -153,7 +155,7 @@ If `operation show` reports that pre-mutation local data is preserved in a recov
 pkudisk-sync operation resolve 42 --restore-recovery
 ```
 
-This action requires the artifact to still match the journaled expected local fingerprint, requires the pinned target to be absent, restores with no-replace rename semantics, verifies the restored target, and then returns the operation to guarded recovery. It never overwrites a newly created target. There is intentionally no `operation delete` escape hatch.
+This action requires the artifact to still match the journaled expected local fingerprint, requires the pinned target to be absent, restores with no-replace rename semantics, verifies the restored target, and then returns the operation to guarded recovery. It never overwrites a newly created target. There is intentionally no `operation delete` escape hatch. Conversely, if restart can already prove that the desired current target/postcondition was installed before the crash, the daemon removes the operation-owned stale recovery artifact and commits the journal automatically; the presence of an old recovery slot alone no longer forces a permanent block.
 
 ## Conflicts
 

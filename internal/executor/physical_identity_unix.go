@@ -5,6 +5,7 @@ package executor
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"syscall"
 )
 
@@ -13,5 +14,5 @@ func physicalObjectIdentity(_ string, info os.FileInfo) (string, error) {
 	if !ok || stat == nil {
 		return "", fmt.Errorf("filesystem does not expose a stable device/inode identity")
 	}
-	return fmt.Sprintf("%d:%d", stat.Dev, stat.Ino), nil
+	return fmt.Sprintf("%s:%d:%d", runtime.GOOS, stat.Dev, stat.Ino), nil
 }

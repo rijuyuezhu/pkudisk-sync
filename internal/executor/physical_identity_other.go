@@ -3,14 +3,11 @@
 package executor
 
 import (
+	"fmt"
 	"os"
-	"path/filepath"
+	"runtime"
 )
 
-func physicalObjectIdentity(path string, _ os.FileInfo) (string, error) {
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Clean(resolved), nil
+func physicalObjectIdentity(_ string, _ os.FileInfo) (string, error) {
+	return "", fmt.Errorf("stable physical filesystem identity is unsupported on %s", runtime.GOOS)
 }
