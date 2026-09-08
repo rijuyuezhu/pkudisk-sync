@@ -3,6 +3,7 @@ package reconcile
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
 )
@@ -14,6 +15,7 @@ type Snapshot struct {
 	Local          map[string]domain.LocalFingerprint
 	Remote         map[string]domain.RemoteFingerprint
 	Content        map[string]domain.ContentEvidence
+	Excluded       []string
 	LocalComplete  bool
 	RemoteComplete bool
 	RootHealthy    bool
@@ -68,8 +70,17 @@ func PlanFullSnapshot(syncRootID int64, initial bool, baselines []domain.Baselin
 
 	paths := unionPaths(baselineByPath, snapshot.Local, snapshot.Remote)
 	plan := RootPlan{Initial: initial, Decisions: make([]domain.Decision, 0, len(paths))}
+	activeBaselines := 0
+	for relPath := range baselineByPath {
+		if !PathExcluded(snapshot.Excluded, relPath) {
+			activeBaselines++
+		}
+	}
 
 	for _, relPath := range paths {
+		if PathExcluded(snapshot.Excluded, relPath) {
+			continue
+		}
 		local := snapshot.Local[relPath]
 		remote := snapshot.Remote[relPath]
 		content := snapshot.Content[relPath]
@@ -124,7 +135,7 @@ func PlanFullSnapshot(syncRootID int64, initial bool, baselines []domain.Baselin
 		return RootPlan{}, fmt.Errorf("internal error: initial reconciliation proposed %d deletes", plan.ProposedDeletes)
 	}
 	if !initial {
-		reason, err := evaluateDeleteGate(deletePolicy, len(baselineByPath), plan.ProposedDeletes)
+		reason, err := evaluateDeleteGate(deletePolicy, activeBaselines, plan.ProposedDeletes)
 		if err != nil {
 			return RootPlan{}, err
 		}
@@ -137,6 +148,16 @@ func PlanFullSnapshot(syncRootID int64, initial bool, baselines []domain.Baselin
 }
 
 func validateSnapshot(snapshot Snapshot) error {
+	seenExcluded := make(map[string]struct{}, len(snapshot.Excluded))
+	for _, relPath := range snapshot.Excluded {
+		if err := domain.ValidateRelPath(relPath); err != nil {
+			return fmt.Errorf("excluded local path: %w", err)
+		}
+		if _, exists := seenExcluded[relPath]; exists {
+			return fmt.Errorf("duplicate excluded local path %q", relPath)
+		}
+		seenExcluded[relPath] = struct{}{}
+	}
 	for relPath, local := range snapshot.Local {
 		if err := domain.ValidateRelPath(relPath); err != nil {
 			return fmt.Errorf("local snapshot path: %w", err)
@@ -173,6 +194,17 @@ func validateSnapshot(snapshot Snapshot) error {
 		}
 	}
 	return nil
+}
+
+// PathExcluded reports whether relPath is an excluded path or lies below one.
+// Excluded local namespaces carry no deletion/download authority for a cycle.
+func PathExcluded(prefixes []string, relPath string) bool {
+	for _, prefix := range prefixes {
+		if relPath == prefix || strings.HasPrefix(relPath, prefix+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func unionPaths(baselines map[string]domain.Baseline, local map[string]domain.LocalFingerprint, remote map[string]domain.RemoteFingerprint) []string {

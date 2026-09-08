@@ -122,6 +122,7 @@ Commands:
   conflict resolve ID --keep-remote  Queue exact-state resolution using remote data
   root add --local PATH --remote pkudisk:P Add one selected directory pair
   root list                          List selected directory pairs
+  root config ID --symlinks MODE     Change symlink policy on a paused root
   root pause ID                      Pause one selected pair
   root resume ID                     Resume one selected pair
   root remove ID                     Unregister one paused pair without deleting data
@@ -519,13 +520,15 @@ func (a *Application) serviceManager() (userservice.Manager, error) {
 
 func (a *Application) runRoot(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("root requires one of: add, list, pause, resume, remove")
+		return fmt.Errorf("root requires one of: add, list, config, pause, resume, remove")
 	}
 	switch args[0] {
 	case "add":
 		return a.runRootAdd(ctx, args[1:])
 	case "list":
 		return a.runRootList(ctx, args[1:])
+	case "config":
+		return a.runRootConfig(ctx, args[1:])
 	case "pause":
 		return a.runRootEnabled(ctx, args[1:], false)
 	case "resume":
@@ -543,6 +546,7 @@ func (a *Application) runRootAdd(ctx context.Context, args []string) error {
 	localArg := fs.String("local", "", "local directory")
 	remoteArg := fs.String("remote", "", "PKU Disk root in remote:path form")
 	poll := fs.Duration("poll", 0, "periodic repair interval; 0 uses daemon default")
+	symlinks := fs.String("symlinks", string(domain.SymlinkFollow), "symlink policy: follow, reject, or ignore")
 	recoverOrphanMarker := fs.Bool("recover-orphan-marker", false, "replace an unowned reserved root marker left by an interrupted prior add")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -558,6 +562,10 @@ func (a *Application) runRootAdd(ctx context.Context, args []string) error {
 	}
 	if *poll < 0 || *poll%time.Second != 0 {
 		return fmt.Errorf("--poll must be zero or a non-negative whole number of seconds")
+	}
+	symlinkMode, err := domain.ParseSymlinkMode(*symlinks)
+	if err != nil {
+		return err
 	}
 
 	localRoot, err := filepath.Abs(*localArg)
@@ -600,6 +608,7 @@ func (a *Application) runRootAdd(ctx context.Context, args []string) error {
 		RemoteName:          remoteName,
 		RemoteRoot:          remoteRoot,
 		Enabled:             true,
+		SymlinkMode:         symlinkMode,
 		PollIntervalSeconds: int64(*poll / time.Second),
 	}
 	if err := root.Validate(); err != nil {
@@ -638,7 +647,7 @@ func (a *Application) runRootList(ctx context.Context, args []string) error {
 		return err
 	}
 	w := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(w, "ID\tSTATE\tINIT\tPOLL\tLOCAL\tREMOTE"); err != nil {
+	if _, err := fmt.Fprintln(w, "ID\tSTATE\tINIT\tSYMLINKS\tPOLL\tLOCAL\tREMOTE"); err != nil {
 		return err
 	}
 	for _, root := range roots {
@@ -654,11 +663,48 @@ func (a *Application) runRootList(ctx context.Context, args []string) error {
 		if root.PollIntervalSeconds > 0 {
 			poll = (time.Duration(root.PollIntervalSeconds) * time.Second).String()
 		}
-		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s:%s\n", root.ID, status, initialized, poll, root.LocalRoot, root.RemoteName, root.RemoteRoot); err != nil {
+		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s:%s\n", root.ID, status, initialized, root.EffectiveSymlinkMode(), poll, root.LocalRoot, root.RemoteName, root.RemoteRoot); err != nil {
 			return err
 		}
 	}
 	return w.Flush()
+}
+
+func (a *Application) runRootConfig(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("root config", flag.ContinueOnError)
+	fs.SetOutput(a.stderr)
+	symlinks := fs.String("symlinks", "", "symlink policy: follow, reject, or ignore")
+	parseArgs := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		parseArgs = append(append([]string(nil), args[1:]...), args[0])
+	}
+	if err := fs.Parse(parseArgs); err != nil {
+		if err == flag.ErrHelp {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() != 1 || *symlinks == "" {
+		return fmt.Errorf("root config requires one root ID and --symlinks follow|reject|ignore")
+	}
+	id, err := strconv.ParseInt(fs.Arg(0), 10, 64)
+	if err != nil || id <= 0 {
+		return fmt.Errorf("invalid sync root ID %q", fs.Arg(0))
+	}
+	mode, err := domain.ParseSymlinkMode(*symlinks)
+	if err != nil {
+		return err
+	}
+	state, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = state.Close() }()
+	if err := state.SetSyncRootSymlinkMode(ctx, id, mode); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(a.stdout, "configured root %d symlinks=%s\n", id, mode)
+	return err
 }
 
 func (a *Application) runRootEnabled(ctx context.Context, args []string, enabled bool) error {

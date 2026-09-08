@@ -581,6 +581,51 @@ func TestRunRootCycleBlocksUnsafeNamespaceBeforeOperationRecovery(t *testing.T) 
 	}
 }
 
+func TestRunRootCycleBlocksWhenPinnedLocalRecoveryArtifactExists(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, true)
+	target := filepath.Join(t.TempDir(), "outside-target.txt")
+	op, err := state.CreateOperation(ctx, domain.Operation{
+		SyncRootID:      root.ID,
+		Kind:            domain.OperationDeleteLocal,
+		EntryKind:       domain.KindFile,
+		SrcPath:         "linked.txt",
+		LocalTargetPath: target,
+		ExpectedLocal:   localFileFP(4, 40),
+		ExpectedRemote:  domain.RemoteExpectation{Absent: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetOperationPhase(ctx, op.ID, domain.OperationRunning, "", true); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(filepath.Dir(target), ".pkudisk-sync-tmp-op-recovery")
+	base := &fakeDataPlane{
+		local:  map[string]domain.LocalFingerprint{"linked.txt": localFileFP(4, 40)},
+		remote: make(map[string]domain.RemoteFingerprint),
+	}
+	data := &recoveryArtifactDataPlane{fakeDataPlane: base, artifact: artifact}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Blocked || result.BlockReason != "operation-recovery-blocked" || result.Recovered != 0 {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if len(base.calls) != 0 {
+		t.Fatalf("recovery artifact allowed local mutation replay: %+v", base.calls)
+	}
+	operations, err := state.ListOperations(ctx, root.ID)
+	if err != nil || len(operations) != 1 {
+		t.Fatalf("operations = %+v err=%v", operations, err)
+	}
+	if operations[0].Phase != domain.OperationBlocked || !strings.Contains(operations[0].LastError, artifact) {
+		t.Fatalf("recovery artifact was not retained as blocked authority: %+v", operations[0])
+	}
+}
+
 func TestRunRootCycleMassDeleteGateHasNoSideEffects(t *testing.T) {
 	ctx := context.Background()
 	state, root := newCycleRoot(t, true, true)
@@ -732,15 +777,24 @@ type cancelUploadDataPlane struct {
 	started chan struct{}
 }
 
+type recoveryArtifactDataPlane struct {
+	*fakeDataPlane
+	artifact string
+}
+
+func (f *recoveryArtifactDataPlane) LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error) {
+	return f.artifact, true, nil
+}
+
 func (f *cancelUploadDataPlane) Upload(ctx context.Context, _ string, _ domain.LocalFingerprint, _ domain.RemoteExpectation) (domain.RemoteFingerprint, error) {
 	close(f.started)
 	<-ctx.Done()
 	return domain.RemoteFingerprint{}, ctx.Err()
 }
 
-func (f *fakeDataPlane) ScanLocal(context.Context) (map[string]domain.LocalFingerprint, error) {
+func (f *fakeDataPlane) ScanLocal(context.Context) (map[string]domain.LocalFingerprint, []string, error) {
 	f.scans++
-	return cloneLocal(f.local), nil
+	return cloneLocal(f.local), nil, nil
 }
 
 func (f *fakeDataPlane) ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error) {
@@ -754,6 +808,17 @@ func (f *fakeDataPlane) ObserveLocalEntry(_ context.Context, rel string) (domain
 
 func (f *fakeDataPlane) ObserveRemoteEntry(_ context.Context, rel string) (domain.RemoteFingerprint, error) {
 	return f.remote[rel], nil
+}
+
+func (f *fakeDataPlane) ResolveLocalMutationTarget(_ context.Context, rel string, expected domain.LocalFingerprint) (string, error) {
+	if !domain.LocalEquivalent(f.local[rel], expected) {
+		return "", fmt.Errorf("local target precondition mismatch for %q", rel)
+	}
+	return filepath.Join(os.TempDir(), "pkudisk-sync-fake", filepath.FromSlash(rel)), nil
+}
+
+func (f *fakeDataPlane) LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error) {
+	return "", false, nil
 }
 
 func (f *fakeDataPlane) CompareFileContent(_ context.Context, rel string, local domain.LocalFingerprint, remote domain.RemoteExpectation) (bool, error) {
@@ -799,8 +864,9 @@ func (f *fakeDataPlane) EnsureRemoteDir(_ context.Context, rel string, expected 
 	return nil
 }
 
-func (f *fakeDataPlane) EnsureLocalFile(_ context.Context, rel string, expectedLocal domain.LocalFingerprint, expectedRemote domain.RemoteExpectation) (domain.LocalFingerprint, error) {
-	if !domain.LocalEquivalent(f.local[rel], expectedLocal) || !fakeRemoteMatches(f.remote[rel], expectedRemote, domain.KindFile) {
+func (f *fakeDataPlane) EnsureLocalFile(_ context.Context, op domain.Operation) (domain.LocalFingerprint, error) {
+	rel := op.SrcPath
+	if !domain.LocalEquivalent(f.local[rel], op.ExpectedLocal) || !fakeRemoteMatches(f.remote[rel], op.ExpectedRemote, domain.KindFile) {
 		return domain.LocalFingerprint{}, fmt.Errorf("local file precondition mismatch for %q", rel)
 	}
 	f.calls = append(f.calls, "ensure-local-file:"+rel)
@@ -819,7 +885,9 @@ func (f *fakeDataPlane) EnsureLocalFile(_ context.Context, rel string, expectedL
 	return written, nil
 }
 
-func (f *fakeDataPlane) EnsureLocalDir(_ context.Context, rel string, expected domain.LocalFingerprint) error {
+func (f *fakeDataPlane) EnsureLocalDir(_ context.Context, op domain.Operation) error {
+	rel := op.SrcPath
+	expected := op.ExpectedLocal
 	if !domain.LocalEquivalent(f.local[rel], expected) || expected.Present {
 		return fmt.Errorf("local dir precondition mismatch for %q", rel)
 	}
@@ -854,7 +922,9 @@ func (f *fakeDataPlane) DeleteRemoteDir(_ context.Context, expected domain.Remot
 	return nil
 }
 
-func (f *fakeDataPlane) DeleteLocal(_ context.Context, rel string, expected domain.LocalFingerprint) error {
+func (f *fakeDataPlane) DeleteLocal(_ context.Context, op domain.Operation) error {
+	rel := op.SrcPath
+	expected := op.ExpectedLocal
 	if !domain.LocalEquivalent(f.local[rel], expected) {
 		return fmt.Errorf("local delete precondition mismatch for %q", rel)
 	}

@@ -15,6 +15,33 @@ const maxPollIntervalSeconds int64 = (1<<63 - 1) / int64(time.Second)
 // need an explicit stable account-identity model before they can be safe.
 const AppRemoteName = "pkudisk"
 
+// SymlinkMode controls how one local sync root treats symbolic links.
+type SymlinkMode string
+
+const (
+	// SymlinkFollow dereferences links into the virtual sync namespace.
+	SymlinkFollow SymlinkMode = "follow"
+	// SymlinkReject makes any symlink a complete-local-scan error.
+	SymlinkReject SymlinkMode = "reject"
+	// SymlinkIgnore excludes every symlink path and its virtual subtree.
+	SymlinkIgnore SymlinkMode = "ignore"
+)
+
+// ParseSymlinkMode validates a user/config value. An empty value selects the
+// default follow policy.
+func ParseSymlinkMode(value string) (SymlinkMode, error) {
+	mode := SymlinkMode(strings.TrimSpace(value))
+	if mode == "" {
+		mode = SymlinkFollow
+	}
+	switch mode {
+	case SymlinkFollow, SymlinkReject, SymlinkIgnore:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid symlink mode %q; want follow, reject, or ignore", value)
+	}
+}
+
 // SyncRoot is one independently reconciled local/remote root pair.
 type SyncRoot struct {
 	ID                  int64
@@ -24,8 +51,18 @@ type SyncRoot struct {
 	RemoteRoot          string
 	Enabled             bool
 	Initialized         bool
+	SymlinkMode         SymlinkMode
 	PollIntervalSeconds int64
 	CreatedAt           time.Time
+}
+
+// EffectiveSymlinkMode returns the configured mode. The zero value means the
+// product default, follow, so old call sites and migrated state remain safe.
+func (r SyncRoot) EffectiveSymlinkMode() SymlinkMode {
+	if r.SymlinkMode == "" {
+		return SymlinkFollow
+	}
+	return r.SymlinkMode
 }
 
 func (r SyncRoot) Validate() error {
@@ -59,6 +96,9 @@ func (r SyncRoot) Validate() error {
 	if r.PollIntervalSeconds > maxPollIntervalSeconds {
 		return fmt.Errorf("poll interval exceeds time.Duration range")
 	}
+	if _, err := ParseSymlinkMode(string(r.SymlinkMode)); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -88,19 +128,20 @@ const (
 // Operation is the durable semantic intent persisted before an external side
 // effect. Byte-transfer chunk/progress state belongs to rclone-pkudisk instead.
 type Operation struct {
-	ID             int64
-	SyncRootID     int64
-	Kind           OperationKind
-	EntryKind      EntryKind
-	SrcPath        string
-	DstPath        string
-	ExpectedLocal  LocalFingerprint
-	ExpectedRemote RemoteExpectation
-	Phase          OperationPhase
-	Attempts       int
-	LastError      string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID              int64
+	SyncRootID      int64
+	Kind            OperationKind
+	EntryKind       EntryKind
+	SrcPath         string
+	DstPath         string
+	LocalTargetPath string
+	ExpectedLocal   LocalFingerprint
+	ExpectedRemote  RemoteExpectation
+	Phase           OperationPhase
+	Attempts        int
+	LastError       string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 func (o Operation) Validate() error {
@@ -124,6 +165,14 @@ func (o Operation) Validate() error {
 		}
 	} else if o.DstPath != "" {
 		return fmt.Errorf("non-move operation must not have a destination path")
+	}
+	if o.LocalTargetPath != "" {
+		if o.Kind != OperationEnsureLocal && o.Kind != OperationDeleteLocal {
+			return fmt.Errorf("operation kind %q must not carry a local target path", o.Kind)
+		}
+		if !filepath.IsAbs(o.LocalTargetPath) || filepath.Clean(o.LocalTargetPath) != o.LocalTargetPath {
+			return fmt.Errorf("operation local target path %q must be canonical and absolute", o.LocalTargetPath)
+		}
 	}
 	if err := o.ExpectedLocal.Validate(); err != nil {
 		return fmt.Errorf("operation expected local state: %w", err)

@@ -66,6 +66,32 @@ func TestWatcherRejectsSymlinkRoot(t *testing.T) {
 	}
 }
 
+func TestWatcherDoesNotFollowSymlinkTargetOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	link := filepath.Join(root, "linked")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	w, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, ok := w.watched[root]; !ok {
+		t.Fatal("real sync root is not watched")
+	}
+	if _, ok := w.watched[link]; ok {
+		t.Fatal("symlink lexical path was installed as a recursive directory watch")
+	}
+	if _, ok := w.watched[outside]; ok {
+		t.Fatal("watcher followed a symlink target outside the sync root")
+	}
+}
+
 func TestCloseSignalsDone(t *testing.T) {
 	w, err := New(t.TempDir())
 	if err != nil {

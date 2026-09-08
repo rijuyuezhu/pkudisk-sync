@@ -18,18 +18,20 @@ const maxCyclePasses = 8
 // DataPlane is the narrow in-process execution surface needed by one complete
 // reconciliation cycle. executor.RootExecutor implements this interface.
 type DataPlane interface {
-	ScanLocal(context.Context) (map[string]domain.LocalFingerprint, error)
+	ScanLocal(context.Context) (map[string]domain.LocalFingerprint, []string, error)
 	ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error)
 	ObserveLocalEntry(context.Context, string) (domain.LocalFingerprint, error)
 	ObserveRemoteEntry(context.Context, string) (domain.RemoteFingerprint, error)
+	ResolveLocalMutationTarget(context.Context, string, domain.LocalFingerprint) (string, error)
+	LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error)
 	CompareFileContent(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (bool, error)
 	Upload(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (domain.RemoteFingerprint, error)
 	EnsureRemoteDir(context.Context, string, domain.RemoteExpectation) error
-	EnsureLocalFile(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (domain.LocalFingerprint, error)
-	EnsureLocalDir(context.Context, string, domain.LocalFingerprint) error
+	EnsureLocalFile(context.Context, domain.Operation) (domain.LocalFingerprint, error)
+	EnsureLocalDir(context.Context, domain.Operation) error
 	DeleteRemoteFile(context.Context, domain.RemoteExpectation) error
 	DeleteRemoteDir(context.Context, domain.RemoteExpectation) error
-	DeleteLocal(context.Context, string, domain.LocalFingerprint) error
+	DeleteLocal(context.Context, domain.Operation) error
 }
 
 // CycleResult summarizes one selected-root cycle without making caller-visible
@@ -231,6 +233,10 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 			if err != nil {
 				return result, fmt.Errorf("journal operation %q: %w", decision.RelPath, err)
 			}
+			op, err = pinLocalMutationTarget(ctx, state, data, op)
+			if err != nil {
+				return result, fmt.Errorf("pin local mutation target %q: %w", decision.RelPath, err)
+			}
 			if err := executePersistedOperation(ctx, state, data, op); err != nil {
 				return result, err
 			}
@@ -241,7 +247,7 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 }
 
 func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot bool) (reconcile.Snapshot, bool, error) {
-	local, err := data.ScanLocal(ctx)
+	local, excluded, err := data.ScanLocal(ctx)
 	if err != nil {
 		return reconcile.Snapshot{}, false, fmt.Errorf("complete local scan: %w", err)
 	}
@@ -252,14 +258,42 @@ func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot
 	if requireRemoteRoot && !remoteRootPresent {
 		return reconcile.Snapshot{}, false, fmt.Errorf("complete remote scan: selected remote root is missing after initialization")
 	}
+	for relPath := range remote {
+		if reconcile.PathExcluded(excluded, relPath) {
+			delete(remote, relPath)
+		}
+	}
 	return reconcile.Snapshot{
 		Local:          local,
 		Remote:         remote,
 		Content:        make(map[string]domain.ContentEvidence),
+		Excluded:       excluded,
 		LocalComplete:  true,
 		RemoteComplete: true,
 		RootHealthy:    true,
 	}, remoteRootPresent, nil
+}
+
+func isLocalMutation(op domain.Operation) bool {
+	return op.Kind == domain.OperationEnsureLocal || op.Kind == domain.OperationDeleteLocal
+}
+
+func pinLocalMutationTarget(ctx context.Context, state *store.Store, data DataPlane, op domain.Operation) (domain.Operation, error) {
+	if !isLocalMutation(op) || op.LocalTargetPath != "" {
+		return op, nil
+	}
+	if op.Phase != domain.OperationPlanned || op.Attempts != 0 {
+		return op, fmt.Errorf("operation %d has no pinned local target after mutation attempts started", op.ID)
+	}
+	target, err := data.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal)
+	if err != nil {
+		return op, err
+	}
+	if err := state.SetOperationLocalTarget(ctx, op.ID, target); err != nil {
+		return op, err
+	}
+	op.LocalTargetPath = target
+	return op, nil
 }
 
 func recoverExistingOperations(ctx context.Context, state *store.Store, data DataPlane, operations []domain.Operation) (blocked bool, recovered int, err error) {
@@ -268,6 +302,10 @@ func recoverExistingOperations(ctx context.Context, state *store.Store, data Dat
 		case domain.OperationBlocked:
 			return true, recovered, nil
 		case domain.OperationPlanned:
+			op, err = pinLocalMutationTarget(ctx, state, data, op)
+			if err != nil {
+				return false, recovered, err
+			}
 			holds, err := operationPreconditionsHold(ctx, data, op)
 			if err != nil {
 				return false, recovered, err
@@ -286,6 +324,25 @@ func recoverExistingOperations(ctx context.Context, state *store.Store, data Dat
 			if op.Phase == domain.OperationRunning {
 				if err := state.SetOperationPhase(ctx, op.ID, domain.OperationRecovering, "recovering unknown prior outcome", false); err != nil {
 					return false, recovered, err
+				}
+			}
+			if isLocalMutation(op) {
+				if op.LocalTargetPath == "" {
+					if err := state.SetOperationPhase(ctx, op.ID, domain.OperationBlocked, "local mutation started before a physical target was pinned", false); err != nil {
+						return false, recovered, err
+					}
+					return true, recovered, nil
+				}
+				recoveryPath, pending, err := data.LocalRecoveryArtifact(ctx, op)
+				if err != nil {
+					return false, recovered, err
+				}
+				if pending {
+					detail := fmt.Sprintf("local data preserved at recovery artifact %q; automatic replay is unsafe", recoveryPath)
+					if err := state.SetOperationPhase(ctx, op.ID, domain.OperationBlocked, detail, false); err != nil {
+						return false, recovered, err
+					}
+					return true, recovered, nil
 				}
 			}
 			satisfied, local, remote, err := proveRecoveredPostcondition(ctx, data, op)
@@ -349,9 +406,9 @@ func executePersistedOperation(ctx context.Context, state *store.Store, data Dat
 		}
 	case domain.OperationEnsureLocal:
 		if op.EntryKind == domain.KindDir {
-			err = data.EnsureLocalDir(ctx, op.SrcPath, op.ExpectedLocal)
+			err = data.EnsureLocalDir(ctx, op)
 		} else {
-			exactDownloadResult, err = data.EnsureLocalFile(ctx, op.SrcPath, op.ExpectedLocal, op.ExpectedRemote)
+			exactDownloadResult, err = data.EnsureLocalFile(ctx, op)
 			hasExactDownloadResult = err == nil
 		}
 	case domain.OperationDeleteRemote:
@@ -361,7 +418,7 @@ func executePersistedOperation(ctx context.Context, state *store.Store, data Dat
 			err = data.DeleteRemoteFile(ctx, op.ExpectedRemote)
 		}
 	case domain.OperationDeleteLocal:
-		err = data.DeleteLocal(ctx, op.SrcPath, op.ExpectedLocal)
+		err = data.DeleteLocal(ctx, op)
 	default:
 		err = fmt.Errorf("unsupported operation kind %q", op.Kind)
 	}
@@ -640,6 +697,9 @@ func reconcileConflictRecords(ctx context.Context, rootID int64, state *store.St
 	}
 	existingByPath := make(map[string]domain.Conflict, len(existing))
 	for _, conflict := range existing {
+		if reconcile.PathExcluded(snapshot.Excluded, conflict.RelPath) {
+			continue
+		}
 		decision, stillConflict := current[conflict.RelPath]
 		if !stillConflict {
 			if err := state.ResolveConflict(ctx, conflict.ID); err != nil {

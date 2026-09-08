@@ -3,6 +3,8 @@ package daemon
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -462,8 +464,8 @@ func (w *fakeWatcher) signal() {
 
 type stubDataPlane struct{}
 
-func (stubDataPlane) ScanLocal(context.Context) (map[string]domain.LocalFingerprint, error) {
-	return nil, nil
+func (stubDataPlane) ScanLocal(context.Context) (map[string]domain.LocalFingerprint, []string, error) {
+	return nil, nil, nil
 }
 func (stubDataPlane) ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error) {
 	return nil, true, nil
@@ -474,6 +476,12 @@ func (stubDataPlane) ObserveLocalEntry(context.Context, string) (domain.LocalFin
 func (stubDataPlane) ObserveRemoteEntry(context.Context, string) (domain.RemoteFingerprint, error) {
 	return domain.RemoteFingerprint{}, nil
 }
+func (stubDataPlane) ResolveLocalMutationTarget(context.Context, string, domain.LocalFingerprint) (string, error) {
+	return filepath.Join(os.TempDir(), "pkudisk-sync-daemon-stub"), nil
+}
+func (stubDataPlane) LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error) {
+	return "", false, nil
+}
 func (stubDataPlane) CompareFileContent(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (bool, error) {
 	return false, nil
 }
@@ -483,12 +491,12 @@ func (stubDataPlane) Upload(context.Context, string, domain.LocalFingerprint, do
 func (stubDataPlane) EnsureRemoteDir(context.Context, string, domain.RemoteExpectation) error {
 	return nil
 }
-func (stubDataPlane) EnsureLocalFile(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (domain.LocalFingerprint, error) {
+func (stubDataPlane) EnsureLocalFile(context.Context, domain.Operation) (domain.LocalFingerprint, error) {
 	return domain.LocalFingerprint{}, nil
 }
-func (stubDataPlane) EnsureLocalDir(context.Context, string, domain.LocalFingerprint) error {
+func (stubDataPlane) EnsureLocalDir(context.Context, domain.Operation) error {
 	return nil
 }
-func (stubDataPlane) DeleteRemoteFile(context.Context, domain.RemoteExpectation) error   { return nil }
-func (stubDataPlane) DeleteRemoteDir(context.Context, domain.RemoteExpectation) error    { return nil }
-func (stubDataPlane) DeleteLocal(context.Context, string, domain.LocalFingerprint) error { return nil }
+func (stubDataPlane) DeleteRemoteFile(context.Context, domain.RemoteExpectation) error { return nil }
+func (stubDataPlane) DeleteRemoteDir(context.Context, domain.RemoteExpectation) error  { return nil }
+func (stubDataPlane) DeleteLocal(context.Context, domain.Operation) error              { return nil }
