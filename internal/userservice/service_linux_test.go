@@ -17,7 +17,7 @@ func TestRenderSystemdUnitEscapesExecutablePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `ExecStart="/opt/PKU Disk/$sync%%/pkudisk-sync" daemon`
+	want := `ExecStart="/opt/PKU Disk/$sync%%/pkudisk-sync" daemon --service`
 	if !strings.Contains(unit, want) {
 		t.Fatalf("unit missing %q:\n%s", want, unit)
 	}

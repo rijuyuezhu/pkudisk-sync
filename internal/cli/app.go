@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -401,8 +402,8 @@ func (a *Application) runService(ctx context.Context, args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("service requires exactly one of: install, uninstall, start, stop, status")
 	}
-	if args[0] == "install" && apppaths.OverridesActive() {
-		return fmt.Errorf("service install requires default pkudisk-sync paths; unset PKUDISK_SYNC_* path overrides first")
+	if (args[0] == "install" || args[0] == "start") && apppaths.OverridesActive() {
+		return fmt.Errorf("service %s requires default pkudisk-sync paths; unset PKUDISK_SYNC_* path overrides first", args[0])
 	}
 	manager, err := a.serviceManager()
 	if err != nil {
@@ -420,6 +421,19 @@ func (a *Application) runService(ctx context.Context, args []string) error {
 		}
 		fmt.Fprintln(a.stdout, "service uninstalled")
 	case "start":
+		if err := a.paths.PrepareRuntime(); err != nil {
+			return err
+		}
+		preflight, err := daemonlock.Acquire(a.paths.RuntimeDir)
+		if err != nil {
+			if errors.Is(err, daemonlock.ErrAlreadyRunning) {
+				return fmt.Errorf("service start requires any foreground daemon to be stopped: %w", err)
+			}
+			return fmt.Errorf("preflight service start daemon lease: %w", err)
+		}
+		if err := preflight.Close(); err != nil {
+			return fmt.Errorf("release service start daemon lease preflight: %w", err)
+		}
 		if err := manager.Start(ctx); err != nil {
 			return err
 		}
@@ -659,6 +673,7 @@ func (a *Application) runRootRemove(ctx context.Context, args []string) error {
 func (a *Application) runDaemon(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	fs.SetOutput(a.stderr)
+	serviceMode := fs.Bool("service", false, "internal: daemon is supervised by the installed user service")
 	maxDeleteCount := fs.Int("max-delete-count", defaultMaxDeleteCount, "block a cycle proposing more deletions than this; 0 disables this threshold")
 	maxDeleteFraction := fs.Float64("max-delete-fraction", defaultMaxDeleteFraction, "block a cycle proposing a larger baseline deletion fraction; 0 disables this threshold")
 	if err := fs.Parse(args); err != nil {
@@ -683,6 +698,9 @@ func (a *Application) runDaemon(ctx context.Context, args []string) error {
 	}
 	lease, err := daemonlock.Acquire(a.paths.RuntimeDir)
 	if err != nil {
+		if *serviceMode && errors.Is(err, daemonlock.ErrAlreadyRunning) {
+			return nil
+		}
 		return err
 	}
 	defer lease.Close()

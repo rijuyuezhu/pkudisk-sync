@@ -632,6 +632,31 @@ func TestDaemonRefusesSecondInstanceBeforeWiringRunner(t *testing.T) {
 	}
 }
 
+func TestServiceDaemonTreatsExistingOwnerAsCleanExit(t *testing.T) {
+	paths := cliTestPaths(t)
+	if err := paths.PrepareRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	held, err := daemonlock.Acquire(paths.RuntimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
+	app.installRcloneConfig = func(string) error {
+		t.Fatal("service-mode lock conflict reached rclone config")
+		return nil
+	}
+	app.newRunner = func(*store.Store, reconcile.DeletePolicy, daemon.Reporter) (daemonRunner, error) {
+		t.Fatal("service-mode lock conflict created runner")
+		return nil, nil
+	}
+	if err := app.Run(context.Background(), []string{"daemon", "--service"}); err != nil {
+		t.Fatalf("service-mode duplicate daemon error = %v", err)
+	}
+}
+
 func TestDaemonRejectsAllDeleteThresholdsDisabled(t *testing.T) {
 	paths := cliTestPaths(t)
 	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
@@ -685,16 +710,44 @@ func TestServiceCommandsWireNativeManager(t *testing.T) {
 	}
 }
 
-func TestServiceInstallRejectsPathOverridesBeforeProvider(t *testing.T) {
-	t.Setenv("PKUDISK_SYNC_STATE_DB", filepath.Join(t.TempDir(), "state.db"))
-	app := New(cliTestPaths(t), &bytes.Buffer{}, &bytes.Buffer{})
-	app.executablePath = func() (string, error) {
-		t.Fatal("service provider resolution ran before override rejection")
-		return "", nil
+func TestServiceStartRefusesForegroundDaemonBeforeManagerStart(t *testing.T) {
+	paths := cliTestPaths(t)
+	if err := paths.PrepareRuntime(); err != nil {
+		t.Fatal(err)
 	}
-	err := app.Run(context.Background(), []string{"service", "install"})
-	if err == nil || !strings.Contains(err.Error(), "requires default") {
-		t.Fatalf("service install error = %v", err)
+	held, err := daemonlock.Acquire(paths.RuntimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
+	app.executablePath = func() (string, error) { return filepath.Join(t.TempDir(), "pkudisk-sync"), nil }
+	fake := &fakeServiceManager{}
+	app.newService = func(string) (userservice.Manager, error) { return fake, nil }
+	err = app.Run(context.Background(), []string{"service", "start"})
+	if err == nil || !errors.Is(err, daemonlock.ErrAlreadyRunning) || !strings.Contains(err.Error(), "foreground daemon") {
+		t.Fatalf("service start error = %v", err)
+	}
+	if len(fake.calls) != 0 {
+		t.Fatalf("service manager was invoked despite occupied daemon lease: %v", fake.calls)
+	}
+}
+
+func TestServiceInstallAndStartRejectPathOverridesBeforeProvider(t *testing.T) {
+	for _, command := range []string{"install", "start"} {
+		t.Run(command, func(t *testing.T) {
+			t.Setenv("PKUDISK_SYNC_STATE_DB", filepath.Join(t.TempDir(), "state.db"))
+			app := New(cliTestPaths(t), &bytes.Buffer{}, &bytes.Buffer{})
+			app.executablePath = func() (string, error) {
+				t.Fatal("service provider resolution ran before override rejection")
+				return "", nil
+			}
+			err := app.Run(context.Background(), []string{"service", command})
+			if err == nil || !strings.Contains(err.Error(), "requires default") {
+				t.Fatalf("service %s error = %v", command, err)
+			}
+		})
 	}
 }
 

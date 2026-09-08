@@ -134,7 +134,7 @@ func renderSystemdUnit(executable string) (string, error) {
 		"Description=PKU Disk bidirectional sync\n\n" +
 		"[Service]\n" +
 		"Type=simple\n" +
-		"ExecStart=" + quoted + " daemon\n" +
+		"ExecStart=" + quoted + " daemon --service\n" +
 		"Restart=on-failure\n" +
 		"RestartSec=5s\n" +
 		"UMask=0077\n\n" +

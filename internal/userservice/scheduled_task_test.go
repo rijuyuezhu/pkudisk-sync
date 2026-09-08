@@ -11,7 +11,7 @@ func TestScheduledTaskCreateArgsUseCurrentInteractiveUserAtLimitedPrivilege(t *t
 	want := []string{
 		"/create",
 		"/tn", scheduledTaskName,
-		"/tr", `"C:\Program Files\PKU Disk\pkudisk-sync.exe" daemon`,
+		"/tr", `"C:\Program Files\PKU Disk\pkudisk-sync.exe" daemon --service`,
 		"/sc", "ONLOGON",
 		"/it",
 		"/rl", "LIMITED",

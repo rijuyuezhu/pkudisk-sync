@@ -20,7 +20,7 @@ func isScheduledTaskNotFoundExitCode(code uint32) bool {
 }
 
 func scheduledTaskCreateArgs(executable string) []string {
-	command := `"` + executable + `" daemon`
+	command := `"` + executable + `" daemon --service`
 	return []string{
 		"/create",
 		"/tn", scheduledTaskName,

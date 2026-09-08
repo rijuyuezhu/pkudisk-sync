@@ -27,11 +27,15 @@ func renderLaunchAgentPlist(executable string) (string, error) {
   <array>
     <string>` + escaped.String() + `</string>
     <string>daemon</string>
+    <string>--service</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>ProcessType</key>
   <string>Background</string>
 </dict>
