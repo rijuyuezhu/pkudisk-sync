@@ -401,6 +401,103 @@ func TestReserveFollowedFileClaimAllowsAtomicReplacementWithoutChangingOwner(t *
 	}
 }
 
+func TestAuthorizeAndPinLocalMutationRefreshesSameTargetFileIdentity(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	root := createTestRoot(t, s)
+	targetPath := filepath.Join(t.TempDir(), "atomic-file")
+	oldClaim := domain.FollowedPhysicalClaim{Kind: domain.KindFile, Identity: "linux:49:300", TargetPath: targetPath}
+	if ok, detail, err := s.ReserveFollowedPhysicalClaims(ctx, root.ID, map[string]domain.FollowedPhysicalClaim{"link.txt": oldClaim}); err != nil || !ok {
+		t.Fatalf("reserve old claim = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+	op, err := s.CreateOperation(ctx, domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationEnsureLocal,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "link.txt",
+		ExpectedLocal:  domain.LocalFingerprint{Present: true, Kind: domain.KindFile, Size: 4, MtimeNS: 40},
+		ExpectedRemote: domain.RemoteExpectation{ID: "doc", Rev: "rev"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newClaim := oldClaim
+	newClaim.Identity = "linux:49:301"
+	ok, detail, err := s.AuthorizeAndPinLocalMutation(ctx, op.ID, domain.LocalMutationTarget{
+		Path:           targetPath,
+		AnchorIdentity: newClaim.Identity,
+		FollowedClaims: map[string]domain.FollowedPhysicalClaim{"link.txt": newClaim},
+	})
+	if err != nil || !ok {
+		t.Fatalf("authorize atomic replacement = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+	gotOp, exists, err := s.GetOperation(ctx, op.ID)
+	if err != nil || !exists || gotOp.LocalTargetPath != targetPath || gotOp.LocalTargetIdentity != newClaim.Identity {
+		t.Fatalf("pinned operation = %+v exists=%v err=%v", gotOp, exists, err)
+	}
+	claims, err := s.ListFollowedPhysicalClaims(ctx, root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := claims["link.txt"]; got != newClaim {
+		t.Fatalf("mutation-time file identity = %+v, want %+v", got, newClaim)
+	}
+}
+
+func TestAuthorizeAndPinLocalMutationRequiresDurableAuthorityForDanglingFile(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	root := createTestRoot(t, s)
+	targetPath := filepath.Join(t.TempDir(), "dangling-file")
+	durable := domain.FollowedPhysicalClaim{Kind: domain.KindFile, Identity: "linux:49:400", TargetPath: targetPath}
+	if ok, detail, err := s.ReserveFollowedPhysicalClaims(ctx, root.ID, map[string]domain.FollowedPhysicalClaim{"known.txt": durable}); err != nil || !ok {
+		t.Fatalf("reserve durable dangling owner = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+
+	newOp := func(path string) domain.Operation {
+		op, err := s.CreateOperation(ctx, domain.Operation{
+			SyncRootID:     root.ID,
+			Kind:           domain.OperationEnsureLocal,
+			EntryKind:      domain.KindFile,
+			SrcPath:        path,
+			ExpectedLocal:  domain.LocalFingerprint{},
+			ExpectedRemote: domain.RemoteExpectation{ID: "doc-" + path, Rev: "rev"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return op
+	}
+
+	known := newOp("known.txt")
+	ok, detail, err := s.AuthorizeAndPinLocalMutation(ctx, known.ID, domain.LocalMutationTarget{
+		Path:           targetPath,
+		AnchorIdentity: "known-parent-anchor",
+		FollowedClaims: map[string]domain.FollowedPhysicalClaim{
+			"known.txt": {Kind: domain.KindFile, TargetPath: targetPath},
+		},
+	})
+	if err != nil || !ok {
+		t.Fatalf("authorize durable dangling file = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+
+	newTarget := filepath.Join(t.TempDir(), "new-dangling-file")
+	unknown := newOp("unknown.txt")
+	ok, detail, err = s.AuthorizeAndPinLocalMutation(ctx, unknown.ID, domain.LocalMutationTarget{
+		Path:           newTarget,
+		AnchorIdentity: "unknown-parent-anchor",
+		FollowedClaims: map[string]domain.FollowedPhysicalClaim{
+			"unknown.txt": {Kind: domain.KindFile, TargetPath: newTarget},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || !strings.Contains(detail, "appeared after the authoritative scan") {
+		t.Fatalf("new dangling boundary gained authority: ok=%v detail=%q", ok, detail)
+	}
+}
+
 func TestCreateSyncRootRejectsPreinitializedRoot(t *testing.T) {
 	root := testSyncRoot("preinitialized", filepath.Join(t.TempDir(), "Data"), "pkudisk", "Personal/Data")
 	root.Initialized = true

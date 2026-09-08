@@ -201,7 +201,8 @@ func TestOperationLocalTargetIsPinnedBeforeRunning(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 	root := createTestRoot(t, s)
-	target := filepath.Join(t.TempDir(), "physical-target.txt")
+	target := filepath.Join(root.LocalRoot, "linked.txt")
+	anchor := "test-anchor-linked"
 
 	created, err := s.CreateOperation(ctx, domain.Operation{
 		SyncRootID:     root.ID,
@@ -214,8 +215,8 @@ func TestOperationLocalTargetIsPinnedBeforeRunning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetOperationLocalTarget(ctx, created.ID, target); err != nil {
-		t.Fatal(err)
+	if ok, detail, err := s.AuthorizeAndPinLocalMutation(ctx, created.ID, domain.LocalMutationTarget{Path: target, AnchorIdentity: anchor}); err != nil || !ok {
+		t.Fatalf("authorize first local target = ok=%v detail=%q err=%v", ok, detail, err)
 	}
 	got, ok, err := s.GetOperation(ctx, created.ID)
 	if err != nil || !ok {
@@ -224,13 +225,16 @@ func TestOperationLocalTargetIsPinnedBeforeRunning(t *testing.T) {
 	if got.LocalTargetPath != target {
 		t.Fatalf("local target = %q, want %q", got.LocalTargetPath, target)
 	}
-	if err := s.SetOperationLocalTarget(ctx, created.ID, target+"-other"); err == nil {
+	if got.LocalTargetIdentity != anchor {
+		t.Fatalf("local target identity = %q, want %q", got.LocalTargetIdentity, anchor)
+	}
+	if ok, _, err := s.AuthorizeAndPinLocalMutation(ctx, created.ID, domain.LocalMutationTarget{Path: target + "-other", AnchorIdentity: anchor}); err == nil && ok {
 		t.Fatal("operation local target was repinned")
 	}
 	if err := s.SetOperationPhase(ctx, created.ID, domain.OperationRunning, "", true); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetOperationLocalTarget(ctx, created.ID, target); err == nil {
+	if ok, _, err := s.AuthorizeAndPinLocalMutation(ctx, created.ID, domain.LocalMutationTarget{Path: target, AnchorIdentity: anchor}); err == nil && ok {
 		t.Fatal("running operation accepted a local target update")
 	}
 }
@@ -671,6 +675,26 @@ VALUES(?, ?, 'pkudisk', ?, 1, 1, 'follow', 60, 1)`, row.uuid, row.localRoot, row
 			t.Fatal(err)
 		}
 	}
+	for _, legacy := range []struct {
+		phase    string
+		attempts int
+		path     string
+	}{
+		{phase: string(domain.OperationPlanned), attempts: 0, path: filepath.Join(base, "legacy-planned")},
+		{phase: string(domain.OperationRunning), attempts: 1, path: filepath.Join(base, "legacy-running")},
+	} {
+		if _, err := db.ExecContext(ctx, `
+INSERT INTO operations(
+    sync_root_id, kind, entry_kind, src_path, dst_path,
+    expected_local_present, expected_local_kind, expected_local_size, expected_local_mtime_ns,
+    expected_remote_absent, expected_remote_id, expected_remote_rev,
+    phase, attempts, last_error, created_at_ns, updated_at_ns, local_target_path
+) VALUES(1, 'delete-local', 'file', ?, '', 1, 'file', 1, 1, 1, '', '', ?, ?, '', 1, 1, ?)`,
+			"legacy-"+legacy.phase+".txt", legacy.phase, legacy.attempts, legacy.path); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
 	for rootID, relPath := range map[int64]string{1: "link-a", 2: "link-b"} {
 		if _, err := db.ExecContext(ctx, `
 INSERT INTO followed_directory_boundaries(sync_root_id, rel_path, physical_identity)
@@ -709,6 +733,27 @@ VALUES(?, ?, 'linux:49:shared')`, rootID, relPath); err != nil {
 		}
 		if ok || !strings.Contains(detail, "already owned by sync root") {
 			t.Fatalf("legacy duplicate root %d was not blocked: ok=%v detail=%q", rootID, ok, detail)
+		}
+	}
+	operations, err := s.ListOperations(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 2 {
+		t.Fatalf("migrated legacy operations = %+v", operations)
+	}
+	for _, op := range operations {
+		switch op.Phase {
+		case domain.OperationPlanned:
+			if op.LocalTargetPath != "" || op.LocalTargetIdentity != "" {
+				t.Fatalf("planned legacy mutation retained incomplete pin: %+v", op)
+			}
+		case domain.OperationRunning:
+			if op.LocalTargetPath == "" || op.LocalTargetIdentity != "" {
+				t.Fatalf("started legacy mutation migration lost inspectability or invented identity: %+v", op)
+			}
+		default:
+			t.Fatalf("unexpected migrated operation phase: %+v", op)
 		}
 	}
 	var version int

@@ -134,7 +134,15 @@ func TestEnsureLocalFileStagesAndCommitsGuardedDownload(t *testing.T) {
 		assertDownloadConfig(t, copyCtx, "doc", "rev")
 		return os.WriteFile(filepath.Join(dst.Root(), filepath.FromSlash(dstRemote)), []byte("remote"), 0o600)
 	}
-	op := domain.Operation{ID: 7, Kind: domain.OperationEnsureLocal, EntryKind: domain.KindFile, SrcPath: "a.txt", LocalTargetPath: target, ExpectedRemote: expectedRemote}
+	op := domain.Operation{
+		ID:                  7,
+		Kind:                domain.OperationEnsureLocal,
+		EntryKind:           domain.KindFile,
+		SrcPath:             "a.txt",
+		LocalTargetPath:     target,
+		LocalTargetIdentity: physicalIdentityForTest(t, root),
+		ExpectedRemote:      expectedRemote,
+	}
 	got, err := exec.EnsureLocalFile(ctx, op)
 	if err != nil {
 		t.Fatal(err)

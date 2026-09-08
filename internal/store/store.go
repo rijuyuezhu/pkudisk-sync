@@ -10,7 +10,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 5
+const schemaVersion = 6
 
 // Store is the durable semantic authority for sync roots, committed baselines,
 // external-side-effect intents, and conflicts.
@@ -186,6 +186,27 @@ END`); err != nil {
 			return fmt.Errorf("migrate followed physical ownership v4 to v5: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 5"); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+		version = 5
+	}
+	if version == 5 {
+		if _, err := tx.ExecContext(ctx, `
+ALTER TABLE operations
+ADD COLUMN local_target_identity TEXT NOT NULL DEFAULT '';
+
+-- Planned, unattempted local intents have no external side effects yet. Drop
+-- their legacy path-only pin so v6 will re-resolve and atomically pin both the
+-- physical path and its anchor identity before execution.
+UPDATE operations
+SET local_target_path = ''
+WHERE kind IN ('ensure-local', 'delete-local')
+  AND phase = 'planned'
+  AND attempts = 0
+  AND local_target_path <> ''`); err != nil {
+			return fmt.Errorf("migrate local mutation authority v5 to v6: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 6"); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
 	}

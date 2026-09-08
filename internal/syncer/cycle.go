@@ -22,7 +22,7 @@ type DataPlane interface {
 	ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error)
 	ObserveLocalEntry(context.Context, string) (domain.LocalFingerprint, error)
 	ObserveRemoteEntry(context.Context, string) (domain.RemoteFingerprint, error)
-	ResolveLocalMutationTarget(context.Context, string, domain.LocalFingerprint) (string, error)
+	ResolveLocalMutationTarget(context.Context, string, domain.LocalFingerprint, domain.EntryKind) (domain.LocalMutationTarget, error)
 	LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error)
 	CleanupLocalRecoveryArtifact(context.Context, domain.Operation) error
 	CompareFileContent(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (bool, error)
@@ -352,20 +352,41 @@ func isLocalMutation(op domain.Operation) bool {
 }
 
 func pinLocalMutationTarget(ctx context.Context, state *store.Store, data DataPlane, op domain.Operation) (domain.Operation, error) {
-	if !isLocalMutation(op) || op.LocalTargetPath != "" {
+	if !isLocalMutation(op) {
+		return op, nil
+	}
+	if op.LocalTargetPath != "" || op.LocalTargetIdentity != "" {
+		if op.LocalTargetPath == "" || op.LocalTargetIdentity == "" {
+			return op, fmt.Errorf("operation %d has an incomplete physical local target pin", op.ID)
+		}
 		return op, nil
 	}
 	if op.Phase != domain.OperationPlanned || op.Attempts != 0 {
 		return op, fmt.Errorf("operation %d has no pinned local target after mutation attempts started", op.ID)
 	}
-	target, err := data.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal)
+	target, err := data.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal, op.EntryKind)
+	if err != nil {
+		// This intent is still planned, unpinned, and has never attempted an
+		// external mutation. A resolution failure means the snapshot used to
+		// create it is no longer a safe authority; discard it so the next cycle
+		// must obtain a fresh complete scan instead of retrying stale intent.
+		if deleteErr := state.DeleteOperation(ctx, op.ID); deleteErr != nil {
+			return op, fmt.Errorf("resolve local mutation target: %v; discard stale planned operation: %w", err, deleteErr)
+		}
+		return op, err
+	}
+	ok, detail, err := state.AuthorizeAndPinLocalMutation(ctx, op.ID, target)
 	if err != nil {
 		return op, err
 	}
-	if err := state.SetOperationLocalTarget(ctx, op.ID, target); err != nil {
-		return op, err
+	if !ok {
+		if deleteErr := state.DeleteOperation(ctx, op.ID); deleteErr != nil {
+			return op, fmt.Errorf("local mutation authority changed before pin: %s; discard stale planned operation: %w", detail, deleteErr)
+		}
+		return op, fmt.Errorf("local mutation authority changed before pin: %s", detail)
 	}
-	op.LocalTargetPath = target
+	op.LocalTargetPath = target.Path
+	op.LocalTargetIdentity = target.AnchorIdentity
 	return op, nil
 }
 
@@ -399,8 +420,9 @@ func recoverExistingOperations(ctx context.Context, state *store.Store, data Dat
 					return false, recovered, err
 				}
 			}
-			if isLocalMutation(op) && op.LocalTargetPath == "" {
-				if err := state.SetOperationPhase(ctx, op.ID, domain.OperationBlocked, "local mutation started before a physical target was pinned", false); err != nil {
+			if isLocalMutation(op) && (op.LocalTargetPath == "" || op.LocalTargetIdentity == "") {
+				detail := "local mutation started before a complete physical target path and identity were pinned; automatic replay is unsafe"
+				if err := state.SetOperationPhase(ctx, op.ID, domain.OperationBlocked, detail, false); err != nil {
 					return false, recovered, err
 				}
 				return true, recovered, nil

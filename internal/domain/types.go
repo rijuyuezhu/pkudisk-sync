@@ -24,6 +24,16 @@ type FollowedPhysicalClaim struct {
 	TargetPath string
 }
 
+// LocalMutationTarget is the physical destination resolved immediately before
+// a local mutation is durably pinned. FollowedClaims contains every followed
+// symlink boundary traversed on the logical path so the store can bind the
+// mutation to the same global physical-ownership authority used by scans.
+type LocalMutationTarget struct {
+	Path           string
+	AnchorIdentity string
+	FollowedClaims map[string]FollowedPhysicalClaim
+}
+
 // LocalFingerprint is the local state used by reconciliation and local-side
 // compare-and-swap checks. Directory mtimes are deliberately not part of
 // directory equality; child entries represent directory contents.
