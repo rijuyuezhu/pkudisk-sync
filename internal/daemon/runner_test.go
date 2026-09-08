@@ -118,6 +118,75 @@ func TestRunnerObservesPauseAndResumeWithoutRestart(t *testing.T) {
 	waitFor(t, func() bool { return calls.Load() == 2 }, "second resume did not run")
 }
 
+func TestRunnerHealthCheckNoticesQueuedDurableOperation(t *testing.T) {
+	state := openDaemonTestStore(t)
+	root := daemonTestRoot(t, "queued-op-root", "Personal/Queued")
+	root.PollIntervalSeconds = 0
+	stored, err := SetupRoot(context.Background(), state, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	watchers := newFakeWatcherFactory()
+	var calls atomic.Int32
+	cycle := func(ctx context.Context, rootID int64, state *store.Store, _ syncer.DataPlane, _ reconcile.DeletePolicy) (syncer.CycleResult, error) {
+		call := calls.Add(1)
+		if call > 1 {
+			operations, err := state.ListOperations(ctx, rootID)
+			if err != nil {
+				return syncer.CycleResult{}, err
+			}
+			for _, operation := range operations {
+				if err := state.DeleteOperation(ctx, operation.ID); err != nil {
+					return syncer.CycleResult{}, err
+				}
+			}
+		}
+		return syncer.CycleResult{}, nil
+	}
+	runner := testRunner(t, state, watchers.new, cycle)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runRunner(t, ctx, runner)
+	defer func() {
+		cancel()
+		waitRunner(t, done)
+	}()
+	waitFor(t, func() bool { return calls.Load() == 1 }, "initial root cycle did not run")
+
+	if _, err := state.CreateOperation(context.Background(), domain.Operation{
+		SyncRootID:     stored.ID,
+		Kind:           domain.OperationEnsureRemote,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "queued.txt",
+		ExpectedLocal:  domain.LocalFingerprint{Present: true, Kind: domain.KindFile, Size: 1, MtimeNS: 1},
+		ExpectedRemote: domain.RemoteExpectation{Absent: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return calls.Load() >= 2 }, "queued durable operation did not trigger a cycle")
+	time.Sleep(40 * time.Millisecond)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("queued operation caused %d cycles, want exactly 2", got)
+	}
+	if _, err := state.CreateOperation(context.Background(), domain.Operation{
+		SyncRootID:     stored.ID,
+		Kind:           domain.OperationEnsureRemote,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "blocked.txt",
+		ExpectedLocal:  domain.LocalFingerprint{Present: true, Kind: domain.KindFile, Size: 1, MtimeNS: 1},
+		ExpectedRemote: domain.RemoteExpectation{Absent: true},
+		Phase:          domain.OperationBlocked,
+		Attempts:       1,
+		LastError:      "needs attention",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("blocked operation triggered health-loop cycles: %d", got)
+	}
+}
+
 func TestRunnerDiscoversRootAddedAfterStartup(t *testing.T) {
 	state := openDaemonTestStore(t)
 	watchers := newFakeWatcherFactory()

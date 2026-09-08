@@ -604,12 +604,22 @@ func reconcileConflictRecords(ctx context.Context, rootID int64, state *store.St
 	}
 	existingByPath := make(map[string]domain.Conflict, len(existing))
 	for _, conflict := range existing {
-		existingByPath[conflict.RelPath] = conflict
-		if _, stillConflict := current[conflict.RelPath]; !stillConflict {
+		decision, stillConflict := current[conflict.RelPath]
+		if !stillConflict {
 			if err := state.ResolveConflict(ctx, conflict.ID); err != nil {
 				return err
 			}
+			continue
 		}
+		local := snapshot.Local[conflict.RelPath]
+		remote := snapshot.Remote[conflict.RelPath]
+		if conflict.Kind != decision.Conflict || !domain.LocalEquivalent(conflict.Local, local) || !domain.RemoteEquivalent(conflict.Remote, remote) {
+			if err := state.ResolveConflict(ctx, conflict.ID); err != nil {
+				return err
+			}
+			continue
+		}
+		existingByPath[conflict.RelPath] = conflict
 	}
 	for relPath, decision := range current {
 		if _, exists := existingByPath[relPath]; exists {

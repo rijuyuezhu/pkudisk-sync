@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -55,6 +56,21 @@ INSERT INTO conflicts(
 		return domain.Conflict{}, fmt.Errorf("read conflict ID: %w", err)
 	}
 	return conflict, nil
+}
+
+func (s *Store) GetConflict(ctx context.Context, id int64) (domain.Conflict, bool, error) {
+	if id <= 0 {
+		return domain.Conflict{}, false, fmt.Errorf("conflict ID must be positive")
+	}
+	row := s.db.QueryRowContext(ctx, conflictSelect+` WHERE id = ?`, id)
+	conflict, err := scanConflict(row)
+	if err == sql.ErrNoRows {
+		return domain.Conflict{}, false, nil
+	}
+	if err != nil {
+		return domain.Conflict{}, false, fmt.Errorf("get conflict: %w", err)
+	}
+	return conflict, true, nil
 }
 
 func (s *Store) ListConflicts(ctx context.Context, syncRootID int64, unresolvedOnly bool) ([]domain.Conflict, error) {

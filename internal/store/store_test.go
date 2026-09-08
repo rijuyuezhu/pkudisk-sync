@@ -336,6 +336,13 @@ func TestConflictRoundTripAndResolution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	got, ok, err := s.GetConflict(ctx, created.ID)
+	if err != nil || !ok || got.ID != created.ID || got.RelPath != created.RelPath || got.Resolved {
+		t.Fatalf("GetConflict() = %+v ok=%v err=%v", got, ok, err)
+	}
+	if _, ok, err := s.GetConflict(ctx, created.ID+999); err != nil || ok {
+		t.Fatalf("GetConflict(missing) ok=%v err=%v", ok, err)
+	}
 	unresolved, err := s.ListConflicts(ctx, root.ID, true)
 	if err != nil {
 		t.Fatal(err)
@@ -360,6 +367,10 @@ func TestConflictRoundTripAndResolution(t *testing.T) {
 	}
 	if len(all) != 1 || !all[0].Resolved || all[0].ResolvedAt.IsZero() {
 		t.Fatalf("resolved conflict = %+v", all)
+	}
+	got, ok, err = s.GetConflict(ctx, created.ID)
+	if err != nil || !ok || !got.Resolved || got.ResolvedAt.IsZero() {
+		t.Fatalf("GetConflict(resolved) = %+v ok=%v err=%v", got, ok, err)
 	}
 }
 

@@ -112,6 +112,7 @@ func TestRunRootCycleInitialConflictPersistsAndDoesNotInitialize(t *testing.T) {
 	if len(conflicts) != 1 || conflicts[0].RelPath != "conflict.txt" {
 		t.Fatalf("conflicts = %+v", conflicts)
 	}
+	oldID := conflicts[0].ID
 
 	second, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
 	if err != nil {
@@ -124,8 +125,168 @@ func TestRunRootCycleInitialConflictPersistsAndDoesNotInitialize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(conflicts) != 1 {
-		t.Fatalf("repeated cycle duplicated unresolved conflict: %+v", conflicts)
+	if len(conflicts) != 1 || conflicts[0].ID != oldID {
+		t.Fatalf("unchanged conflict was replaced or duplicated: %+v", conflicts)
+	}
+	data.remote["conflict.txt"] = remoteFileFP("doc-conflict", "rev-b", 4)
+	third, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Initialized || third.Conflicts != 1 {
+		t.Fatalf("third result = %+v", third)
+	}
+	conflicts, err = state.ListConflicts(ctx, root.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conflicts) != 1 || conflicts[0].ID == oldID || conflicts[0].Remote.Rev != "rev-b" {
+		t.Fatalf("changed conflict did not refresh durable fingerprint: %+v", conflicts)
+	}
+	allConflicts, err := state.ListConflicts(ctx, root.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(allConflicts) != 2 || !allConflicts[0].Resolved || allConflicts[1].Resolved {
+		t.Fatalf("conflict history after fingerprint refresh = %+v", allConflicts)
+	}
+}
+
+func TestRunRootCycleAppliesQueuedConflictResolutionThroughDurableOperation(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	data := &fakeDataPlane{
+		local: map[string]domain.LocalFingerprint{"conflict.txt": localFileFP(4, 40)},
+		remote: map[string]domain.RemoteFingerprint{
+			"conflict.txt": remoteFileFP("doc-conflict", "rev-a", 4),
+		},
+		contentEqual: map[string]bool{"conflict.txt": false},
+	}
+	if _, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	conflicts, err := state.ListConflicts(ctx, root.ID, true)
+	if err != nil || len(conflicts) != 1 {
+		t.Fatalf("initial conflicts = %+v err=%v", conflicts, err)
+	}
+	op, err := OperationForConflictResolution(conflicts[0], ConflictKeepLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.CreateOperation(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Recovered != 1 || !result.Initialized {
+		t.Fatalf("resolution cycle result = %+v", result)
+	}
+	if operations, err := state.ListOperations(ctx, root.ID); err != nil || len(operations) != 0 {
+		t.Fatalf("resolution operation remains = %+v err=%v", operations, err)
+	}
+	if conflicts, err := state.ListConflicts(ctx, root.ID, true); err != nil || len(conflicts) != 0 {
+		t.Fatalf("resolved conflict remains unresolved = %+v err=%v", conflicts, err)
+	}
+	if got := data.remote["conflict.txt"]; got.Rev == "rev-a" || got.Size != 4 {
+		t.Fatalf("keep-local did not replace remote conflict state: %+v", got)
+	}
+}
+
+func TestRunRootCycleAppliesKeepRemoteConflictResolution(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	data := &fakeDataPlane{
+		local: map[string]domain.LocalFingerprint{"conflict.txt": localFileFP(4, 40)},
+		remote: map[string]domain.RemoteFingerprint{
+			"conflict.txt": remoteFileFP("doc-conflict", "rev-a", 7),
+		},
+		contentEqual: map[string]bool{"conflict.txt": false},
+	}
+	if _, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	conflicts, err := state.ListConflicts(ctx, root.ID, true)
+	if err != nil || len(conflicts) != 1 {
+		t.Fatalf("initial conflicts = %+v err=%v", conflicts, err)
+	}
+	op, err := OperationForConflictResolution(conflicts[0], ConflictKeepRemote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.CreateOperation(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Recovered != 1 || !result.Initialized {
+		t.Fatalf("keep-remote resolution cycle result = %+v", result)
+	}
+	if got := data.local["conflict.txt"]; !got.Present || got.Kind != domain.KindFile || got.Size != 7 {
+		t.Fatalf("keep-remote did not replace local conflict state: %+v", got)
+	}
+	if conflicts, err := state.ListConflicts(ctx, root.ID, true); err != nil || len(conflicts) != 0 {
+		t.Fatalf("keep-remote conflict remains unresolved = %+v err=%v", conflicts, err)
+	}
+}
+
+func TestRunRootCycleDropsStaleConflictResolutionAndRefreshesConflict(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	data := &fakeDataPlane{
+		local: map[string]domain.LocalFingerprint{"conflict.txt": localFileFP(4, 40)},
+		remote: map[string]domain.RemoteFingerprint{
+			"conflict.txt": remoteFileFP("doc-conflict", "rev-a", 4),
+		},
+		contentEqual: map[string]bool{"conflict.txt": false},
+	}
+	if _, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	conflicts, err := state.ListConflicts(ctx, root.ID, true)
+	if err != nil || len(conflicts) != 1 {
+		t.Fatalf("initial conflicts = %+v err=%v", conflicts, err)
+	}
+	oldConflictID := conflicts[0].ID
+	op, err := OperationForConflictResolution(conflicts[0], ConflictKeepLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.CreateOperation(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+
+	data.remote["conflict.txt"] = remoteFileFP("doc-conflict", "rev-b", 4)
+	beforeCalls := len(data.calls)
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Recovered != 0 || result.Conflicts != 1 {
+		t.Fatalf("stale resolution cycle result = %+v", result)
+	}
+	for _, call := range data.calls[beforeCalls:] {
+		if strings.HasPrefix(call, "upload:") || strings.HasPrefix(call, "ensure-") || strings.HasPrefix(call, "delete-") {
+			t.Fatalf("stale resolution mutated data: calls=%v", data.calls[beforeCalls:])
+		}
+	}
+	if got := data.remote["conflict.txt"]; got.Rev != "rev-b" {
+		t.Fatalf("stale resolution overwrote newer remote state: %+v", got)
+	}
+	if operations, err := state.ListOperations(ctx, root.ID); err != nil || len(operations) != 0 {
+		t.Fatalf("stale resolution operation remains = %+v err=%v", operations, err)
+	}
+	conflicts, err = state.ListConflicts(ctx, root.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conflicts) != 1 || conflicts[0].ID == oldConflictID || conflicts[0].Remote.Rev != "rev-b" {
+		t.Fatalf("stale conflict was not refreshed: %+v", conflicts)
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"github.com/rijuyuezhu/pkudisk-sync/internal/executor"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/reconcile"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/store"
+	"github.com/rijuyuezhu/pkudisk-sync/internal/syncer"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/userservice"
 )
 
@@ -103,6 +104,8 @@ func (a *Application) printUsage() {
 	fmt.Fprintln(a.stdout, "  paths                              Show app-owned state/config/cache/runtime paths")
 	fmt.Fprintln(a.stdout, "  status                             Summarize roots, operations, and conflicts")
 	fmt.Fprintln(a.stdout, "  conflict list [--root ID]          List unresolved conflicts")
+	fmt.Fprintln(a.stdout, "  conflict resolve ID --keep-local   Queue exact-state resolution using local data")
+	fmt.Fprintln(a.stdout, "  conflict resolve ID --keep-remote  Queue exact-state resolution using remote data")
 	fmt.Fprintln(a.stdout, "  root add --local PATH --remote R:P Add one selected directory pair")
 	fmt.Fprintln(a.stdout, "  root list                          List selected directory pairs")
 	fmt.Fprintln(a.stdout, "  root pause ID                      Pause one selected pair")
@@ -179,15 +182,23 @@ func (a *Application) runStatus(ctx context.Context, args []string) error {
 
 func (a *Application) runConflict(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("conflict requires: list")
+		return fmt.Errorf("conflict requires one of: list, resolve")
 	}
-	if args[0] != "list" {
+	switch args[0] {
+	case "list":
+		return a.runConflictList(ctx, args[1:])
+	case "resolve":
+		return a.runConflictResolve(ctx, args[1:])
+	default:
 		return fmt.Errorf("unknown conflict command %q", args[0])
 	}
+}
+
+func (a *Application) runConflictList(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("conflict list", flag.ContinueOnError)
 	fs.SetOutput(a.stderr)
 	rootID := fs.Int64("root", 0, "limit to one sync root ID")
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return nil
 		}
@@ -242,6 +253,84 @@ func (a *Application) runConflict(ctx context.Context, args []string) error {
 		}
 	}
 	return w.Flush()
+}
+
+func (a *Application) runConflictResolve(ctx context.Context, args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("conflict resolve requires a conflict ID and exactly one of --keep-local or --keep-remote")
+	}
+	var (
+		id         int64
+		resolution syncer.ConflictResolution
+	)
+	for _, arg := range args {
+		switch arg {
+		case "--keep-local":
+			if resolution != "" {
+				return fmt.Errorf("conflict resolve requires exactly one resolution choice")
+			}
+			resolution = syncer.ConflictKeepLocal
+		case "--keep-remote":
+			if resolution != "" {
+				return fmt.Errorf("conflict resolve requires exactly one resolution choice")
+			}
+			resolution = syncer.ConflictKeepRemote
+		default:
+			parsed, err := strconv.ParseInt(arg, 10, 64)
+			if err != nil || parsed <= 0 || id != 0 {
+				return fmt.Errorf("invalid conflict resolve argument %q", arg)
+			}
+			id = parsed
+		}
+	}
+	if id == 0 || resolution == "" {
+		return fmt.Errorf("conflict resolve requires a conflict ID and exactly one of --keep-local or --keep-remote")
+	}
+
+	state, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer state.Close()
+	conflict, ok, err := state.GetConflict(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("conflict %d not found", id)
+	}
+	if conflict.Resolved {
+		return fmt.Errorf("conflict %d is already resolved", id)
+	}
+	root, ok, err := state.GetSyncRoot(ctx, conflict.SyncRootID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("sync root %d for conflict %d not found", conflict.SyncRootID, id)
+	}
+	operations, err := state.ListOperations(ctx, conflict.SyncRootID)
+	if err != nil {
+		return err
+	}
+	for _, operation := range operations {
+		if operation.SrcPath == conflict.RelPath {
+			return fmt.Errorf("conflict %d path %q already has pending operation %d (%s)", id, conflict.RelPath, operation.ID, operation.Phase)
+		}
+	}
+	operation, err := syncer.OperationForConflictResolution(conflict, resolution)
+	if err != nil {
+		return err
+	}
+	operation, err = state.CreateOperation(ctx, operation)
+	if err != nil {
+		return fmt.Errorf("queue conflict %d resolution: %w", id, err)
+	}
+	fmt.Fprintf(a.stdout, "queued conflict %d %s as operation %d\n", id, resolution, operation.ID)
+	if !root.Enabled {
+		fmt.Fprintf(a.stdout, "root %d is paused; resume it to apply the queued resolution\n", root.ID)
+	}
+	return nil
 }
 
 func describeLocalConflictState(state domain.LocalFingerprint) string {

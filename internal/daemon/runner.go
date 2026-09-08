@@ -262,6 +262,18 @@ func (r *Runner) runRoot(ctx context.Context, initial domain.SyncRoot) {
 			}
 			if root.Enabled && !lastEnabled {
 				pending = true
+			} else if root.Enabled && !pending {
+				operations, listErr := r.state.ListOperations(ctx, root.ID)
+				if listErr != nil {
+					r.report(initial.ID, "state", syncer.CycleResult{}, false, listErr)
+				} else {
+					for _, operation := range operations {
+						if operation.Phase == domain.OperationPlanned {
+							pending = true
+							break
+						}
+					}
+				}
 			}
 			lastEnabled = root.Enabled
 		case _, ok := <-hints:

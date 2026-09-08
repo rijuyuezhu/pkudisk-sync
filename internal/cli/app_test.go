@@ -279,6 +279,111 @@ func TestRootRemoveRequiresStoppedDaemonAndPausedRootAndKeepsData(t *testing.T) 
 	}
 }
 
+func TestConflictResolveQueuesExactDurableOperationWithoutMarkingConflictResolved(t *testing.T) {
+	ctx := context.Background()
+	paths := cliTestPaths(t)
+	var stdout bytes.Buffer
+	app := New(paths, &stdout, &bytes.Buffer{})
+	app.installRcloneConfig = func(string) error { return nil }
+	app.validateRemote = func(string) error { return nil }
+	app.newUUID = func() (string, error) { return "resolve-root-uuid", nil }
+	if err := app.Run(ctx, []string{"root", "add", "--local", t.TempDir(), "--remote", "pkudisk:Personal/Resolve"}); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := store.Open(ctx, paths.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflict, err := state.CreateConflict(ctx, domain.Conflict{
+		SyncRootID: 1,
+		RelPath:    "conflict.txt",
+		Kind:       domain.ConflictBothModified,
+		Local:      domain.LocalFingerprint{Present: true, Kind: domain.KindFile, Size: 12, MtimeNS: 123},
+		Remote:     domain.RemoteFingerprint{Present: true, Kind: domain.KindFile, ID: "doc", Rev: "rev-b", Size: 13},
+	})
+	if err != nil {
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout.Reset()
+	if err := app.Run(ctx, []string{"conflict", "resolve", "1", "--keep-local"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "queued conflict 1 keep-local as operation") {
+		t.Fatalf("resolve output = %q", stdout.String())
+	}
+	state, err = store.Open(ctx, paths.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operations, err := state.ListOperations(ctx, 1)
+	if err != nil {
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	if len(operations) != 1 || operations[0].Kind != domain.OperationEnsureRemote || operations[0].ExpectedRemote.ID != "doc" || operations[0].ExpectedRemote.Rev != "rev-b" {
+		_ = state.Close()
+		t.Fatalf("queued resolution operation = %+v", operations)
+	}
+	storedConflict, ok, err := state.GetConflict(ctx, conflict.ID)
+	if err != nil || !ok || storedConflict.Resolved {
+		_ = state.Close()
+		t.Fatalf("conflict was prematurely resolved: %+v ok=%v err=%v", storedConflict, ok, err)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Run(ctx, []string{"conflict", "resolve", "--keep-remote", "1"}); err == nil || !strings.Contains(err.Error(), "pending operation") {
+		t.Fatalf("duplicate resolution error = %v", err)
+	}
+}
+
+func TestConflictResolveRejectsKindMismatchWithoutQueueingOperation(t *testing.T) {
+	ctx := context.Background()
+	paths := cliTestPaths(t)
+	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
+	app.installRcloneConfig = func(string) error { return nil }
+	app.validateRemote = func(string) error { return nil }
+	app.newUUID = func() (string, error) { return "kind-root-uuid", nil }
+	if err := app.Run(ctx, []string{"root", "add", "--local", t.TempDir(), "--remote", "pkudisk:Personal/Kind"}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Open(ctx, paths.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.CreateConflict(ctx, domain.Conflict{
+		SyncRootID: 1,
+		RelPath:    "mixed",
+		Kind:       domain.ConflictKindMismatch,
+		Local:      domain.LocalFingerprint{Present: true, Kind: domain.KindFile, Size: 1, MtimeNS: 1},
+		Remote:     domain.RemoteFingerprint{Present: true, Kind: domain.KindDir, ID: "dir"},
+	}); err != nil {
+		_ = state.Close()
+		t.Fatal(err)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err = app.Run(ctx, []string{"conflict", "resolve", "1", "--keep-local"})
+	if err == nil || !strings.Contains(err.Error(), "kind mismatch") {
+		t.Fatalf("kind mismatch resolution error = %v", err)
+	}
+	state, err = store.Open(ctx, paths.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	if operations, err := state.ListOperations(ctx, 1); err != nil || len(operations) != 0 {
+		t.Fatalf("kind mismatch queued operations = %+v err=%v", operations, err)
+	}
+}
+
 func TestRootAddValidatesRemoteBeforeCreatingRootState(t *testing.T) {
 	paths := cliTestPaths(t)
 	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
