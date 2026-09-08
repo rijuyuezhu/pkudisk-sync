@@ -56,30 +56,48 @@ func Check(localRoot, uuid string) error {
 	if err := validateInputs(localRoot, uuid); err != nil {
 		return err
 	}
+	actual, err := Read(localRoot)
+	if err != nil {
+		return err
+	}
+	if actual != uuid {
+		return fmt.Errorf("sync root marker UUID mismatch")
+	}
+	return nil
+}
+
+// Read returns the UUID stored in a valid reserved marker without asserting
+// ownership. Callers must not treat this as permission to adopt or replace the
+// marker; it exists for explicit recovery workflows only.
+func Read(localRoot string) (string, error) {
+	if strings.TrimSpace(localRoot) == "" {
+		return "", fmt.Errorf("local root must not be empty")
+	}
 	rootInfo, err := os.Lstat(localRoot)
 	if err != nil {
-		return fmt.Errorf("stat sync root: %w", err)
+		return "", fmt.Errorf("stat sync root: %w", err)
 	}
 	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
-		return fmt.Errorf("sync root %q must be a real directory", localRoot)
+		return "", fmt.Errorf("sync root %q must be a real directory", localRoot)
 	}
 
 	marker := filepath.Join(localRoot, FileName)
 	info, err := os.Lstat(marker)
 	if err != nil {
-		return fmt.Errorf("stat sync root marker: %w", err)
+		return "", fmt.Errorf("stat sync root marker: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("sync root marker %q is not a regular file", marker)
+		return "", fmt.Errorf("sync root marker %q is not a regular file", marker)
 	}
 	contents, err := os.ReadFile(marker)
 	if err != nil {
-		return fmt.Errorf("read sync root marker: %w", err)
+		return "", fmt.Errorf("read sync root marker: %w", err)
 	}
-	if strings.TrimSpace(string(contents)) != uuid {
-		return fmt.Errorf("sync root marker UUID mismatch")
+	uuid := strings.TrimSpace(string(contents))
+	if uuid == "" {
+		return "", fmt.Errorf("sync root marker UUID is empty")
 	}
-	return nil
+	return uuid, nil
 }
 
 // Remove deletes only a marker that currently proves the expected root UUID.

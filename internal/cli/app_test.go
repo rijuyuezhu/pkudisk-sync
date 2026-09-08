@@ -104,6 +104,41 @@ func TestRootAddListPauseResume(t *testing.T) {
 	}
 }
 
+func TestRootAddRecoversOrphanMarkerOnlyWithExplicitFlag(t *testing.T) {
+	ctx := context.Background()
+	paths := cliTestPaths(t)
+	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
+	app.installRcloneConfig = func(string) error { return nil }
+	app.validateRemote = func(string) error { return nil }
+	app.newUUID = func() (string, error) { return "replacement-root-uuid", nil }
+	localRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(localRoot, "keep.txt"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := rootmarker.Ensure(localRoot, "orphan-root-uuid"); err != nil {
+		t.Fatal(err)
+	}
+	baseArgs := []string{"root", "add", "--local", localRoot, "--remote", "pkudisk:Personal/Recovered"}
+	if err := app.Run(ctx, baseArgs); err == nil {
+		t.Fatal("root add silently adopted an existing marker")
+	}
+	if err := rootmarker.Check(localRoot, "orphan-root-uuid"); err != nil {
+		t.Fatalf("ordinary add changed orphan marker: %v", err)
+	}
+
+	recoverArgs := append(append([]string{}, baseArgs...), "--recover-orphan-marker")
+	if err := app.Run(ctx, recoverArgs); err != nil {
+		t.Fatal(err)
+	}
+	if err := rootmarker.Check(localRoot, "replacement-root-uuid"); err != nil {
+		t.Fatalf("explicit recovery did not replace marker: %v", err)
+	}
+	contents, err := os.ReadFile(filepath.Join(localRoot, "keep.txt"))
+	if err != nil || string(contents) != "keep" {
+		t.Fatalf("explicit orphan recovery changed user data: contents=%q err=%v", contents, err)
+	}
+}
+
 func TestStatusAndConflictListExposeDurableAttentionState(t *testing.T) {
 	ctx := context.Background()
 	paths := cliTestPaths(t)

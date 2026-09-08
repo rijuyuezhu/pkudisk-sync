@@ -492,6 +492,7 @@ func (a *Application) runRootAdd(ctx context.Context, args []string) error {
 	localArg := fs.String("local", "", "local directory")
 	remoteArg := fs.String("remote", "", "PKU Disk root in remote:path form")
 	poll := fs.Duration("poll", 0, "periodic repair interval; 0 uses daemon default")
+	recoverOrphanMarker := fs.Bool("recover-orphan-marker", false, "replace an unowned reserved root marker left by an interrupted prior add")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return nil
@@ -556,7 +557,12 @@ func (a *Application) runRootAdd(ctx context.Context, args []string) error {
 		return err
 	}
 	defer state.Close()
-	stored, err := daemon.SetupRoot(ctx, state, root)
+	var stored domain.SyncRoot
+	if *recoverOrphanMarker {
+		stored, err = daemon.SetupRootRecoveringOrphanMarker(ctx, state, root)
+	} else {
+		stored, err = daemon.SetupRoot(ctx, state, root)
+	}
 	if err != nil {
 		return err
 	}

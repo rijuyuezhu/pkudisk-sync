@@ -90,6 +90,34 @@ func TestSetupRootRefusesUnexpectedReservedMarker(t *testing.T) {
 	}
 }
 
+func TestSetupRootExplicitlyRecoversOrphanMarker(t *testing.T) {
+	ctx := context.Background()
+	state := openDaemonTestStore(t)
+	root := daemonTestRoot(t, "replacement-root", "Personal/Data")
+	userFile := filepath.Join(root.LocalRoot, "keep.txt")
+	if err := os.WriteFile(userFile, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := rootmarker.Ensure(root.LocalRoot, "orphan-root"); err != nil {
+		t.Fatal(err)
+	}
+
+	stored, err := SetupRootRecoveringOrphanMarker(ctx, state, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.UUID != root.UUID {
+		t.Fatalf("stored UUID = %q, want %q", stored.UUID, root.UUID)
+	}
+	if err := rootmarker.Check(root.LocalRoot, root.UUID); err != nil {
+		t.Fatalf("recovered marker: %v", err)
+	}
+	contents, err := os.ReadFile(userFile)
+	if err != nil || string(contents) != "keep" {
+		t.Fatalf("orphan recovery changed user data: contents=%q err=%v", contents, err)
+	}
+}
+
 func TestSetupRootSerializesConcurrentPairing(t *testing.T) {
 	ctx := context.Background()
 	state := openDaemonTestStore(t)
@@ -206,6 +234,29 @@ func TestRemoveRootRequiresPausedIdleRootAndPreservesMarkerOnRejection(t *testin
 	}
 	if err := rootmarker.Check(root.LocalRoot, root.UUID); err != nil {
 		t.Fatalf("busy-root rejection lost marker: %v", err)
+	}
+}
+
+func TestRemoveRootRecoversAfterMarkerWasAlreadyRemoved(t *testing.T) {
+	ctx := context.Background()
+	state := openDaemonTestStore(t)
+	root := daemonTestRoot(t, "remove-recovery", "Personal/RemoveRecovery")
+	stored, err := SetupRoot(ctx, state, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootEnabled(ctx, stored.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := rootmarker.Remove(root.LocalRoot, root.UUID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RemoveRoot(ctx, state, stored.ID); err != nil {
+		t.Fatalf("resume interrupted remove: %v", err)
+	}
+	if _, ok, err := state.GetSyncRoot(ctx, stored.ID); err != nil || ok {
+		t.Fatalf("root remained after resumed remove: ok=%v err=%v", ok, err)
 	}
 }
 
