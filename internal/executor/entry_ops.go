@@ -16,8 +16,9 @@ import (
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
 )
 
-// ObserveLocalEntry returns the exact ordinary-file/directory state currently
-// visible at relPath. Unsupported local types are errors, never absence.
+// ObserveLocalEntry returns the ordinary-file/directory state visible through
+// the configured symlink policy. In follow mode it fingerprints the resolved
+// target; dangling links are absent from the synchronized virtual namespace.
 func (e *RootExecutor) ObserveLocalEntry(ctx context.Context, relPath string) (domain.LocalFingerprint, error) {
 	if err := domain.ValidateRelPath(relPath); err != nil {
 		return domain.LocalFingerprint{}, err
@@ -26,7 +27,11 @@ func (e *RootExecutor) ObserveLocalEntry(ctx context.Context, relPath string) (d
 		return domain.LocalFingerprint{}, err
 	}
 	fullPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
-	info, err := os.Lstat(fullPath)
+	stat := os.Lstat
+	if e.root.EffectiveSymlinkMode() == domain.SymlinkFollow {
+		stat = os.Stat
+	}
+	info, err := stat(fullPath)
 	if errors.Is(err, os.ErrNotExist) {
 		return domain.LocalFingerprint{}, nil
 	}
@@ -34,7 +39,7 @@ func (e *RootExecutor) ObserveLocalEntry(ctx context.Context, relPath string) (d
 		return domain.LocalFingerprint{}, fmt.Errorf("stat local entry %q: %w", relPath, err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return domain.LocalFingerprint{}, fmt.Errorf("unsupported local symlink %q", relPath)
+		return domain.LocalFingerprint{}, fmt.Errorf("local symlink %q is not addressable under %s policy", relPath, e.root.EffectiveSymlinkMode())
 	}
 	if info.IsDir() {
 		return domain.LocalFingerprint{Present: true, Kind: domain.KindDir}, nil
@@ -42,12 +47,7 @@ func (e *RootExecutor) ObserveLocalEntry(ctx context.Context, relPath string) (d
 	if !info.Mode().IsRegular() {
 		return domain.LocalFingerprint{}, fmt.Errorf("unsupported local file type %q (%s)", relPath, info.Mode().Type())
 	}
-	return domain.LocalFingerprint{
-		Present: true,
-		Kind:    domain.KindFile,
-		Size:    info.Size(),
-		MtimeNS: info.ModTime().UnixNano(),
-	}, nil
+	return localFileFingerprint(info), nil
 }
 
 // ObserveRemoteEntry resolves one path through its parent listing, so it can
@@ -94,25 +94,34 @@ func (e *RootExecutor) ObserveRemoteEntry(ctx context.Context, relPath string) (
 	return domain.RemoteFingerprint{}, nil
 }
 
-// EnsureLocalDir creates exactly one planned directory. Parents must already
-// exist, which lets the coordinator enforce shallow-to-deep ordering.
-func (e *RootExecutor) EnsureLocalDir(ctx context.Context, relPath string, expected domain.LocalFingerprint) error {
-	if err := expected.Validate(); err != nil {
+// EnsureLocalDir creates exactly one planned physical target directory.
+// A dangling followed directory symlink is preserved and its target is created.
+func (e *RootExecutor) EnsureLocalDir(ctx context.Context, op domain.Operation) error {
+	if op.Kind != domain.OperationEnsureLocal || op.EntryKind != domain.KindDir || op.LocalTargetPath == "" {
+		return fmt.Errorf("invalid pinned local directory operation")
+	}
+	if err := op.ExpectedLocal.Validate(); err != nil {
 		return fmt.Errorf("expected local state: %w", err)
 	}
-	if expected.Present {
+	if op.ExpectedLocal.Present {
 		return fmt.Errorf("local directory create requires an absent expectation")
 	}
-	current, err := e.ObserveLocalEntry(ctx, relPath)
+	current, err := e.ObserveLocalEntry(ctx, op.SrcPath)
 	if err != nil {
 		return err
 	}
 	if current.Present {
-		return fmt.Errorf("local directory create precondition failed for %q", relPath)
+		return fmt.Errorf("local directory create precondition failed for %q", op.SrcPath)
 	}
-	fullPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
-	if err := os.Mkdir(fullPath, 0o755); err != nil {
-		return fmt.Errorf("create local directory %q: %w", relPath, err)
+	currentTarget, err := e.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal)
+	if err != nil {
+		return err
+	}
+	if !samePhysicalDestination(op.LocalTargetPath, currentTarget, false) {
+		return fmt.Errorf("local symlink target changed before directory create for %q", op.SrcPath)
+	}
+	if err := os.Mkdir(op.LocalTargetPath, 0o755); err != nil {
+		return fmt.Errorf("create local directory %q: %w", op.SrcPath, err)
 	}
 	return nil
 }
@@ -143,117 +152,294 @@ func (e *RootExecutor) EnsureRemoteDir(ctx context.Context, relPath string, expe
 	return nil
 }
 
-// EnsureLocalFile downloads the exact planned remote revision to a unique
-// same-directory temp and only then commits it under local/remote preconditions.
-// It returns the exact stat fingerprint of the temp that was atomically moved
-// into place so the coordinator can detect a local write racing postcondition
-// observation.
-func (e *RootExecutor) EnsureLocalFile(ctx context.Context, relPath string, expectedLocal domain.LocalFingerprint, expectedRemote domain.RemoteExpectation) (domain.LocalFingerprint, error) {
-	tempRel, err := newTempRelPath(relPath)
+// EnsureLocalFile downloads the exact planned remote revision next to the
+// resolved physical destination and only then commits it under local/remote
+// preconditions. A followed symlink is preserved; only its target is replaced.
+func (e *RootExecutor) EnsureLocalFile(ctx context.Context, op domain.Operation) (domain.LocalFingerprint, error) {
+	if op.Kind != domain.OperationEnsureLocal || op.EntryKind != domain.KindFile || op.LocalTargetPath == "" || op.ID <= 0 {
+		return domain.LocalFingerprint{}, fmt.Errorf("invalid pinned local file operation")
+	}
+	if err := op.ExpectedLocal.Validate(); err != nil {
+		return domain.LocalFingerprint{}, fmt.Errorf("expected local state: %w", err)
+	}
+	if err := validateFileRemoteExpectation(op.ExpectedRemote); err != nil || op.ExpectedRemote.Absent {
+		if err != nil {
+			return domain.LocalFingerprint{}, err
+		}
+		return domain.LocalFingerprint{}, fmt.Errorf("download requires a present remote expectation")
+	}
+	current, err := e.ObserveLocalEntry(ctx, op.SrcPath)
 	if err != nil {
 		return domain.LocalFingerprint{}, err
 	}
-	defer e.removeLocalTemp(tempRel)
-	if err := e.DownloadToTemp(ctx, relPath, tempRel, expectedRemote); err != nil {
+	if !domain.LocalEquivalent(current, op.ExpectedLocal) {
+		return domain.LocalFingerprint{}, fmt.Errorf("local download precondition failed for %q", op.SrcPath)
+	}
+	currentTarget, err := e.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal)
+	if err != nil {
 		return domain.LocalFingerprint{}, err
 	}
-	return e.CommitDownloadedTemp(ctx, relPath, tempRel, expectedLocal, expectedRemote)
+	if !samePhysicalDestination(op.LocalTargetPath, currentTarget, op.ExpectedLocal.Present) {
+		return domain.LocalFingerprint{}, fmt.Errorf("local symlink target changed before download for %q", op.SrcPath)
+	}
+	tempPath := operationPhysicalTempPath(op.LocalTargetPath, op.ID, "download")
+	_ = os.Remove(tempPath)
+	defer func() { _ = os.Remove(tempPath) }()
+	if err := e.downloadToPhysicalTemp(ctx, op.SrcPath, tempPath, op.ExpectedRemote); err != nil {
+		return domain.LocalFingerprint{}, err
+	}
+	return e.commitDownloadedPhysicalTemp(ctx, op, tempPath)
 }
 
-// DeleteLocal removes exactly the expected file or an empty expected directory.
-// It never recursively deletes a directory, so an unseen concurrent child makes
-// the operation fail closed.
-func (e *RootExecutor) DeleteLocal(ctx context.Context, relPath string, expected domain.LocalFingerprint) error {
-	if err := expected.Validate(); err != nil {
+// DeleteLocal removes exactly the expected target file or empty target
+// directory. In follow mode a symlink object is retained and becomes dangling
+// after its target is deleted.
+func (e *RootExecutor) DeleteLocal(ctx context.Context, op domain.Operation) error {
+	if op.Kind != domain.OperationDeleteLocal || op.LocalTargetPath == "" || op.ID <= 0 {
+		return fmt.Errorf("invalid pinned local delete operation")
+	}
+	if err := op.ExpectedLocal.Validate(); err != nil {
 		return fmt.Errorf("expected local state: %w", err)
 	}
-	if !expected.Present {
+	if !op.ExpectedLocal.Present {
 		return fmt.Errorf("local delete requires a present expectation")
 	}
-	current, err := e.ObserveLocalEntry(ctx, relPath)
+	current, err := e.ObserveLocalEntry(ctx, op.SrcPath)
 	if err != nil {
 		return err
 	}
-	if !domain.LocalEquivalent(current, expected) {
-		return fmt.Errorf("local delete precondition failed for %q", relPath)
+	if !domain.LocalEquivalent(current, op.ExpectedLocal) {
+		return fmt.Errorf("local delete precondition failed for %q", op.SrcPath)
 	}
-	recoveryRel, err := e.preserveExpectedLocalEntry(ctx, relPath, expected)
+	currentTarget, err := e.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal)
 	if err != nil {
 		return err
 	}
-	recoveryPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(recoveryRel))
+	if !samePhysicalDestination(op.LocalTargetPath, currentTarget, true) {
+		return fmt.Errorf("local symlink target changed before delete for %q", op.SrcPath)
+	}
+	recoveryPath := operationPhysicalTempPath(op.LocalTargetPath, op.ID, "recovery")
+	preserved, err := preserveExpectedLocalEntryAt(ctx, op.SrcPath, op.LocalTargetPath, recoveryPath, op.ExpectedLocal)
+	if err != nil {
+		return err
+	}
 	if err := ctx.Err(); err != nil {
-		return e.restorePreservedLocalEntry(relPath, recoveryRel, err)
+		return restorePreservedLocalEntry(preserved, op.SrcPath, err)
 	}
-	if err := os.Remove(recoveryPath); err != nil {
-		return e.restorePreservedLocalEntry(relPath, recoveryRel, fmt.Errorf("delete local %s %q: %w", expected.Kind, relPath, err))
+	if err := os.Remove(preserved.recoveryPath); err != nil {
+		return restorePreservedLocalEntry(preserved, op.SrcPath, fmt.Errorf("delete local %s %q: %w", op.ExpectedLocal.Kind, op.SrcPath, err))
 	}
 	return nil
 }
 
-// preserveExpectedLocalEntry atomically moves the current path into a unique
-// same-directory recovery slot before validating the object that was actually
-// moved. This closes the path-level Lstat->rename/unlink race: a concurrent
-// save-by-rename is preserved rather than overwritten or deleted.
-func (e *RootExecutor) preserveExpectedLocalEntry(ctx context.Context, relPath string, expected domain.LocalFingerprint) (string, error) {
-	recoveryRel, err := newTempRelPath(relPath)
-	if err != nil {
-		return "", err
-	}
-	srcPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
-	recoveryPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(recoveryRel))
-	if err := movePathNoReplace(srcPath, recoveryPath); err != nil {
-		return "", fmt.Errorf("preserve local entry %q before mutation: %w", relPath, err)
-	}
+type preservedLocalEntry struct {
+	targetPath   string
+	recoveryPath string
+}
 
-	observed, observeErr := e.ObserveLocalEntry(ctx, recoveryRel)
+// preserveExpectedLocalEntryAt atomically moves the resolved physical target
+// aside before validating what was actually moved. The symlink path itself is
+// never renamed or unlinked.
+func preserveExpectedLocalEntryAt(ctx context.Context, relPath, targetPath, recoveryPath string, expected domain.LocalFingerprint) (preservedLocalEntry, error) {
+	if err := movePathNoReplace(targetPath, recoveryPath); err != nil {
+		return preservedLocalEntry{}, fmt.Errorf("preserve local entry %q before mutation: %w", relPath, err)
+	}
+	preserved := preservedLocalEntry{targetPath: targetPath, recoveryPath: recoveryPath}
+	observed, observeErr := observePhysicalLocalEntry(ctx, recoveryPath)
 	if observeErr == nil && domain.LocalEquivalent(observed, expected) {
-		return recoveryRel, nil
+		return preserved, nil
 	}
 	primary := observeErr
 	if primary == nil {
 		primary = fmt.Errorf("local mutation precondition failed for %q after preserving the actual path target", relPath)
 	}
-	if restoreErr := movePathNoReplace(recoveryPath, srcPath); restoreErr != nil {
-		return "", errors.Join(primary, fmt.Errorf("local data is preserved at %q because restoring %q failed: %w", recoveryRel, relPath, restoreErr))
+	if restoreErr := movePathNoReplace(recoveryPath, targetPath); restoreErr != nil {
+		return preservedLocalEntry{}, errors.Join(primary, fmt.Errorf("local data is preserved at %q because restoring %q failed: %w", recoveryPath, relPath, restoreErr))
 	}
-	return "", primary
+	return preservedLocalEntry{}, primary
 }
 
-func (e *RootExecutor) restorePreservedLocalEntry(relPath, recoveryRel string, primary error) error {
-	recoveryPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(recoveryRel))
-	dstPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
-	if restoreErr := movePathNoReplace(recoveryPath, dstPath); restoreErr != nil {
-		return errors.Join(primary, fmt.Errorf("local data is preserved at %q because restoring %q failed: %w", recoveryRel, relPath, restoreErr))
+func restorePreservedLocalEntry(preserved preservedLocalEntry, relPath string, primary error) error {
+	if restoreErr := movePathNoReplace(preserved.recoveryPath, preserved.targetPath); restoreErr != nil {
+		return errors.Join(primary, fmt.Errorf("local data is preserved at %q because restoring %q failed: %w", preserved.recoveryPath, relPath, restoreErr))
 	}
 	return primary
 }
 
-func (e *RootExecutor) installDownloadedTemp(ctx context.Context, relPath, tempRelPath string, expectedLocal domain.LocalFingerprint) error {
-	tempPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(tempRelPath))
-	dstPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
+func (e *RootExecutor) installDownloadedPhysicalTemp(ctx context.Context, relPath, targetPath, tempPath, recoveryPath string, expectedLocal domain.LocalFingerprint) error {
 	if !expectedLocal.Present {
-		if err := movePathNoReplace(tempPath, dstPath); err != nil {
+		if err := movePathNoReplace(tempPath, targetPath); err != nil {
 			return fmt.Errorf("install downloaded file %q without replacing a concurrent local create: %w", relPath, err)
 		}
 		return nil
 	}
-
-	recoveryRel, err := e.preserveExpectedLocalEntry(ctx, relPath, expectedLocal)
+	preserved, err := preserveExpectedLocalEntryAt(ctx, relPath, targetPath, recoveryPath, expectedLocal)
 	if err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
-		return e.restorePreservedLocalEntry(relPath, recoveryRel, err)
+		return restorePreservedLocalEntry(preserved, relPath, err)
 	}
-	if err := movePathNoReplace(tempPath, dstPath); err != nil {
-		return e.restorePreservedLocalEntry(relPath, recoveryRel, fmt.Errorf("install downloaded file %q without replacing a concurrent local write: %w", relPath, err))
+	if err := movePathNoReplace(tempPath, targetPath); err != nil {
+		return restorePreservedLocalEntry(preserved, relPath, fmt.Errorf("install downloaded file %q without replacing a concurrent local write: %w", relPath, err))
 	}
-	recoveryPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(recoveryRel))
-	if err := os.Remove(recoveryPath); err != nil {
-		return fmt.Errorf("download installed at %q but could not remove preserved prior file %q: %w", relPath, recoveryRel, err)
+	if err := os.Remove(preserved.recoveryPath); err != nil {
+		return fmt.Errorf("download installed at %q but could not remove preserved prior file %q: %w", relPath, preserved.recoveryPath, err)
 	}
 	return nil
+}
+
+// installDownloadedTemp retains the existing test/helper surface for lexical
+// temporary paths while routing the actual commit through physical targets.
+func (e *RootExecutor) installDownloadedTemp(ctx context.Context, relPath, tempRelPath string, expectedLocal domain.LocalFingerprint) error {
+	tempPath, err := e.resolveLocalMutationPath(tempRelPath, true)
+	if err != nil {
+		return err
+	}
+	targetPath, err := e.resolveLocalMutationPath(relPath, expectedLocal.Present)
+	if err != nil {
+		return err
+	}
+	recoveryPath, err := newPhysicalTempPath(targetPath)
+	if err != nil {
+		return err
+	}
+	return e.installDownloadedPhysicalTemp(ctx, relPath, targetPath, tempPath, recoveryPath, expectedLocal)
+}
+
+func (e *RootExecutor) commitDownloadedPhysicalTemp(ctx context.Context, op domain.Operation, tempPath string) (domain.LocalFingerprint, error) {
+	currentLocal, err := e.ObserveLocalEntry(ctx, op.SrcPath)
+	if err != nil {
+		return domain.LocalFingerprint{}, err
+	}
+	if !domain.LocalEquivalent(currentLocal, op.ExpectedLocal) {
+		return domain.LocalFingerprint{}, fmt.Errorf("local download precondition failed for %q", op.SrcPath)
+	}
+	currentTarget, err := e.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal)
+	if err != nil {
+		return domain.LocalFingerprint{}, err
+	}
+	if !samePhysicalDestination(op.LocalTargetPath, currentTarget, op.ExpectedLocal.Present) {
+		return domain.LocalFingerprint{}, fmt.Errorf("local symlink target changed during download for %q", op.SrcPath)
+	}
+	currentRemote, err := e.ObserveRemoteEntry(ctx, op.SrcPath)
+	if err != nil {
+		return domain.LocalFingerprint{}, err
+	}
+	if !remoteMatchesExpectation(currentRemote, op.ExpectedRemote, domain.KindFile) {
+		return domain.LocalFingerprint{}, fmt.Errorf("remote download precondition failed for %q", op.SrcPath)
+	}
+	temp, err := observePhysicalLocalEntry(ctx, tempPath)
+	if err != nil {
+		return domain.LocalFingerprint{}, err
+	}
+	if !temp.Present || temp.Kind != domain.KindFile {
+		return domain.LocalFingerprint{}, fmt.Errorf("download temp %q is not a regular file", tempPath)
+	}
+	recoveryPath := operationPhysicalTempPath(op.LocalTargetPath, op.ID, "recovery")
+	if err := e.installDownloadedPhysicalTemp(ctx, op.SrcPath, op.LocalTargetPath, tempPath, recoveryPath, op.ExpectedLocal); err != nil {
+		return domain.LocalFingerprint{}, fmt.Errorf("replace local file %q: %w", op.SrcPath, err)
+	}
+	return temp, nil
+}
+
+func (e *RootExecutor) resolveLocalMutationPath(relPath string, present bool) (string, error) {
+	if err := domain.ValidateRelPath(relPath); err != nil {
+		return "", err
+	}
+	lexical := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
+	if e.root.EffectiveSymlinkMode() != domain.SymlinkFollow {
+		return lexical, nil
+	}
+	resolved, resolvedPresent, err := resolveFollowedLocalPath(lexical, !present)
+	if err != nil {
+		return "", fmt.Errorf("resolve followed local entry %q: %w", relPath, err)
+	}
+	if present && !resolvedPresent {
+		return "", fmt.Errorf("followed local entry %q disappeared", relPath)
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func (e *RootExecutor) ResolveLocalMutationTarget(ctx context.Context, relPath string, expected domain.LocalFingerprint) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	current, err := e.ObserveLocalEntry(ctx, relPath)
+	if err != nil {
+		return "", err
+	}
+	if !domain.LocalEquivalent(current, expected) {
+		return "", fmt.Errorf("local mutation target precondition failed for %q", relPath)
+	}
+	return e.resolveLocalMutationPath(relPath, expected.Present)
+}
+
+func samePhysicalDestination(a, b string, present bool) bool {
+	if present {
+		ai, aErr := os.Stat(a)
+		bi, bErr := os.Stat(b)
+		return aErr == nil && bErr == nil && os.SameFile(ai, bi)
+	}
+	if filepath.Base(a) != filepath.Base(b) {
+		return false
+	}
+	ai, aErr := os.Stat(filepath.Dir(a))
+	bi, bErr := os.Stat(filepath.Dir(b))
+	return aErr == nil && bErr == nil && os.SameFile(ai, bi)
+}
+
+func observePhysicalLocalEntry(ctx context.Context, fullPath string) (domain.LocalFingerprint, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.LocalFingerprint{}, err
+	}
+	info, err := os.Lstat(fullPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return domain.LocalFingerprint{}, nil
+	}
+	if err != nil {
+		return domain.LocalFingerprint{}, fmt.Errorf("stat physical local entry %q: %w", fullPath, err)
+	}
+	if info.IsDir() {
+		return domain.LocalFingerprint{Present: true, Kind: domain.KindDir}, nil
+	}
+	if !info.Mode().IsRegular() {
+		return domain.LocalFingerprint{}, fmt.Errorf("unsupported physical local file type %q (%s)", fullPath, info.Mode().Type())
+	}
+	return localFileFingerprint(info), nil
+}
+
+func newPhysicalTempPath(targetPath string) (string, error) {
+	name, err := newTempName()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(targetPath), name), nil
+}
+
+func operationPhysicalTempPath(targetPath string, operationID int64, role string) string {
+	return filepath.Join(filepath.Dir(targetPath), fmt.Sprintf("%sop-%d-%s", tempNamePrefix, operationID, role))
+}
+
+// LocalRecoveryArtifact reports the deterministic preserved-target slot for a
+// journaled local mutation. Recovery code uses this to fail closed rather than
+// forgetting data moved outside the lexical sync root by a followed symlink.
+func (e *RootExecutor) LocalRecoveryArtifact(ctx context.Context, op domain.Operation) (string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	if op.LocalTargetPath == "" || op.ID <= 0 {
+		return "", false, nil
+	}
+	recoveryPath := operationPhysicalTempPath(op.LocalTargetPath, op.ID, "recovery")
+	_, err := os.Lstat(recoveryPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return recoveryPath, false, nil
+	}
+	if err != nil {
+		return recoveryPath, false, fmt.Errorf("stat local recovery artifact %q: %w", recoveryPath, err)
+	}
+	return recoveryPath, true, nil
 }
 
 // CommitDownloadedTemp performs the local half of conditional download commit.
@@ -361,15 +547,22 @@ func (e *RootExecutor) CompareFileContent(ctx context.Context, relPath string, e
 	return equal, nil
 }
 
-func newTempRelPath(relPath string) (string, error) {
-	if err := domain.ValidateRelPath(relPath); err != nil {
-		return "", err
-	}
+func newTempName() (string, error) {
 	var random [12]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		return "", fmt.Errorf("generate temporary file name: %w", err)
 	}
-	name := tempNamePrefix + hex.EncodeToString(random[:])
+	return tempNamePrefix + hex.EncodeToString(random[:]), nil
+}
+
+func newTempRelPath(relPath string) (string, error) {
+	if err := domain.ValidateRelPath(relPath); err != nil {
+		return "", err
+	}
+	name, err := newTempName()
+	if err != nil {
+		return "", err
+	}
 	dir := path.Dir(relPath)
 	if dir == "." {
 		return name, nil

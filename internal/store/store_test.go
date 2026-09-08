@@ -196,6 +196,44 @@ func TestOperationRoundTripAndPhaseTransitions(t *testing.T) {
 	}
 }
 
+func TestOperationLocalTargetIsPinnedBeforeRunning(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	root := createTestRoot(t, s)
+	target := filepath.Join(t.TempDir(), "physical-target.txt")
+
+	created, err := s.CreateOperation(ctx, domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationEnsureLocal,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "linked.txt",
+		ExpectedLocal:  domain.LocalFingerprint{},
+		ExpectedRemote: domain.RemoteExpectation{ID: "doc", Rev: "rev"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetOperationLocalTarget(ctx, created.ID, target); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.GetOperation(ctx, created.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetOperation() = %+v ok=%v err=%v", got, ok, err)
+	}
+	if got.LocalTargetPath != target {
+		t.Fatalf("local target = %q, want %q", got.LocalTargetPath, target)
+	}
+	if err := s.SetOperationLocalTarget(ctx, created.ID, target+"-other"); err == nil {
+		t.Fatal("operation local target was repinned")
+	}
+	if err := s.SetOperationPhase(ctx, created.ID, domain.OperationRunning, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetOperationLocalTarget(ctx, created.ID, target); err == nil {
+		t.Fatal("running operation accepted a local target update")
+	}
+}
+
 func TestDeleteOperationOnlyDeletesPlannedIntent(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
@@ -434,7 +472,7 @@ func assertBaselineEqual(t *testing.T, got, want domain.Baseline) {
 	}
 }
 
-func TestMigrationV1ToV2KeepsExistingRootsUninitialized(t *testing.T) {
+func TestMigrationV1ToCurrentKeepsExistingRootsUninitializedAndDefaultsSymlinkFollow(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "state-v1.sqlite3")
 	db, err := sql.Open("sqlite", dbPath)
@@ -472,11 +510,14 @@ VALUES('old-root', '/tmp/old-root', 'pkudisk', 'Personal/Old', 1, 60, 1)`); err 
 	if root.Initialized {
 		t.Fatal("pre-v2 root was incorrectly treated as fully initialized")
 	}
+	if root.EffectiveSymlinkMode() != domain.SymlinkFollow {
+		t.Fatalf("migrated symlink mode = %q, want follow", root.EffectiveSymlinkMode())
+	}
 	var version int
 	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 {
-		t.Fatalf("schema version after migration = %d, want 2", version)
+	if version != schemaVersion {
+		t.Fatalf("schema version after migration = %d, want %d", version, schemaVersion)
 	}
 }

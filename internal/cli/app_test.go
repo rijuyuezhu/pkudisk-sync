@@ -464,6 +464,43 @@ func TestRootAddRejectsSubsecondPoll(t *testing.T) {
 	}
 }
 
+func TestRootSymlinkPolicyCanBeConfiguredWhilePaused(t *testing.T) {
+	ctx := context.Background()
+	paths := cliTestPaths(t)
+	var stdout bytes.Buffer
+	app := New(paths, &stdout, &bytes.Buffer{})
+	app.installRcloneConfig = func(string) error { return nil }
+	app.validateRemote = func(string) error { return nil }
+	app.newUUID = func() (string, error) { return "symlink-policy-root", nil }
+	localRoot := t.TempDir()
+
+	if err := app.Run(ctx, []string{"root", "add", "--local", localRoot, "--remote", "pkudisk:Personal/Symlink", "--symlinks", "reject"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Run(ctx, []string{"root", "pause", "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Run(ctx, []string{"root", "config", "1", "--symlinks", "ignore"}); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := store.Open(ctx, paths.StateDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	root, ok, err := state.GetSyncRoot(ctx, 1)
+	if err != nil || !ok {
+		t.Fatalf("GetSyncRoot() = %+v ok=%v err=%v", root, ok, err)
+	}
+	if root.Enabled || root.EffectiveSymlinkMode() != domain.SymlinkIgnore {
+		t.Fatalf("configured root = %+v", root)
+	}
+	if !strings.Contains(stdout.String(), "configured root 1 symlinks=ignore") {
+		t.Fatalf("root config output = %q", stdout.String())
+	}
+}
+
 func TestPathsCommand(t *testing.T) {
 	paths := cliTestPaths(t)
 	var stdout bytes.Buffer

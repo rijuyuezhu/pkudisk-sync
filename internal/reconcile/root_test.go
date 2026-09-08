@@ -224,6 +224,36 @@ func TestPlanFullSnapshotInitialAllowsPartialBaselinesWithoutDeleteInference(t *
 	}
 }
 
+func TestPlanFullSnapshotExcludedPrefixHasNoDeleteOrDownloadAuthority(t *testing.T) {
+	dirLocal := domain.LocalFingerprint{Present: true, Kind: domain.KindDir}
+	dirRemote := domain.RemoteFingerprint{Present: true, Kind: domain.KindDir, ID: "dir-linked"}
+	baselines := []domain.Baseline{
+		rootBaseline("linked", dirLocal, dirRemote),
+		rootBaseline("linked/file.txt", lf(4, 40), rf("file-linked", "r1", 4)),
+		rootBaseline("ordinary.txt", lf(5, 50), rf("ordinary", "r1", 5)),
+	}
+	snapshot := completeSnapshot(
+		map[string]domain.LocalFingerprint{"ordinary.txt": lf(5, 50)},
+		map[string]domain.RemoteFingerprint{
+			"linked":          dirRemote,
+			"linked/file.txt": rf("file-linked", "r1", 4),
+			"ordinary.txt":    rf("ordinary", "r1", 5),
+		},
+	)
+	snapshot.Excluded = []string{"linked"}
+
+	plan, err := PlanFullSnapshot(1, false, baselines, snapshot, DeletePolicy{MaxCount: 1, MaxFraction: 0.01})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Blocked || plan.ProposedDeletes != 0 {
+		t.Fatalf("excluded namespace influenced delete gate: %+v", plan)
+	}
+	if len(plan.Decisions) != 1 || plan.Decisions[0].RelPath != "ordinary.txt" || plan.Decisions[0].Kind != domain.DecisionNoop {
+		t.Fatalf("excluded namespace produced decisions: %+v", plan.Decisions)
+	}
+}
+
 func completeSnapshot(local map[string]domain.LocalFingerprint, remote map[string]domain.RemoteFingerprint) Snapshot {
 	return Snapshot{
 		Local:          local,

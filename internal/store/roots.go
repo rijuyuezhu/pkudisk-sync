@@ -79,9 +79,9 @@ func (r *SyncRootCreateReservation) Commit(ctx context.Context) (domain.SyncRoot
 		return domain.SyncRoot{}, fmt.Errorf("sync root create reservation is not active")
 	}
 	result, err := r.conn.ExecContext(ctx, `
-INSERT INTO sync_roots(uuid, local_root, remote_name, remote_root, enabled, initialized, poll_interval_seconds, created_at_ns)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.root.UUID, r.root.LocalRoot, r.root.RemoteName, r.root.RemoteRoot, boolInt(r.root.Enabled), boolInt(r.root.Initialized), r.root.PollIntervalSeconds, r.root.CreatedAt.UnixNano())
+INSERT INTO sync_roots(uuid, local_root, remote_name, remote_root, enabled, initialized, symlink_mode, poll_interval_seconds, created_at_ns)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.root.UUID, r.root.LocalRoot, r.root.RemoteName, r.root.RemoteRoot, boolInt(r.root.Enabled), boolInt(r.root.Initialized), r.root.EffectiveSymlinkMode(), r.root.PollIntervalSeconds, r.root.CreatedAt.UnixNano())
 	if err != nil {
 		return domain.SyncRoot{}, fmt.Errorf("insert sync root: %w", err)
 	}
@@ -147,7 +147,7 @@ func (s *Store) GetSyncRoot(ctx context.Context, id int64) (domain.SyncRoot, boo
 		return domain.SyncRoot{}, false, fmt.Errorf("sync root ID must be positive")
 	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, uuid, local_root, remote_name, remote_root, enabled, initialized, poll_interval_seconds, created_at_ns
+SELECT id, uuid, local_root, remote_name, remote_root, enabled, initialized, symlink_mode, poll_interval_seconds, created_at_ns
 FROM sync_roots WHERE id = ?`, id)
 	root, err := scanSyncRoot(row)
 	if err == sql.ErrNoRows {
@@ -169,7 +169,7 @@ type rowsQuerier interface {
 
 func listSyncRoots(ctx context.Context, q rowsQuerier) ([]domain.SyncRoot, error) {
 	rows, err := q.QueryContext(ctx, `
-SELECT id, uuid, local_root, remote_name, remote_root, enabled, initialized, poll_interval_seconds, created_at_ns
+SELECT id, uuid, local_root, remote_name, remote_root, enabled, initialized, symlink_mode, poll_interval_seconds, created_at_ns
 FROM sync_roots ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list sync roots: %w", err)
@@ -208,6 +208,40 @@ func (s *Store) SetSyncRootEnabled(ctx context.Context, id int64, enabled bool) 
 		return fmt.Errorf("sync root %d not found", id)
 	}
 	return nil
+}
+
+// SetSyncRootSymlinkMode changes local symlink policy only while a root is
+// paused and has no pending operation created under the previous policy.
+func (s *Store) SetSyncRootSymlinkMode(ctx context.Context, id int64, mode domain.SymlinkMode) error {
+	if id <= 0 {
+		return fmt.Errorf("sync root ID must be positive")
+	}
+	parsed, err := domain.ParseSymlinkMode(string(mode))
+	if err != nil {
+		return err
+	}
+	result, err := s.db.ExecContext(ctx, `
+UPDATE sync_roots
+SET symlink_mode = ?
+WHERE id = ?
+  AND enabled = 0
+  AND NOT EXISTS (SELECT 1 FROM operations WHERE operations.sync_root_id = sync_roots.id)`, parsed, id)
+	if err != nil {
+		return fmt.Errorf("update sync root symlink mode: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read updated sync root count: %w", err)
+	}
+	if rows == 1 {
+		return nil
+	}
+	if _, ok, getErr := s.GetSyncRoot(ctx, id); getErr != nil {
+		return getErr
+	} else if !ok {
+		return fmt.Errorf("sync root %d not found", id)
+	}
+	return fmt.Errorf("sync root %d must be paused and have no pending operations before changing symlink mode", id)
 }
 
 // DeleteSyncRoot removes one paused, idle root and lets SQLite cascade its
@@ -315,7 +349,7 @@ func scanSyncRoot(row rowScanner) (domain.SyncRoot, error) {
 	var root domain.SyncRoot
 	var enabled, initialized int
 	var createdNS int64
-	if err := row.Scan(&root.ID, &root.UUID, &root.LocalRoot, &root.RemoteName, &root.RemoteRoot, &enabled, &initialized, &root.PollIntervalSeconds, &createdNS); err != nil {
+	if err := row.Scan(&root.ID, &root.UUID, &root.LocalRoot, &root.RemoteName, &root.RemoteRoot, &enabled, &initialized, &root.SymlinkMode, &root.PollIntervalSeconds, &createdNS); err != nil {
 		return domain.SyncRoot{}, err
 	}
 	root.Enabled = enabled != 0

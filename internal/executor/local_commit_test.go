@@ -103,3 +103,195 @@ func TestInstallDownloadedTempPresentReplacesValidatedTarget(t *testing.T) {
 		t.Fatalf("successful install left internal recovery files: %v", matches)
 	}
 }
+
+func TestInstallDownloadedPhysicalTempPreservesFollowedFileSymlink(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	target := filepath.Join(outside, "target.txt")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkFollow}}
+	expected, err := exec.ObserveLocalEntry(context.Background(), "link.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	temp := filepath.Join(outside, "staged")
+	if err := os.WriteFile(temp, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recovery := filepath.Join(outside, "recovery")
+	if err := exec.installDownloadedPhysicalTemp(context.Background(), "link.txt", target, temp, recovery, expected); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("remote update replaced the symlink object")
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("followed target content = %q, want new", got)
+	}
+}
+
+func TestDeleteLocalPreservesSymlinkAndDeletesPinnedTarget(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	target := filepath.Join(outside, "target.txt")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkFollow}}
+	expected, err := exec.ObserveLocalEntry(context.Background(), "link.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := domain.Operation{ID: 41, Kind: domain.OperationDeleteLocal, EntryKind: domain.KindFile, SrcPath: "link.txt", LocalTargetPath: target, ExpectedLocal: expected}
+	if err := exec.DeleteLocal(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("remote delete removed the symlink object")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("followed target still exists: %v", err)
+	}
+	if _, err := os.Lstat(operationPhysicalTempPath(target, op.ID, "recovery")); !os.IsNotExist(err) {
+		t.Fatalf("successful delete left recovery artifact: %v", err)
+	}
+}
+
+func TestDanglingFollowedSymlinkCanRecreateTargetWithoutReplacingLink(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	target := filepath.Join(outside, "missing.txt")
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkFollow}}
+	resolved, err := exec.ResolveLocalMutationTarget(context.Background(), "link.txt", domain.LocalFingerprint{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != target {
+		t.Fatalf("dangling symlink target = %q, want %q", resolved, target)
+	}
+	temp := filepath.Join(outside, "staged")
+	if err := os.WriteFile(temp, []byte("restored"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.installDownloadedPhysicalTemp(context.Background(), "link.txt", resolved, temp, filepath.Join(outside, "unused-recovery"), domain.LocalFingerprint{}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("recreate replaced dangling symlink")
+	}
+	got, err := os.ReadFile(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "restored" {
+		t.Fatalf("recreated target content = %q", got)
+	}
+}
+
+func TestDeleteLocalRejectsSymlinkRetargetEvenWithEquivalentContent(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	targetA := filepath.Join(outside, "a.txt")
+	targetB := filepath.Join(outside, "b.txt")
+	for _, name := range []string{targetA, targetB} {
+		if err := os.WriteFile(name, []byte("same"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Match mtimes so the normal local fingerprint cannot distinguish targets.
+	infoA, err := os.Stat(targetA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(targetB, infoA.ModTime(), infoA.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(targetA, link); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkFollow}}
+	expected, err := exec.ObserveLocalEntry(context.Background(), "link.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(targetB, link); err != nil {
+		t.Fatal(err)
+	}
+	// Filesystems may round mtimes differently; make the expected fingerprint
+	// exactly match the newly targeted file to isolate physical-identity fencing.
+	expectedB, err := exec.ObserveLocalEntry(context.Background(), "link.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected = expectedB
+	op := domain.Operation{ID: 42, Kind: domain.OperationDeleteLocal, EntryKind: domain.KindFile, SrcPath: "link.txt", LocalTargetPath: targetA, ExpectedLocal: expected}
+	if err := exec.DeleteLocal(context.Background(), op); err == nil {
+		t.Fatal("delete accepted a retargeted symlink")
+	}
+	for _, name := range []string{targetA, targetB} {
+		if _, err := os.Stat(name); err != nil {
+			t.Fatalf("retarget race mutated %q: %v", name, err)
+		}
+	}
+}
+
+func TestLocalRecoveryArtifactFindsPinnedOutsideRootSlot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	target := filepath.Join(outside, "target.txt")
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkFollow}}
+	op := domain.Operation{
+		ID:              77,
+		Kind:            domain.OperationDeleteLocal,
+		EntryKind:       domain.KindFile,
+		SrcPath:         "link.txt",
+		LocalTargetPath: target,
+		ExpectedLocal:   domain.LocalFingerprint{Present: true, Kind: domain.KindFile, Size: 3, MtimeNS: 1},
+	}
+	artifact := operationPhysicalTempPath(target, op.ID, "recovery")
+	if err := os.WriteFile(artifact, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, present, err := exec.LocalRecoveryArtifact(context.Background(), op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !present || got != artifact {
+		t.Fatalf("recovery artifact = %q present=%v, want %q true", got, present, artifact)
+	}
+}

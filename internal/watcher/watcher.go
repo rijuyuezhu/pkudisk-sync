@@ -35,10 +35,11 @@ type Watcher struct {
 	wg        sync.WaitGroup
 }
 
-// New recursively watches all directories currently below root. The event
-// loop starts before the recursive walk, and every successful setup must still
-// be followed by a complete scan; this closes the setup race without treating
-// watcher delivery as durable truth.
+// New recursively watches real directories currently below root. It does not
+// follow symlink targets, including targets outside the root; those are observed
+// by the periodic authoritative repair scan. The event loop starts before the
+// recursive walk, and every successful setup must still be followed by a
+// complete scan, closing setup races without treating watcher delivery as truth.
 func New(root string) (*Watcher, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, fmt.Errorf("watch root must not be empty")

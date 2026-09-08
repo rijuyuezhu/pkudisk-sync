@@ -33,16 +33,17 @@ func (s *Store) CreateOperation(ctx context.Context, operation domain.Operation)
 
 	result, err := s.db.ExecContext(ctx, `
 INSERT INTO operations(
-    sync_root_id, kind, entry_kind, src_path, dst_path,
+    sync_root_id, kind, entry_kind, src_path, dst_path, local_target_path,
     expected_local_present, expected_local_kind, expected_local_size, expected_local_mtime_ns,
     expected_remote_absent, expected_remote_id, expected_remote_rev,
     phase, attempts, last_error, created_at_ns, updated_at_ns
-) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		operation.SyncRootID,
 		string(operation.Kind),
 		string(operation.EntryKind),
 		operation.SrcPath,
 		operation.DstPath,
+		operation.LocalTargetPath,
 		boolInt(operation.ExpectedLocal.Present),
 		string(operation.ExpectedLocal.Kind),
 		operation.ExpectedLocal.Size,
@@ -143,8 +144,29 @@ WHERE id = ?`, string(phase), lastError, increment, s.now().UnixNano(), id)
 	return requireOneRow(result, "operation")
 }
 
+// SetOperationLocalTarget pins the physical local mutation destination while
+// the operation is still planned and before any external side effect starts.
+func (s *Store) SetOperationLocalTarget(ctx context.Context, id int64, target string) error {
+	if id <= 0 {
+		return fmt.Errorf("operation ID must be positive")
+	}
+	if target == "" {
+		return fmt.Errorf("operation local target must not be empty")
+	}
+	result, err := s.db.ExecContext(ctx, `
+UPDATE operations
+SET local_target_path = ?, updated_at_ns = ?
+WHERE id = ? AND phase = ? AND attempts = 0 AND local_target_path = ''`,
+		target, s.now().UnixNano(), id, string(domain.OperationPlanned))
+	if err != nil {
+		return fmt.Errorf("pin operation local target: %w", err)
+	}
+	return requireOneRow(result, "planned operation")
+}
+
 const operationSelect = `
 SELECT id, sync_root_id, kind, entry_kind, src_path, dst_path,
+       local_target_path,
        expected_local_present, expected_local_kind, expected_local_size, expected_local_mtime_ns,
        expected_remote_absent, expected_remote_id, expected_remote_rev,
        phase, attempts, last_error, created_at_ns, updated_at_ns
@@ -162,6 +184,7 @@ func scanOperation(row rowScanner) (domain.Operation, error) {
 		&entryKind,
 		&operation.SrcPath,
 		&operation.DstPath,
+		&operation.LocalTargetPath,
 		&localPresent,
 		&expectedLocalKind,
 		&operation.ExpectedLocal.Size,

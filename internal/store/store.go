@@ -10,7 +10,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // Store is the durable semantic authority for sync roots, committed baselines,
 // external-side-effect intents, and conflicts.
@@ -92,6 +92,23 @@ ADD COLUMN initialized INTEGER NOT NULL DEFAULT 0 CHECK (initialized IN (0, 1))`
 			return fmt.Errorf("migrate schema v1 to v2: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+		version = 2
+	}
+	if version == 2 {
+		if _, err := tx.ExecContext(ctx, `
+ALTER TABLE sync_roots
+ADD COLUMN symlink_mode TEXT NOT NULL DEFAULT 'follow'
+CHECK (symlink_mode IN ('follow', 'reject', 'ignore'))`); err != nil {
+			return fmt.Errorf("migrate sync roots v2 to v3: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+ALTER TABLE operations
+ADD COLUMN local_target_path TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("migrate operations v2 to v3: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 3"); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/rclone/rclone/backend/local"
@@ -41,7 +42,14 @@ func NewRoot(ctx context.Context, root domain.SyncRoot, remoteConfig configmap.M
 		return nil, fmt.Errorf("remote config mapper must not be nil")
 	}
 
-	localFS, err := local.NewFs(ctx, "local", root.LocalRoot, configmap.Simple{})
+	localConfig := configmap.Simple{}
+	if root.EffectiveSymlinkMode() == domain.SymlinkFollow {
+		// Match rclone --copy-links for source reads. Local mutation code still
+		// resolves the physical target explicitly so downloads never replace the
+		// symlink object itself.
+		localConfig["copy_links"] = "true"
+	}
+	localFS, err := local.NewFs(ctx, "local", root.LocalRoot, localConfig)
 	if err != nil {
 		return nil, fmt.Errorf("open local sync root %q: %w", root.LocalRoot, err)
 	}
@@ -140,6 +148,36 @@ func (e *RootExecutor) DownloadToTemp(ctx context.Context, relPath, tempRelPath 
 
 	copyCtx := downloadContext(ctx, expected.ID, expected.Rev)
 	if err := operations.CopyFile(copyCtx, e.local, e.remote, tempRelPath, relPath); err != nil {
+		return fmt.Errorf("download %q: %w", relPath, err)
+	}
+	return nil
+}
+
+// downloadToPhysicalTemp stages one exact remote revision into a caller-owned
+// absolute path. The caller chooses a path in the destination target's physical
+// directory so the later no-replace rename remains same-filesystem even when a
+// followed symlink points outside the configured sync root.
+func (e *RootExecutor) downloadToPhysicalTemp(ctx context.Context, relPath, tempPath string, expected domain.RemoteExpectation) error {
+	if err := domain.ValidateRelPath(relPath); err != nil {
+		return err
+	}
+	if !filepath.IsAbs(tempPath) {
+		return fmt.Errorf("physical temporary path must be absolute")
+	}
+	if err := validateFileRemoteExpectation(expected); err != nil {
+		return err
+	}
+	if expected.Absent {
+		return fmt.Errorf("download requires a present remote expectation")
+	}
+
+	parent := filepath.Dir(tempPath)
+	localFS, err := local.NewFs(ctx, "local-temp", parent, configmap.Simple{})
+	if err != nil {
+		return fmt.Errorf("open local temporary directory %q: %w", parent, err)
+	}
+	copyCtx := downloadContext(ctx, expected.ID, expected.Rev)
+	if err := operations.CopyFile(copyCtx, localFS, e.remote, filepath.Base(tempPath), relPath); err != nil {
 		return fmt.Errorf("download %q: %w", relPath, err)
 	}
 	return nil

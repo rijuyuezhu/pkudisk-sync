@@ -31,9 +31,12 @@ func TestScanLocalIncludesOrdinaryTreeAndExcludesRootMarker(t *testing.T) {
 	}
 
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	got, err := exec.ScanLocal(context.Background())
+	got, excluded, err := exec.ScanLocal(context.Background())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(excluded) != 0 {
+		t.Fatalf("unexpected exclusions: %v", excluded)
 	}
 	if len(got) != 3 {
 		t.Fatalf("ScanLocal() returned %d entries, want 3: %+v", len(got), got)
@@ -59,8 +62,25 @@ func TestScanLocalRejectsStaleInternalTempFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	if _, err := exec.ScanLocal(context.Background()); err == nil {
+	if _, _, err := exec.ScanLocal(context.Background()); err == nil {
 		t.Fatal("stale internal temp file was silently omitted from a complete snapshot")
+	}
+}
+
+func TestScanLocalSkipsJournaledOperationTempFile(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	name := operationPhysicalTempPath(target, 17, "recovery")
+	if err := os.WriteFile(name, []byte("preserved"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	got, excluded, err := exec.ScanLocal(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 || len(excluded) != 0 {
+		t.Fatalf("journaled operation temp leaked into snapshot: got=%+v excluded=%v", got, excluded)
 	}
 }
 
@@ -72,9 +92,139 @@ func TestScanLocalRejectsSymlink(t *testing.T) {
 	if err := os.Symlink("target", filepath.Join(root, "link")); err != nil {
 		t.Fatal(err)
 	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkReject}}
+	if _, _, err := exec.ScanLocal(context.Background()); err == nil {
+		t.Fatal("reject policy accepted a symlink")
+	}
+}
+
+func TestScanLocalDefaultFollowsFileSymlinkOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	target := filepath.Join(outside, "target.txt")
+	if err := os.WriteFile(target, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	if _, err := exec.ScanLocal(context.Background()); err == nil {
-		t.Fatal("symlink was silently omitted from a complete snapshot")
+	got, excluded, err := exec.ScanLocal(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(excluded) != 0 {
+		t.Fatalf("unexpected exclusions: %v", excluded)
+	}
+	if got["link.txt"].Kind != domain.KindFile || got["link.txt"].Size != int64(len("outside")) {
+		t.Fatalf("followed file fingerprint = %+v", got["link.txt"])
+	}
+}
+
+func TestScanLocalDefaultFollowsDirectorySymlinkOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "note.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	got, excluded, err := exec.ScanLocal(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(excluded) != 0 {
+		t.Fatalf("unexpected exclusions: %v", excluded)
+	}
+	if got["linked"].Kind != domain.KindDir || got["linked/note.txt"].Size != 5 {
+		t.Fatalf("followed directory snapshot = %+v", got)
+	}
+}
+
+func TestScanLocalFollowExcludesSelfAndMutualCycles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Symlink("self", filepath.Join(root, "self")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("b", filepath.Join(root, "a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("a", filepath.Join(root, "b")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	got, excluded, err := exec.ScanLocal(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("cycle leaked entries: %+v", got)
+	}
+	want := map[string]bool{"a": true, "b": true, "self": true}
+	for _, rel := range excluded {
+		delete(want, rel)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing cycle exclusions %v; got %v", want, excluded)
+	}
+}
+
+func TestScanLocalFollowExcludesLinkToPhysicalParent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// From root/sub, ../.. resolves to the parent of the sync root. Descending
+	// there would re-enter the sync root and recurse forever through ordinary dirs.
+	if err := os.Symlink(filepath.Join("..", ".."), filepath.Join(root, "sub", "up")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	got, excluded, err := exec.ScanLocal(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["sub"].Kind != domain.KindDir {
+		t.Fatalf("ordinary parent dir missing: %+v", got)
+	}
+	if len(excluded) != 1 || excluded[0] != "sub/up" {
+		t.Fatalf("parent-link exclusions = %v, want [sub/up]", excluded)
+	}
+}
+
+func TestScanLocalFollowTreatsResolvableDanglingFinalSymlinkAsAbsence(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Symlink("missing.txt", filepath.Join(root, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	got, excluded, err := exec.ScanLocal(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 || len(excluded) != 0 {
+		t.Fatalf("dangling final symlink snapshot=%+v excluded=%v", got, excluded)
+	}
+}
+
+func TestScanLocalIgnoreExcludesSymlinkPrefix(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "note.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkIgnore}}
+	got, excluded, err := exec.ScanLocal(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 || len(excluded) != 1 || excluded[0] != "linked" {
+		t.Fatalf("ignore snapshot=%+v excluded=%v", got, excluded)
 	}
 }
 
@@ -84,7 +234,7 @@ func TestScanLocalRejectsMarkerDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	if _, err := exec.ScanLocal(context.Background()); err == nil {
+	if _, _, err := exec.ScanLocal(context.Background()); err == nil {
 		t.Fatal("reserved marker directory accepted")
 	}
 }
@@ -96,7 +246,7 @@ func TestScanLocalRejectsInternalTempDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	if _, err := exec.ScanLocal(context.Background()); err == nil {
+	if _, _, err := exec.ScanLocal(context.Background()); err == nil {
 		t.Fatal("reserved internal temp directory accepted")
 	}
 }
