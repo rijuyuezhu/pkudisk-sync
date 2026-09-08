@@ -118,6 +118,84 @@ func TestRunnerObservesPauseAndResumeWithoutRestart(t *testing.T) {
 	waitFor(t, func() bool { return calls.Load() == 2 }, "second resume did not run")
 }
 
+func TestRunnerPauseCancelsActiveCycleAndResumeWaitsForWorkerExit(t *testing.T) {
+	state := openDaemonTestStore(t)
+	root := daemonTestRoot(t, "pause-active-root", "Personal/PauseActive")
+	root.PollIntervalSeconds = 0
+	stored, err := SetupRoot(context.Background(), state, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	watchers := newFakeWatcherFactory()
+	firstStarted := make(chan struct{})
+	firstCanceled := make(chan struct{})
+	releaseCanceledWorker := make(chan struct{})
+	secondStarted := make(chan struct{})
+	var calls atomic.Int32
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	cycle := func(ctx context.Context, _ int64, _ *store.Store, _ syncer.DataPlane, _ reconcile.DeletePolicy) (syncer.CycleResult, error) {
+		call := calls.Add(1)
+		nowActive := active.Add(1)
+		for {
+			old := maxActive.Load()
+			if nowActive <= old || maxActive.CompareAndSwap(old, nowActive) {
+				break
+			}
+		}
+		defer active.Add(-1)
+		switch call {
+		case 1:
+			close(firstStarted)
+			<-ctx.Done()
+			close(firstCanceled)
+			// Deliberately delay unwinding after cancellation. A correct runner
+			// must not create the resumed worker until this goroutine is gone.
+			<-releaseCanceledWorker
+			return syncer.CycleResult{}, ctx.Err()
+		case 2:
+			close(secondStarted)
+		}
+		return syncer.CycleResult{}, nil
+	}
+	runner := testRunner(t, state, watchers.new, cycle)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runRunner(t, ctx, runner)
+	defer func() {
+		cancel()
+		select {
+		case <-releaseCanceledWorker:
+		default:
+			close(releaseCanceledWorker)
+		}
+		waitRunner(t, done)
+	}()
+
+	waitChannel(t, firstStarted, "initial cycle did not start")
+	if err := state.SetSyncRootEnabled(context.Background(), stored.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	waitChannel(t, firstCanceled, "pause did not cancel active cycle")
+
+	if err := state.SetSyncRootEnabled(context.Background(), stored.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("resume started another cycle before canceled worker exited: calls=%d", got)
+	}
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("maximum concurrent cycles before worker exit = %d, want 1", got)
+	}
+
+	close(releaseCanceledWorker)
+	waitChannel(t, secondStarted, "resume did not start a fresh cycle after canceled worker exited")
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("maximum concurrent cycles = %d, want 1", got)
+	}
+}
+
 func TestRunnerHealthCheckNoticesQueuedDurableOperation(t *testing.T) {
 	state := openDaemonTestStore(t)
 	root := daemonTestRoot(t, "queued-op-root", "Personal/Queued")

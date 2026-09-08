@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -99,18 +100,23 @@ func newRunnerWithDeps(state *store.Store, deletePolicy reconcile.DeletePolicy, 
 	return &Runner{state: state, deletePolicy: deletePolicy, deps: deps}, nil
 }
 
-// Run continuously reconciles every configured sync root. Root additions are
-// discovered without daemon restart. One worker goroutine owns each root, so a
-// root can never have overlapping reconciliation cycles.
+// Run continuously reconciles every enabled sync root. Root additions and
+// pause/resume changes are discovered without daemon restart. At most one
+// worker goroutine owns a root at a time, including while a canceled worker is
+// still unwinding, so rapid pause/resume can never overlap reconciliation.
 func (r *Runner) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	workers := make(map[int64]context.CancelFunc)
+	type rootWorker struct {
+		cancel context.CancelFunc
+		done   chan struct{}
+	}
+	workers := make(map[int64]rootWorker)
 	var wg sync.WaitGroup
 	stopWorkers := func() {
-		for _, workerCancel := range workers {
-			workerCancel()
+		for _, worker := range workers {
+			worker.cancel()
 		}
 		wg.Wait()
 	}
@@ -119,26 +125,44 @@ func (r *Runner) Run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("list sync roots: %w", err)
 		}
+		// Reap only after a worker has fully exited. Keeping a canceled worker in
+		// the map until done is the fence that prevents a quick resume from
+		// starting a second cycle against the same root.
+		for id, worker := range workers {
+			select {
+			case <-worker.done:
+				delete(workers, id)
+			default:
+			}
+		}
+
 		seen := make(map[int64]struct{}, len(roots))
 		for _, root := range roots {
 			seen[root.ID] = struct{}{}
+			if !root.Enabled {
+				if worker, exists := workers[root.ID]; exists {
+					worker.cancel()
+				}
+				continue
+			}
 			if _, exists := workers[root.ID]; exists {
 				continue
 			}
 			workerCtx, workerCancel := context.WithCancel(ctx)
-			workers[root.ID] = workerCancel
+			done := make(chan struct{})
+			workers[root.ID] = rootWorker{cancel: workerCancel, done: done}
 			wg.Add(1)
 			go func(root domain.SyncRoot) {
 				defer wg.Done()
+				defer close(done)
 				r.runRoot(workerCtx, root)
 			}(root)
 		}
-		for id, workerCancel := range workers {
+		for id, worker := range workers {
 			if _, exists := seen[id]; exists {
 				continue
 			}
-			workerCancel()
-			delete(workers, id)
+			worker.cancel()
 		}
 		return nil
 	}
@@ -240,7 +264,9 @@ func (r *Runner) runRoot(ctx context.Context, initial domain.SyncRoot) {
 				}
 				if data != nil {
 					result, cycleErr := r.deps.cycle(ctx, root.ID, r.state, data, r.deletePolicy)
-					r.report(root.ID, "cycle", result, true, cycleErr)
+					if ctx.Err() == nil || !errors.Is(cycleErr, context.Canceled) {
+						r.report(root.ID, "cycle", result, true, cycleErr)
+					}
 					pending = false
 				}
 			}

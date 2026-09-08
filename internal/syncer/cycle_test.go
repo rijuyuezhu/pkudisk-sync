@@ -2,11 +2,13 @@ package syncer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/executor"
@@ -17,6 +19,61 @@ import (
 
 var _ DataPlane = (*executor.RootExecutor)(nil)
 var _ DataPlane = (*fakeDataPlane)(nil)
+var _ DataPlane = (*cancelUploadDataPlane)(nil)
+
+func TestRunRootCycleCancellationLeavesRecoverableDurableIntent(t *testing.T) {
+	state, root := newCycleRoot(t, true, false)
+	base := &fakeDataPlane{
+		local: map[string]domain.LocalFingerprint{
+			"cancel.txt": localFileFP(4, 40),
+		},
+		remote: make(map[string]domain.RemoteFingerprint),
+	}
+	data := &cancelUploadDataPlane{
+		fakeDataPlane: base,
+		started:       make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{})
+		done <- err
+	}()
+
+	select {
+	case <-data.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("upload did not reach cancellable mutation")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled cycle error = %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("canceled cycle did not return")
+	}
+
+	operations, err := state.ListOperations(context.Background(), root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 1 || (operations[0].Phase != domain.OperationRunning && operations[0].Phase != domain.OperationRecovering) {
+		t.Fatalf("canceled mutation did not leave one recoverable intent: %+v", operations)
+	}
+
+	result, err := RunRootCycle(context.Background(), root.ID, state, base, reconcile.DeletePolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Recovered != 1 || !result.Initialized {
+		t.Fatalf("recovery result = %+v", result)
+	}
+	if operations, err := state.ListOperations(context.Background(), root.ID); err != nil || len(operations) != 0 {
+		t.Fatalf("recovered operation remains = %+v err=%v", operations, err)
+	}
+}
 
 func TestRunRootCycleInitialNestedTreeConvergesAndInitializes(t *testing.T) {
 	ctx := context.Background()
@@ -583,6 +640,17 @@ type fakeDataPlane struct {
 	revCounter           int
 	uploadPostOverride   map[string]domain.RemoteFingerprint
 	downloadPostOverride map[string]domain.LocalFingerprint
+}
+
+type cancelUploadDataPlane struct {
+	*fakeDataPlane
+	started chan struct{}
+}
+
+func (f *cancelUploadDataPlane) Upload(ctx context.Context, _ string, _ domain.LocalFingerprint, _ domain.RemoteExpectation) (domain.RemoteFingerprint, error) {
+	close(f.started)
+	<-ctx.Done()
+	return domain.RemoteFingerprint{}, ctx.Err()
 }
 
 func (f *fakeDataPlane) ScanLocal(context.Context) (map[string]domain.LocalFingerprint, error) {
