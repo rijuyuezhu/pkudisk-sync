@@ -232,15 +232,25 @@ func (e *RootExecutor) ownedOperationArtifacts(operations []domain.Operation) (m
 
 func rejectPeerRootPath(physicalPath string, peerLocalRoots []string) error {
 	for _, peer := range peerLocalRoots {
-		owned, err := physicalPathContains(peer, physicalPath)
+		peerOwnsTarget, err := physicalPathContains(peer, physicalPath)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
 			return fmt.Errorf("compare physical path %q with configured sync root %q: %w", physicalPath, peer, err)
 		}
-		if owned {
+		if peerOwnsTarget {
 			return fmt.Errorf("physical path %q is owned by configured sync root %q", physicalPath, peer)
+		}
+		targetOwnsPeer, err := physicalPathContains(physicalPath, peer)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("compare followed physical path %q with configured sync root %q: %w", physicalPath, peer, err)
+		}
+		if targetOwnsPeer {
+			return fmt.Errorf("followed physical directory %q contains configured sync root %q", physicalPath, peer)
 		}
 	}
 	return nil

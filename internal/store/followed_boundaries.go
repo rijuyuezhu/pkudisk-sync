@@ -44,6 +44,38 @@ ORDER BY rel_path`, rootID)
 	return out, nil
 }
 
+func checkSyncRootAgainstFollowedClaims(ctx context.Context, q rowsQuerier, candidate domain.SyncRoot) error {
+	rows, err := q.QueryContext(ctx, `
+SELECT sync_root_id, rel_path, kind, physical_target_path
+FROM followed_physical_claims
+ORDER BY sync_root_id, rel_path`)
+	if err != nil {
+		return fmt.Errorf("list followed physical claims for sync root ownership: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var ownerRootID int64
+		var relPath, kind, targetPath string
+		if err := rows.Scan(&ownerRootID, &relPath, &kind, &targetPath); err != nil {
+			return fmt.Errorf("scan followed physical claim for sync root ownership: %w", err)
+		}
+		ownerKind := domain.EntryKind(kind)
+		if ownerKind != domain.KindFile && ownerKind != domain.KindDir {
+			return fmt.Errorf("followed physical claim for sync root %d path %q has invalid kind %q", ownerRootID, relPath, kind)
+		}
+		if targetPath == "" {
+			return fmt.Errorf("cannot prove local ownership for new sync root %q while sync root %d path %q has a legacy followed directory with unknown physical target; run or re-pair that root first", candidate.LocalRoot, ownerRootID, relPath)
+		}
+		if physicalOwnershipPathsOverlap(candidate.LocalRoot, domain.KindDir, targetPath, ownerKind) {
+			return fmt.Errorf("local sync root %q overlaps followed %s target %q owned by sync root %d path %q", candidate.LocalRoot, ownerKind, targetPath, ownerRootID, relPath)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate followed physical claims for sync root ownership: %w", err)
+	}
+	return nil
+}
+
 // ReserveFollowedPhysicalClaims atomically establishes global ownership for
 // every currently observed followed symlink target before the caller may plan
 // or execute external mutations. New claims are allowed only while the root is
@@ -66,6 +98,16 @@ func (s *Store) ReserveFollowedPhysicalClaims(ctx context.Context, rootID int64,
 		return false, "", fmt.Errorf("begin followed physical claim reservation: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Acquire SQLite's single-writer authority before any ownership read. This
+	// makes hierarchical read-check-write reservation serial across Store
+	// instances/processes rather than relying on an in-process mutex.
+	result, err := tx.ExecContext(ctx, `UPDATE sync_roots SET initialized = initialized WHERE id = ?`, rootID)
+	if err != nil {
+		return false, "", fmt.Errorf("reserve followed physical claim writer authority: %w", err)
+	}
+	if err := requireOneRow(result, "sync root"); err != nil {
+		return false, "", err
+	}
 
 	var initialized int
 	if err := tx.QueryRowContext(ctx, `SELECT initialized FROM sync_roots WHERE id = ?`, rootID).Scan(&initialized); err != nil {
@@ -74,6 +116,35 @@ func (s *Store) ReserveFollowedPhysicalClaims(ctx context.Context, rootID int64,
 	existing, err := listFollowedPhysicalClaimsTx(ctx, tx, rootID)
 	if err != nil {
 		return false, "", err
+	}
+
+	// v4->v5 migration knew directory identities but not canonical target
+	// paths. Recover all such paths together from this complete scan before
+	// subtree arbitration; an unavailable legacy boundary keeps authority
+	// ambiguous and therefore blocks rather than allowing a partial backfill.
+	for relPath, prior := range existing {
+		if prior.TargetPath != "" {
+			continue
+		}
+		current, exists := observed[relPath]
+		if !exists {
+			return false, fmt.Sprintf("legacy followed directory %q has unknown physical target and is unavailable; re-pair or restore it before ownership can be proven", relPath), nil
+		}
+		if prior.Kind != current.Kind || prior.Identity != current.Identity {
+			return false, fmt.Sprintf("legacy followed directory %q changed before its physical target path could be recovered; re-pair the root", relPath), nil
+		}
+		if conflict, err := followedOwnershipConflictTx(ctx, tx, rootID, relPath, current, true); err != nil {
+			return false, "", err
+		} else if conflict != "" {
+			return false, conflict, nil
+		}
+		if _, err := tx.ExecContext(ctx, `
+UPDATE followed_physical_claims
+SET physical_target_path = ?
+WHERE sync_root_id = ? AND rel_path = ? AND physical_target_path = ''`, current.TargetPath, rootID, relPath); err != nil {
+			return false, "", fmt.Errorf("backfill followed physical target path %q: %w", relPath, err)
+		}
+		existing[relPath] = current
 	}
 
 	for _, relPath := range paths {
@@ -93,35 +164,10 @@ func (s *Store) ReserveFollowedPhysicalClaims(ctx context.Context, rootID int64,
 			return false, fmt.Sprintf("followed %s %q has no durable physical ownership claim; re-pair the root before accepting this boundary", claim.Kind, relPath), nil
 		}
 
-		var ownerRootID int64
-		var ownerPath, ownerKind string
-		err := tx.QueryRowContext(ctx, `
-SELECT sync_root_id, rel_path, kind
-FROM followed_physical_claims
-WHERE physical_identity = ?
-  AND NOT (sync_root_id = ? AND rel_path = ?)
-ORDER BY sync_root_id, rel_path
-LIMIT 1`, claim.Identity, rootID, relPath).Scan(&ownerRootID, &ownerPath, &ownerKind)
-		switch {
-		case err == nil:
-			return false, fmt.Sprintf("followed %s %q resolves to physical identity %q already owned by sync root %d path %q (%s)", claim.Kind, relPath, claim.Identity, ownerRootID, ownerPath, ownerKind), nil
-		case err != sql.ErrNoRows:
-			return false, "", fmt.Errorf("check global followed physical ownership: %w", err)
-		}
-
-		err = tx.QueryRowContext(ctx, `
-SELECT sync_root_id, rel_path, kind
-FROM followed_physical_claims
-WHERE physical_target_path = ?
-  AND physical_target_path <> ''
-  AND NOT (sync_root_id = ? AND rel_path = ?)
-ORDER BY sync_root_id, rel_path
-LIMIT 1`, claim.TargetPath, rootID, relPath).Scan(&ownerRootID, &ownerPath, &ownerKind)
-		switch {
-		case err == nil:
-			return false, fmt.Sprintf("followed %s %q resolves to physical target %q already owned by sync root %d path %q (%s)", claim.Kind, relPath, claim.TargetPath, ownerRootID, ownerPath, ownerKind), nil
-		case err != sql.ErrNoRows:
-			return false, "", fmt.Errorf("check global followed target ownership: %w", err)
+		if conflict, err := followedOwnershipConflictTx(ctx, tx, rootID, relPath, claim, false); err != nil {
+			return false, "", err
+		} else if conflict != "" {
+			return false, conflict, nil
 		}
 
 		if !exists {
@@ -175,6 +221,15 @@ func (s *Store) AuthorizeAndPinLocalMutation(ctx context.Context, operationID in
 		return false, "", fmt.Errorf("begin local mutation authority transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Mutation-time claim refresh must serialize with root creation and scan-time
+	// claim reservation before it reads global ownership.
+	result, err := tx.ExecContext(ctx, `UPDATE operations SET updated_at_ns = updated_at_ns WHERE id = ?`, operationID)
+	if err != nil {
+		return false, "", fmt.Errorf("reserve local mutation writer authority: %w", err)
+	}
+	if err := requireOneRow(result, "operation"); err != nil {
+		return false, "", err
+	}
 
 	var rootID int64
 	var operationKind, srcPath, phase, pinned string
@@ -228,7 +283,7 @@ WHERE id = ?`, operationID).Scan(&rootID, &operationKind, &srcPath, &phase, &att
 		if current.Kind == domain.KindDir && prior.Identity != current.Identity {
 			return false, fmt.Sprintf("followed directory %q changed physical identity from %q to %q before local mutation pin", relPath, prior.Identity, current.Identity), nil
 		}
-		if conflict, err := followedOwnershipConflictTx(ctx, tx, rootID, relPath, current); err != nil {
+		if conflict, err := followedOwnershipConflictTx(ctx, tx, rootID, relPath, current, false); err != nil {
 			return false, "", err
 		} else if conflict != "" {
 			return false, conflict, nil
@@ -260,7 +315,7 @@ WHERE sync_root_id = ? AND rel_path = ?`, current.Identity, current.TargetPath, 
 		}
 	}
 
-	result, err := tx.ExecContext(ctx, `
+	result, err = tx.ExecContext(ctx, `
 UPDATE operations
 SET local_target_path = ?, local_target_identity = ?, updated_at_ns = ?
 WHERE id = ? AND phase = ? AND attempts = 0 AND local_target_path = '' AND local_target_identity = ''`,
@@ -285,6 +340,7 @@ func followedClaimAppliesToMutation(claimPath string, kind domain.EntryKind, mut
 }
 
 func validateLocalMutationClaims(claims map[string]domain.FollowedPhysicalClaim) error {
+	paths := make([]string, 0, len(claims))
 	targets := make(map[string]string, len(claims))
 	identities := make(map[string]string, len(claims))
 	for relPath, claim := range claims {
@@ -306,6 +362,19 @@ func validateLocalMutationClaims(claims map[string]domain.FollowedPhysicalClaim)
 				return fmt.Errorf("local mutation followed paths %q and %q claim the same physical identity %q", prior, relPath, claim.Identity)
 			}
 			identities[claim.Identity] = relPath
+		}
+		paths = append(paths, relPath)
+	}
+	sort.Strings(paths)
+	for i := 0; i < len(paths); i++ {
+		leftPath := paths[i]
+		left := claims[leftPath]
+		for j := i + 1; j < len(paths); j++ {
+			rightPath := paths[j]
+			right := claims[rightPath]
+			if physicalOwnershipPathsOverlap(left.TargetPath, left.Kind, right.TargetPath, right.Kind) {
+				return fmt.Errorf("local mutation followed paths %q and %q claim overlapping physical target subtrees %q and %q", leftPath, rightPath, left.TargetPath, right.TargetPath)
+			}
 		}
 	}
 	return nil
@@ -335,38 +404,68 @@ func mutationTargetFromDeepestClaim(mutationPath string, claims map[string]domai
 	return filepath.Join(claim.TargetPath, filepath.FromSlash(suffix)), true, nil
 }
 
-func followedOwnershipConflictTx(ctx context.Context, tx *sql.Tx, rootID int64, relPath string, claim domain.FollowedPhysicalClaim) (string, error) {
-	var ownerRootID int64
-	var ownerPath, ownerKind string
-	if claim.Identity != "" {
-		err := tx.QueryRowContext(ctx, `
-SELECT sync_root_id, rel_path, kind
+func followedOwnershipConflictTx(ctx context.Context, tx *sql.Tx, rootID int64, relPath string, claim domain.FollowedPhysicalClaim, allowSameRootLegacyUnknown bool) (string, error) {
+	rows, err := tx.QueryContext(ctx, `
+SELECT sync_root_id, rel_path, kind, physical_identity, physical_target_path
 FROM followed_physical_claims
-WHERE physical_identity = ?
-  AND NOT (sync_root_id = ? AND rel_path = ?)
-ORDER BY sync_root_id, rel_path
-LIMIT 1`, claim.Identity, rootID, relPath).Scan(&ownerRootID, &ownerPath, &ownerKind)
-		switch {
-		case err == nil:
+WHERE NOT (sync_root_id = ? AND rel_path = ?)
+ORDER BY sync_root_id, rel_path`, rootID, relPath)
+	if err != nil {
+		return "", fmt.Errorf("list global followed physical ownership: %w", err)
+	}
+	for rows.Next() {
+		var ownerRootID int64
+		var ownerPath, ownerKindRaw, ownerIdentity, ownerTarget string
+		if err := rows.Scan(&ownerRootID, &ownerPath, &ownerKindRaw, &ownerIdentity, &ownerTarget); err != nil {
+			_ = rows.Close()
+			return "", fmt.Errorf("scan global followed physical ownership: %w", err)
+		}
+		ownerKind := domain.EntryKind(ownerKindRaw)
+		if ownerKind != domain.KindFile && ownerKind != domain.KindDir {
+			_ = rows.Close()
+			return "", fmt.Errorf("global followed owner root %d path %q has invalid kind %q", ownerRootID, ownerPath, ownerKindRaw)
+		}
+		if claim.Identity != "" && ownerIdentity == claim.Identity {
+			_ = rows.Close()
 			return fmt.Sprintf("followed %s %q resolves to physical identity %q already owned by sync root %d path %q (%s)", claim.Kind, relPath, claim.Identity, ownerRootID, ownerPath, ownerKind), nil
-		case err != sql.ErrNoRows:
-			return "", fmt.Errorf("check global followed physical ownership: %w", err)
+		}
+		if ownerTarget == "" {
+			if allowSameRootLegacyUnknown && ownerRootID == rootID {
+				continue
+			}
+			_ = rows.Close()
+			return fmt.Sprintf("followed %s %q cannot prove subtree ownership because sync root %d path %q (%s) has an unknown legacy physical target", claim.Kind, relPath, ownerRootID, ownerPath, ownerKind), nil
+		}
+		if physicalOwnershipPathsOverlap(ownerTarget, ownerKind, claim.TargetPath, claim.Kind) {
+			_ = rows.Close()
+			return fmt.Sprintf("followed %s %q resolves to physical target subtree %q overlapping target %q already owned by sync root %d path %q (%s)", claim.Kind, relPath, claim.TargetPath, ownerTarget, ownerRootID, ownerPath, ownerKind), nil
 		}
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return "", fmt.Errorf("iterate global followed physical ownership: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return "", fmt.Errorf("close global followed physical ownership rows: %w", err)
+	}
 
-	err := tx.QueryRowContext(ctx, `
-SELECT sync_root_id, rel_path, kind
-FROM followed_physical_claims
-WHERE physical_target_path = ?
-  AND physical_target_path <> ''
-  AND NOT (sync_root_id = ? AND rel_path = ?)
-ORDER BY sync_root_id, rel_path
-LIMIT 1`, claim.TargetPath, rootID, relPath).Scan(&ownerRootID, &ownerPath, &ownerKind)
-	switch {
-	case err == nil:
-		return fmt.Sprintf("followed %s %q resolves to physical target %q already owned by sync root %d path %q (%s)", claim.Kind, relPath, claim.TargetPath, ownerRootID, ownerPath, ownerKind), nil
-	case err != sql.ErrNoRows:
-		return "", fmt.Errorf("check global followed target ownership: %w", err)
+	rootRows, err := tx.QueryContext(ctx, `SELECT id, local_root FROM sync_roots WHERE id <> ? ORDER BY id`, rootID)
+	if err != nil {
+		return "", fmt.Errorf("list configured roots for followed ownership: %w", err)
+	}
+	defer func() { _ = rootRows.Close() }()
+	for rootRows.Next() {
+		var peerRootID int64
+		var peerLocalRoot string
+		if err := rootRows.Scan(&peerRootID, &peerLocalRoot); err != nil {
+			return "", fmt.Errorf("scan configured root for followed ownership: %w", err)
+		}
+		if physicalOwnershipPathsOverlap(peerLocalRoot, domain.KindDir, claim.TargetPath, claim.Kind) {
+			return fmt.Sprintf("followed %s %q resolves to physical target subtree %q overlapping configured sync root %d at %q", claim.Kind, relPath, claim.TargetPath, peerRootID, peerLocalRoot), nil
+		}
+	}
+	if err := rootRows.Err(); err != nil {
+		return "", fmt.Errorf("iterate configured roots for followed ownership: %w", err)
 	}
 	return "", nil
 }
@@ -469,6 +568,17 @@ func validateFollowedPhysicalClaims(claims map[string]domain.FollowedPhysicalCla
 		paths = append(paths, relPath)
 	}
 	sort.Strings(paths)
+	for i := 0; i < len(paths); i++ {
+		leftPath := paths[i]
+		left := claims[leftPath]
+		for j := i + 1; j < len(paths); j++ {
+			rightPath := paths[j]
+			right := claims[rightPath]
+			if physicalOwnershipPathsOverlap(left.TargetPath, left.Kind, right.TargetPath, right.Kind) {
+				return nil, fmt.Errorf("followed paths %q and %q claim overlapping physical target subtrees %q and %q", leftPath, rightPath, left.TargetPath, right.TargetPath)
+			}
+		}
+	}
 	return paths, nil
 }
 
