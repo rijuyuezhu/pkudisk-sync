@@ -18,12 +18,13 @@ const maxCyclePasses = 8
 // DataPlane is the narrow in-process execution surface needed by one complete
 // reconciliation cycle. executor.RootExecutor implements this interface.
 type DataPlane interface {
-	ScanLocal(context.Context) (map[string]domain.LocalFingerprint, []string, error)
+	ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]string, error)
 	ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error)
 	ObserveLocalEntry(context.Context, string) (domain.LocalFingerprint, error)
 	ObserveRemoteEntry(context.Context, string) (domain.RemoteFingerprint, error)
 	ResolveLocalMutationTarget(context.Context, string, domain.LocalFingerprint) (string, error)
 	LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error)
+	CleanupLocalRecoveryArtifact(context.Context, domain.Operation) error
 	CompareFileContent(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (bool, error)
 	Upload(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (domain.RemoteFingerprint, error)
 	EnsureRemoteDir(context.Context, string, domain.RemoteExpectation) error
@@ -88,7 +89,11 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 		return result, err
 	}
 	if len(operations) > 0 {
-		preflight, _, err := scanCompleteSnapshot(ctx, data, root.Initialized)
+		peerRoots, err := configuredPeerLocalRoots(ctx, state, root.ID)
+		if err != nil {
+			return result, err
+		}
+		preflight, _, followedDirectories, err := scanCompleteSnapshot(ctx, data, root.Initialized, operations, peerRoots)
 		if err != nil {
 			return result, fmt.Errorf("operation recovery namespace preflight: %w", err)
 		}
@@ -97,6 +102,18 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 			result.BlockReason = string(reconcile.BlockNamespaceUnsafe)
 			result.BlockDetail = err.Error()
 			return result, nil
+		}
+		if root.Initialized {
+			ok, detail, err := followedDirectoryContinuity(ctx, state, root.ID, preflight, followedDirectories)
+			if err != nil {
+				return result, err
+			}
+			if !ok {
+				result.Blocked = true
+				result.BlockReason = "followed-directory-identity-changed"
+				result.BlockDetail = detail
+				return result, nil
+			}
 		}
 	}
 
@@ -131,7 +148,11 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 			return result, nil
 		}
 
-		snapshot, remoteRootPresent, err := scanCompleteSnapshot(ctx, data, root.Initialized)
+		peerRoots, err := configuredPeerLocalRoots(ctx, state, root.ID)
+		if err != nil {
+			return result, err
+		}
+		snapshot, remoteRootPresent, followedDirectories, err := scanCompleteSnapshot(ctx, data, root.Initialized, nil, peerRoots)
 		if err != nil {
 			return result, err
 		}
@@ -140,6 +161,18 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 			result.BlockReason = string(reconcile.BlockNamespaceUnsafe)
 			result.BlockDetail = err.Error()
 			return result, nil
+		}
+		if root.Initialized {
+			ok, detail, err := followedDirectoryContinuity(ctx, state, root.ID, snapshot, followedDirectories)
+			if err != nil {
+				return result, err
+			}
+			if !ok {
+				result.Blocked = true
+				result.BlockReason = "followed-directory-identity-changed"
+				result.BlockDetail = detail
+				return result, nil
+			}
 		}
 		baselines, err := state.ListBaselines(ctx, root.ID)
 		if err != nil {
@@ -219,7 +252,7 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 				return result, err
 			}
 			if !root.Initialized && len(unresolved) == 0 && plan.Conflicts == 0 {
-				if err := state.MarkSyncRootInitialized(ctx, root.ID); err != nil {
+				if err := state.InitializeSyncRoot(ctx, root.ID, followedDirectories); err != nil {
 					return result, err
 				}
 				result.Initialized = true
@@ -246,17 +279,31 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 	return result, fmt.Errorf("sync root %d did not stabilize after %d passes", rootID, maxCyclePasses)
 }
 
-func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot bool) (reconcile.Snapshot, bool, error) {
-	local, excluded, err := data.ScanLocal(ctx)
+func configuredPeerLocalRoots(ctx context.Context, state *store.Store, rootID int64) ([]string, error) {
+	roots, err := state.ListSyncRoots(ctx)
 	if err != nil {
-		return reconcile.Snapshot{}, false, fmt.Errorf("complete local scan: %w", err)
+		return nil, fmt.Errorf("list sync roots for physical ownership: %w", err)
+	}
+	peers := make([]string, 0, len(roots))
+	for _, root := range roots {
+		if root.ID != rootID {
+			peers = append(peers, root.LocalRoot)
+		}
+	}
+	return peers, nil
+}
+
+func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot bool, operations []domain.Operation, peerLocalRoots []string) (reconcile.Snapshot, bool, map[string]string, error) {
+	local, excluded, followedDirectories, err := data.ScanLocal(ctx, operations, peerLocalRoots)
+	if err != nil {
+		return reconcile.Snapshot{}, false, nil, fmt.Errorf("complete local scan: %w", err)
 	}
 	remote, remoteRootPresent, err := data.ScanRemote(ctx)
 	if err != nil {
-		return reconcile.Snapshot{}, remoteRootPresent, fmt.Errorf("complete remote scan: %w", err)
+		return reconcile.Snapshot{}, remoteRootPresent, nil, fmt.Errorf("complete remote scan: %w", err)
 	}
 	if requireRemoteRoot && !remoteRootPresent {
-		return reconcile.Snapshot{}, false, fmt.Errorf("complete remote scan: selected remote root is missing after initialization")
+		return reconcile.Snapshot{}, false, nil, fmt.Errorf("complete remote scan: selected remote root is missing after initialization")
 	}
 	for relPath := range remote {
 		if reconcile.PathExcluded(excluded, relPath) {
@@ -271,7 +318,37 @@ func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot
 		LocalComplete:  true,
 		RemoteComplete: true,
 		RootHealthy:    true,
-	}, remoteRootPresent, nil
+	}, remoteRootPresent, followedDirectories, nil
+}
+
+func followedDirectoryContinuity(ctx context.Context, state *store.Store, rootID int64, snapshot reconcile.Snapshot, observed map[string]string) (bool, string, error) {
+	expected, err := state.ListFollowedDirectoryBoundaries(ctx, rootID)
+	if err != nil {
+		return false, "", err
+	}
+	for relPath, observedIdentity := range observed {
+		expectedIdentity, ok := expected[relPath]
+		if !ok {
+			return false, fmt.Sprintf("followed directory %q has no durable physical identity; re-pair the root before accepting this boundary", relPath), nil
+		}
+		if observedIdentity != expectedIdentity {
+			return false, fmt.Sprintf("followed directory %q changed physical identity from %q to %q; re-pair the root before accepting the replacement", relPath, expectedIdentity, observedIdentity), nil
+		}
+	}
+	for relPath := range expected {
+		if _, ok := observed[relPath]; ok {
+			continue
+		}
+		if reconcile.PathExcluded(snapshot.Excluded, relPath) {
+			continue
+		}
+		if local, ok := snapshot.Local[relPath]; ok && local.Present {
+			return false, fmt.Sprintf("followed directory %q no longer resolves through its durable followed boundary; re-pair the root before accepting the replacement", relPath), nil
+		}
+		// The lexical symlink itself disappeared. That is an ordinary local
+		// namespace deletion rather than a referent-identity continuity failure.
+	}
+	return true, "", nil
 }
 
 func isLocalMutation(op domain.Operation) bool {
@@ -326,24 +403,11 @@ func recoverExistingOperations(ctx context.Context, state *store.Store, data Dat
 					return false, recovered, err
 				}
 			}
-			if isLocalMutation(op) {
-				if op.LocalTargetPath == "" {
-					if err := state.SetOperationPhase(ctx, op.ID, domain.OperationBlocked, "local mutation started before a physical target was pinned", false); err != nil {
-						return false, recovered, err
-					}
-					return true, recovered, nil
-				}
-				recoveryPath, pending, err := data.LocalRecoveryArtifact(ctx, op)
-				if err != nil {
+			if isLocalMutation(op) && op.LocalTargetPath == "" {
+				if err := state.SetOperationPhase(ctx, op.ID, domain.OperationBlocked, "local mutation started before a physical target was pinned", false); err != nil {
 					return false, recovered, err
 				}
-				if pending {
-					detail := fmt.Sprintf("local data preserved at recovery artifact %q; automatic replay is unsafe", recoveryPath)
-					if err := state.SetOperationPhase(ctx, op.ID, domain.OperationBlocked, detail, false); err != nil {
-						return false, recovered, err
-					}
-					return true, recovered, nil
-				}
+				return true, recovered, nil
 			}
 			satisfied, local, remote, err := proveRecoveredPostcondition(ctx, data, op)
 			if err != nil {
@@ -351,11 +415,30 @@ func recoverExistingOperations(ctx context.Context, state *store.Store, data Dat
 				return false, recovered, err
 			}
 			if satisfied {
+				if isLocalMutation(op) {
+					if err := data.CleanupLocalRecoveryArtifact(ctx, op); err != nil {
+						_ = state.SetOperationPhase(ctx, op.ID, domain.OperationRecovering, err.Error(), false)
+						return false, recovered, err
+					}
+				}
 				if err := commitCompletedOperation(ctx, state, op, local, remote); err != nil {
 					return false, recovered, err
 				}
 				recovered++
 				continue
+			}
+			if isLocalMutation(op) {
+				recoveryPath, pending, err := data.LocalRecoveryArtifact(ctx, op)
+				if err != nil {
+					return false, recovered, err
+				}
+				if pending {
+					detail := fmt.Sprintf("local data preserved at recovery artifact %q; prior completion is not proven and automatic replay is unsafe", recoveryPath)
+					if err := state.SetOperationPhase(ctx, op.ID, domain.OperationBlocked, detail, false); err != nil {
+						return false, recovered, err
+					}
+					return true, recovered, nil
+				}
 			}
 			holds, err := operationPreconditionsHold(ctx, data, op)
 			if err != nil {

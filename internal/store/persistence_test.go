@@ -10,7 +10,8 @@ import (
 
 func TestStorePersistsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "state.sqlite3")
+	tempRoot := t.TempDir()
+	dbPath := filepath.Join(tempRoot, "state.sqlite3")
 
 	s, err := Open(ctx, dbPath)
 	if err != nil {
@@ -18,7 +19,7 @@ func TestStorePersistsAcrossReopen(t *testing.T) {
 	}
 	root, err := s.CreateSyncRoot(ctx, domain.SyncRoot{
 		UUID:                "reopen-root",
-		LocalRoot:           "/tmp/reopen-root",
+		LocalRoot:           filepath.Join(tempRoot, "reopen-root"),
 		RemoteName:          "pkudisk",
 		RemoteRoot:          "Personal/Reopen",
 		Enabled:             true,

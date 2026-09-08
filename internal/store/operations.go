@@ -144,6 +144,24 @@ WHERE id = ?`, string(phase), lastError, increment, s.now().UnixNano(), id)
 	return requireOneRow(result, "operation")
 }
 
+// RetryBlockedOperation returns one explicitly blocked operation to the normal
+// recovering state. Recovery still has to prove the prior postcondition or
+// revalidate preconditions before any external mutation can run again.
+func (s *Store) RetryBlockedOperation(ctx context.Context, id int64, detail string) error {
+	if id <= 0 {
+		return fmt.Errorf("operation ID must be positive")
+	}
+	result, err := s.db.ExecContext(ctx, `
+UPDATE operations
+SET phase = ?, last_error = ?, updated_at_ns = ?
+WHERE id = ? AND phase = ?`,
+		string(domain.OperationRecovering), detail, s.now().UnixNano(), id, string(domain.OperationBlocked))
+	if err != nil {
+		return fmt.Errorf("retry blocked operation: %w", err)
+	}
+	return requireOneRow(result, "blocked operation")
+}
+
 // SetOperationLocalTarget pins the physical local mutation destination while
 // the operation is still planned and before any external side effect starts.
 func (s *Store) SetOperationLocalTarget(ctx context.Context, id int64, target string) error {

@@ -8,7 +8,7 @@ import (
 func TestSyncRootValidateCanonicalPaths(t *testing.T) {
 	base := SyncRoot{
 		UUID:                "root-1",
-		LocalRoot:           filepath.Clean(filepath.Join(string(filepath.Separator), "tmp", "sync")),
+		LocalRoot:           filepath.Join(t.TempDir(), "sync"),
 		RemoteName:          "pkudisk",
 		RemoteRoot:          "Personal/Sync",
 		Enabled:             true,

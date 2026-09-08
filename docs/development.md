@@ -91,7 +91,7 @@ See [releasing.md](releasing.md) for the complete release checklist.
 
 ## Native service validation
 
-Cross-compilation is not enough for service-manager changes. Native lifecycle behavior should be exercised on the affected OS.
+Cross-compilation is not enough for filesystem or service-manager changes. CI runs the full Go test suite natively on Linux, macOS, and Windows; the Windows job additionally exercises the per-user Scheduled Task lifecycle. Release-target cross-compilation remains a separate packaging/provenance check.
 
 For Windows, the expected product lifecycle is:
 

@@ -81,6 +81,9 @@ jobs:
         with:
           go-version-file: '.go-version'
           cache: true
+      - name: Run native Windows tests
+        shell: pwsh
+        run: go test ./...
       - name: Build pkudisk-sync
         shell: pwsh
         run: go build -o pkudisk-sync.exe ./cmd/pkudisk-sync
@@ -132,3 +135,15 @@ jobs:
               & .\pkudisk-sync.exe service uninstall 2>&1 | Out-Host
             }
           }
+
+  macos-native:
+    name: macOS native tests
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: '.go-version'
+          cache: true
+      - run: go test ./...

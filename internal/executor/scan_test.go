@@ -31,7 +31,7 @@ func TestScanLocalIncludesOrdinaryTreeAndExcludesRootMarker(t *testing.T) {
 	}
 
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	got, excluded, err := exec.ScanLocal(context.Background())
+	got, excluded, _, err := exec.ScanLocal(context.Background(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestScanLocalRejectsStaleInternalTempFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	if _, _, err := exec.ScanLocal(context.Background()); err == nil {
+	if _, _, _, err := exec.ScanLocal(context.Background(), nil, nil); err == nil {
 		t.Fatal("stale internal temp file was silently omitted from a complete snapshot")
 	}
 }
@@ -74,13 +74,54 @@ func TestScanLocalSkipsJournaledOperationTempFile(t *testing.T) {
 	if err := os.WriteFile(name, []byte("preserved"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	got, excluded, err := exec.ScanLocal(context.Background())
+	exec := &RootExecutor{root: domain.SyncRoot{ID: 1, LocalRoot: root}}
+	operations := []domain.Operation{{
+		ID:              17,
+		SyncRootID:      1,
+		Kind:            domain.OperationDeleteLocal,
+		LocalTargetPath: target,
+		Phase:           domain.OperationRecovering,
+		Attempts:        1,
+	}}
+	got, excluded, _, err := exec.ScanLocal(context.Background(), operations, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 0 || len(excluded) != 0 {
 		t.Fatalf("journaled operation temp leaked into snapshot: got=%+v excluded=%v", got, excluded)
+	}
+}
+
+func TestScanLocalPlannedOperationDoesNotOwnTempArtifact(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	name := operationPhysicalTempPath(target, 17, "recovery")
+	if err := os.WriteFile(name, []byte("user"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{ID: 1, LocalRoot: root}}
+	operations := []domain.Operation{{
+		ID:              17,
+		SyncRootID:      1,
+		Kind:            domain.OperationDeleteLocal,
+		LocalTargetPath: target,
+		Phase:           domain.OperationPlanned,
+		Attempts:        1,
+	}}
+	if _, _, _, err := exec.ScanLocal(context.Background(), operations, nil); err == nil {
+		t.Fatal("planned operation incorrectly owned an operation-shaped artifact")
+	}
+}
+
+func TestScanLocalRejectsUnownedOperationShapedFile(t *testing.T) {
+	root := t.TempDir()
+	name := operationPhysicalTempPath(filepath.Join(root, "target.txt"), 17, "recovery")
+	if err := os.WriteFile(name, []byte("user"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	if _, _, _, err := exec.ScanLocal(context.Background(), nil, nil); err == nil {
+		t.Fatal("operation-shaped user file was silently hidden without journal ownership")
 	}
 }
 
@@ -93,7 +134,7 @@ func TestScanLocalRejectsSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkReject}}
-	if _, _, err := exec.ScanLocal(context.Background()); err == nil {
+	if _, _, _, err := exec.ScanLocal(context.Background(), nil, nil); err == nil {
 		t.Fatal("reject policy accepted a symlink")
 	}
 }
@@ -109,7 +150,7 @@ func TestScanLocalDefaultFollowsFileSymlinkOutsideRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	got, excluded, err := exec.ScanLocal(context.Background())
+	got, excluded, _, err := exec.ScanLocal(context.Background(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +172,7 @@ func TestScanLocalDefaultFollowsDirectorySymlinkOutsideRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	got, excluded, err := exec.ScanLocal(context.Background())
+	got, excluded, boundaries, err := exec.ScanLocal(context.Background(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,6 +181,9 @@ func TestScanLocalDefaultFollowsDirectorySymlinkOutsideRoot(t *testing.T) {
 	}
 	if got["linked"].Kind != domain.KindDir || got["linked/note.txt"].Size != 5 {
 		t.Fatalf("followed directory snapshot = %+v", got)
+	}
+	if boundaries["linked"] == "" || len(boundaries) != 1 {
+		t.Fatalf("followed directory identities = %+v", boundaries)
 	}
 }
 
@@ -155,7 +199,7 @@ func TestScanLocalFollowExcludesSelfAndMutualCycles(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	got, excluded, err := exec.ScanLocal(context.Background())
+	got, excluded, _, err := exec.ScanLocal(context.Background(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +226,7 @@ func TestScanLocalFollowExcludesLinkToPhysicalParent(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	got, excluded, err := exec.ScanLocal(context.Background())
+	got, excluded, _, err := exec.ScanLocal(context.Background(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,18 +238,71 @@ func TestScanLocalFollowExcludesLinkToPhysicalParent(t *testing.T) {
 	}
 }
 
-func TestScanLocalFollowTreatsResolvableDanglingFinalSymlinkAsAbsence(t *testing.T) {
+func TestScanLocalFollowExcludesResolvableDanglingFinalSymlink(t *testing.T) {
 	root := t.TempDir()
 	if err := os.Symlink("missing.txt", filepath.Join(root, "link.txt")); err != nil {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	got, excluded, err := exec.ScanLocal(context.Background())
+	got, excluded, _, err := exec.ScanLocal(context.Background(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 0 || len(excluded) != 0 {
+	if len(got) != 0 || len(excluded) != 1 || excluded[0] != "link.txt" {
 		t.Fatalf("dangling final symlink snapshot=%+v excluded=%v", got, excluded)
+	}
+}
+
+func TestScanLocalFollowRejectsDuplicatePhysicalOwnership(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "x.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(root, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	if _, _, _, err := exec.ScanLocal(context.Background(), nil, nil); err == nil {
+		t.Fatal("follow policy allowed two logical paths to own the same physical directory")
+	}
+}
+
+func TestScanLocalFollowRejectsTargetInsideForeignSyncRoot(t *testing.T) {
+	root := t.TempDir()
+	foreign := t.TempDir()
+	if err := os.WriteFile(filepath.Join(foreign, rootmarker.FileName), []byte("foreign\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(foreign, "x.txt")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	if _, _, _, err := exec.ScanLocal(context.Background(), nil, nil); err == nil {
+		t.Fatal("follow policy crossed into another configured sync root")
+	}
+}
+
+func TestScanLocalFollowRejectsConfiguredPeerRootWithoutMarker(t *testing.T) {
+	root := t.TempDir()
+	peer := t.TempDir()
+	target := filepath.Join(peer, "x.txt")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	if _, _, _, err := exec.ScanLocal(context.Background(), nil, []string{peer}); err == nil {
+		t.Fatal("follow policy crossed into a configured peer root without relying on its marker")
 	}
 }
 
@@ -219,12 +316,73 @@ func TestScanLocalIgnoreExcludesSymlinkPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkIgnore}}
-	got, excluded, err := exec.ScanLocal(context.Background())
+	got, excluded, boundaries, err := exec.ScanLocal(context.Background(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 0 || len(excluded) != 1 || excluded[0] != "linked" {
-		t.Fatalf("ignore snapshot=%+v excluded=%v", got, excluded)
+	if len(got) != 0 || len(excluded) != 1 || excluded[0] != "linked" || len(boundaries) != 0 {
+		t.Fatalf("ignore snapshot=%+v excluded=%v boundaries=%+v", got, excluded, boundaries)
+	}
+}
+
+func TestScanLocalIgnoreDoesNotResolvePeerRootSymlink(t *testing.T) {
+	root := t.TempDir()
+	peer := t.TempDir()
+	if err := os.Symlink(peer, filepath.Join(root, "ignored")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkIgnore}}
+	got, excluded, boundaries, err := exec.ScanLocal(context.Background(), nil, []string{peer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 || len(excluded) != 1 || excluded[0] != "ignored" || len(boundaries) != 0 {
+		t.Fatalf("ignore peer snapshot=%+v excluded=%v boundaries=%+v", got, excluded, boundaries)
+	}
+}
+
+func TestScanLocalIgnoreDoesNotResolveDanglingSymlinkWithMissingPeer(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "missing-target"), filepath.Join(root, "ignored")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkIgnore}}
+	_, excluded, boundaries, err := exec.ScanLocal(context.Background(), nil, []string{filepath.Join(base, "missing-peer")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(excluded) != 1 || excluded[0] != "ignored" || len(boundaries) != 0 {
+		t.Fatalf("ignore dangling exclusions=%v boundaries=%+v", excluded, boundaries)
+	}
+}
+
+func TestScanLocalFollowIgnoresUnavailableUnrelatedPeerRoot(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "x.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	got, excluded, boundaries, err := exec.ScanLocal(context.Background(), nil, []string{filepath.Join(base, "missing-peer")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(excluded) != 0 || got["linked/x.txt"].Size != 1 || boundaries["linked"] == "" {
+		t.Fatalf("follow with unavailable peer snapshot=%+v excluded=%v boundaries=%+v", got, excluded, boundaries)
 	}
 }
 
@@ -234,7 +392,7 @@ func TestScanLocalRejectsMarkerDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	if _, _, err := exec.ScanLocal(context.Background()); err == nil {
+	if _, _, _, err := exec.ScanLocal(context.Background(), nil, nil); err == nil {
 		t.Fatal("reserved marker directory accepted")
 	}
 }
@@ -246,7 +404,7 @@ func TestScanLocalRejectsInternalTempDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	if _, _, err := exec.ScanLocal(context.Background()); err == nil {
+	if _, _, _, err := exec.ScanLocal(context.Background(), nil, nil); err == nil {
 		t.Fatal("reserved internal temp directory accepted")
 	}
 }
@@ -294,6 +452,19 @@ func TestScanRemoteStillFailsWhenListedChildDisappears(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("incomplete remote scan returned a snapshot: %+v", got)
+	}
+}
+
+func TestScanRemoteRejectsOperationReservedNamespace(t *testing.T) {
+	reserved := fs.NewDir(".pkudisk-sync-tmp-op-12-recovery", time.Unix(1, 0)).SetID("reserved-id")
+	exec := &RootExecutor{remote: &listOnlyFS{list: func(_ context.Context, dir string) (fs.DirEntries, error) {
+		if dir != "" {
+			t.Fatalf("unexpected list dir %q", dir)
+		}
+		return fs.DirEntries{reserved}, nil
+	}}}
+	if _, _, err := exec.ScanRemote(context.Background()); err == nil {
+		t.Fatal("remote operation-reserved namespace was accepted")
 	}
 }
 

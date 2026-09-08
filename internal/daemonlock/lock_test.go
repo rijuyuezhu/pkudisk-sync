@@ -21,19 +21,18 @@ func TestAcquireIsExclusiveAndReusable(t *testing.T) {
 		t.Fatalf("second Acquire() error = %v, want ErrAlreadyRunning", err)
 	}
 
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("second Close() = %v", err)
+	}
 	contents, err := os.ReadFile(filepath.Join(runtimeDir, fileName))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.TrimSpace(string(contents)) != strconv.Itoa(os.Getpid()) {
 		t.Fatalf("lock PID = %q, want %d", strings.TrimSpace(string(contents)), os.Getpid())
-	}
-
-	if err := first.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := first.Close(); err != nil {
-		t.Fatalf("second Close() = %v", err)
 	}
 
 	third, err := Acquire(runtimeDir)

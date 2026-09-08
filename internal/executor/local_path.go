@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // resolveFollowedLocalPath resolves symlinks while optionally allowing the
-// final physical leaf to be absent. That absent-leaf case is what lets a
-// dangling final symlink remain an authoritative virtual deletion and later be
-// recreated without replacing the symlink object itself.
+// final physical leaf to be absent. The scanner treats that state as excluded,
+// not deletion evidence; callers that already have independent mutation
+// authority can still use the resolved missing target to recreate it without
+// replacing the symlink object itself.
 func resolveFollowedLocalPath(name string, allowMissingLeaf bool) (resolved string, present bool, err error) {
 	resolved, err = filepath.EvalSymlinks(name)
 	if err == nil {
@@ -58,4 +60,35 @@ func resolveMissingLocalLeaf(name string, seen map[string]struct{}) (string, boo
 		return "", false, evalErr
 	}
 	return filepath.Join(filepath.Clean(resolvedParent), filepath.Base(name)), false, nil
+}
+
+func canonicalExistingLocalPath(name string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(filepath.Clean(name))
+	if err != nil {
+		return "", err
+	}
+	abs, err := filepath.Abs(resolved)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(abs), nil
+}
+
+func physicalPathContains(parent, child string) (bool, error) {
+	canonicalParent, err := canonicalExistingLocalPath(parent)
+	if err != nil {
+		return false, err
+	}
+	canonicalChild, err := canonicalExistingLocalPath(child)
+	if err != nil {
+		return false, err
+	}
+	rel, err := filepath.Rel(canonicalParent, canonicalChild)
+	if err != nil || filepath.IsAbs(rel) {
+		// Different Windows volumes are a normal non-containment case. Both
+		// inputs were already canonicalized successfully, so Rel failure here
+		// cannot grant ownership and need not make an unrelated root unhealthy.
+		return false, nil
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))), nil
 }

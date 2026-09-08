@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -83,7 +85,7 @@ func TestLocalRootsOverlapUsesPlatformNamespaceSemantics(t *testing.T) {
 	if !localRootsOverlapForOS(base, caseChild, "windows") {
 		t.Fatal("windows case alias was not treated as overlapping")
 	}
-	if localRootsOverlapForOS(base, caseChild, "linux") {
+	if runtime.GOOS != "windows" && localRootsOverlapForOS(base, caseChild, "linux") {
 		t.Fatal("linux distinct case spellings were treated as overlapping")
 	}
 
@@ -92,7 +94,7 @@ func TestLocalRootsOverlapUsesPlatformNamespaceSemantics(t *testing.T) {
 	if !localRootsOverlapForOS(composed, decomposedChild, "darwin") {
 		t.Fatal("darwin normalization alias was not treated as overlapping")
 	}
-	if localRootsOverlapForOS(composed, decomposedChild, "linux") {
+	if runtime.GOOS != "windows" && localRootsOverlapForOS(composed, decomposedChild, "linux") {
 		t.Fatal("linux normalization-distinct spellings were treated as overlapping")
 	}
 }
@@ -264,6 +266,37 @@ func TestSyncRootInitializationLifecycle(t *testing.T) {
 	}
 	if paused.Enabled || !paused.Initialized {
 		t.Fatalf("pause changed initialization state: %+v", paused)
+	}
+}
+
+func TestInitializeSyncRootPersistsFollowedDirectoryBoundariesAtomically(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	root := createTestRoot(t, s)
+	want := map[string]string{"linked": "linux:1:2", "nested/alias": "linux:1:3"}
+	if err := s.InitializeSyncRoot(ctx, root.ID, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListFollowedDirectoryBoundaries(ctx, root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("followed boundaries = %+v, want %+v", got, want)
+	}
+	initialized, ok, err := s.GetSyncRoot(ctx, root.ID)
+	if err != nil || !ok || !initialized.Initialized {
+		t.Fatalf("initialized root = %+v ok=%v err=%v", initialized, ok, err)
+	}
+	if err := s.InitializeSyncRoot(ctx, root.ID, map[string]string{"linked": "linux:9:9"}); err == nil {
+		t.Fatal("second initialization rewrote durable followed identities")
+	}
+	got, err = s.ListFollowedDirectoryBoundaries(ctx, root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("failed second initialization changed boundaries = %+v", got)
 	}
 }
 
