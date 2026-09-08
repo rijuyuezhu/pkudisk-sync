@@ -100,14 +100,14 @@ pkudisk-sync root remove 1
 
 `install` registers but deliberately does not start synchronization immediately. Linux uses a `systemd --user` unit, macOS uses a LaunchAgent in `~/Library/LaunchAgents`, and Windows registers an interactive current-user Scheduled Task with limited privileges through the native ScheduledTasks PowerShell API, which works without elevation; later start/stop/uninstall operations use the same task under the current user. `service status` is normalized to `active`, `inactive`, or `not-installed` instead of exposing platform- or locale-specific task states. Reinstall/upgrade is fail-closed while any sync daemon owns the default runtime lease: stop the foreground daemon or user service before `service install`, then start it again after the new executable/definition is in place. On macOS, `service start` unloads any inactive cached LaunchAgent before bootstrap so launchd re-reads the current plist rather than retaining stale `ProgramArguments`. The installed service always uses OS-native platform-default app paths rather than shell-selected path authorities. `service install` and `service start` therefore fail closed if the invoking CLI resolves to a different authority because of `PKUDISK_SYNC_*`, custom XDG paths, or an altered home/profile environment. The final supervisor-only `daemon --service` process independently resolves the native user home or Windows Known Folder path, so inherited systemd, launchd, or Task Scheduler environment variables cannot redirect its lease, SQLite state, or rclone config. This keeps the start preflight lease, SQLite state, rclone config, service definition, and running daemon on the same authority. Linux and macOS restart genuine daemon failures, but an already-owned single-instance lease is an intentional clean service exit rather than a restartable failure.
 
-## Planned implementation order
+## v0.1 implementation status
 
-1. Pure domain model and three-way planner.
-2. SQLite baseline / operation-intent / conflict persistence, including multiple selected sync roots.
-3. Deletion guards and crash-recovery decision model.
-4. In-process executor using the Go rclone / `rclone-pkudisk` APIs directly. **Implemented.**
-5. Native watchers and continuous multi-root daemon. **Implemented with foreground CLI.**
-6. Per-user service packaging and CLI/UI polish. **Native Linux/macOS/Windows user-service control, explicit file-conflict resolution, and a six-target portable release pipeline are implemented; richer GUI UX and signed/native installers remain.**
+1. Pure domain model and three-way planner — **implemented.**
+2. SQLite baseline / operation-intent / conflict persistence, including multiple selected sync roots — **implemented.**
+3. Deletion guards and crash-recovery decision model — **implemented.**
+4. In-process executor using the Go rclone / `rclone-pkudisk` APIs directly — **implemented.**
+5. Native watchers and continuous multi-root daemon — **implemented with foreground CLI and per-user background-service integration.**
+6. Product/release surface — **Linux/macOS/Windows user-service control, explicit file-conflict resolution, and a six-target portable release pipeline are implemented. Richer GUI UX plus signed/notarized native installers remain later packaging work rather than v0.1 synchronization requirements.**
 
 ## Development
 
