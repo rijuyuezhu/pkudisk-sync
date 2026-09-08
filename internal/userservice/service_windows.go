@@ -25,9 +25,9 @@ func newPlatformManager(executable string) (Manager, error) {
 }
 
 func (m *windowsTaskManager) Install(ctx context.Context) error {
-	_, err := m.run(ctx, "schtasks.exe", scheduledTaskCreateArgs(m.executable)...)
+	_, err := m.run(ctx, "powershell.exe", scheduledTaskInstallArgs(m.executable)...)
 	if err != nil {
-		return fmt.Errorf("create per-user scheduled task: %w", err)
+		return fmt.Errorf("register per-user scheduled task: %w", err)
 	}
 	return nil
 }
@@ -70,14 +70,17 @@ func (m *windowsTaskManager) Stop(ctx context.Context) error {
 }
 
 func (m *windowsTaskManager) Status(ctx context.Context) (Status, error) {
-	output, err := m.run(ctx, "schtasks.exe", scheduledTaskQueryArgs()...)
+	output, err := m.run(ctx, "powershell.exe", scheduledTaskStatusArgs()...)
 	if err != nil {
-		if scheduledTaskNotFound(err) {
-			return StatusNotInstalled, nil
-		}
-		return "", fmt.Errorf("query per-user scheduled task: %w", err)
+		return "", fmt.Errorf("query per-user scheduled task status: %w", err)
 	}
-	return parseScheduledTaskStatus(output), nil
+	status := Status(strings.TrimSpace(string(output)))
+	switch status {
+	case StatusNotInstalled, StatusActive, StatusInactive:
+		return status, nil
+	default:
+		return "", fmt.Errorf("query per-user scheduled task status: unexpected state %q", status)
+	}
 }
 
 func (m *windowsTaskManager) isInstalled(ctx context.Context) (bool, error) {

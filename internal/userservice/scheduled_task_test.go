@@ -2,23 +2,25 @@ package userservice
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
-func TestScheduledTaskCreateArgsUseCurrentInteractiveUserAtLimitedPrivilege(t *testing.T) {
-	executable := `C:\Program Files\PKU Disk\pkudisk-sync.exe`
-	got := scheduledTaskCreateArgs(executable)
-	want := []string{
-		"/create",
-		"/tn", scheduledTaskName,
-		"/tr", `"C:\Program Files\PKU Disk\pkudisk-sync.exe" daemon --service`,
-		"/sc", "ONLOGON",
-		"/it",
-		"/rl", "LIMITED",
-		"/f",
-	}
+func TestScheduledTaskInstallArgsUseCurrentInteractiveUserAtLimitedPrivilege(t *testing.T) {
+	executable := `C:\Users\O'Brien\PKU Disk\pkudisk-sync.exe`
+	got := scheduledTaskInstallArgs(executable)
+	wantScript := strings.Join([]string{
+		`$ErrorActionPreference = 'Stop'`,
+		`$user = [Security.Principal.WindowsIdentity]::GetCurrent().Name`,
+		`$action = New-ScheduledTaskAction -Execute 'C:\Users\O''Brien\PKU Disk\pkudisk-sync.exe' -Argument 'daemon --service'`,
+		`$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user`,
+		`$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited`,
+		`$task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal`,
+		`Register-ScheduledTask -TaskName 'PKUDisk Sync' -InputObject $task -Force | Out-Null`,
+	}, `; `)
+	want := []string{"-NoProfile", "-NonInteractive", "-Command", wantScript}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("scheduled task create args = %#v, want %#v", got, want)
+		t.Fatalf("scheduled task install args = %#v, want %#v", got, want)
 	}
 }
 
@@ -36,11 +38,15 @@ func TestScheduledTaskQueryArgsUseHRESULTExitCodes(t *testing.T) {
 	}
 }
 
-func TestParseScheduledTaskStatus(t *testing.T) {
-	if got := parseScheduledTaskStatus([]byte(`"\\PKUDisk Sync","N/A","Running"` + "\r\n")); got != Status("Running") {
-		t.Fatalf("parseScheduledTaskStatus() = %q", got)
-	}
-	if got := parseScheduledTaskStatus([]byte("not csv enough\r\n")); got != Status("installed") {
-		t.Fatalf("fallback status = %q", got)
+func TestScheduledTaskStatusArgsAreLocaleIndependent(t *testing.T) {
+	got := scheduledTaskStatusArgs()
+	wantScript := strings.Join([]string{
+		`$task = Get-ScheduledTask -TaskName 'PKUDisk Sync' -ErrorAction SilentlyContinue`,
+		`if ($null -eq $task) { Write-Output 'not-installed'; exit 0 }`,
+		`if ($task.State -eq 'Running') { Write-Output 'active' } else { Write-Output 'inactive' }`,
+	}, `; `)
+	want := []string{"-NoProfile", "-NonInteractive", "-Command", wantScript}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("scheduled task status args = %#v, want %#v", got, want)
 	}
 }

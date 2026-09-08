@@ -100,17 +100,31 @@ jobs:
             return $output
           }
 
+          function Wait-SyncStatus {
+            param([string] $Expected)
+            $status = ''
+            for ($i = 0; $i -lt 30; $i++) {
+              $status = (Invoke-Sync service status | Out-String).Trim()
+              if ($status -eq $Expected) {
+                return
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            throw "scheduled task did not reach $Expected state: $status"
+          }
+
           $installed = $false
           try {
             Invoke-Sync service install | Out-Null
             $installed = $true
+            Wait-SyncStatus 'inactive'
             Invoke-Sync service start | Out-Null
-            Start-Sleep -Seconds 2
-            $status = (Invoke-Sync service status | Out-String).Trim()
-            if ($status -notmatch '(?i)^running$') {
-              throw "scheduled task did not reach Running state: $status"
-            }
+            Wait-SyncStatus 'active'
             Invoke-Sync service stop | Out-Null
+            Wait-SyncStatus 'inactive'
+            Invoke-Sync service uninstall | Out-Null
+            $installed = $false
+            Wait-SyncStatus 'not-installed'
           }
           finally {
             if ($installed) {
