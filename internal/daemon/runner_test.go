@@ -14,6 +14,20 @@ import (
 	"github.com/rijuyuezhu/pkudisk-sync/internal/syncer"
 )
 
+func TestIsContextTerminationRequiresMatchingEndedContext(t *testing.T) {
+	if isContextTermination(context.Background(), context.Canceled) {
+		t.Fatal("live context treated a cancellation error as expected termination")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !isContextTermination(ctx, errors.Join(errors.New("wrapped state error"), context.Canceled)) {
+		t.Fatal("wrapped cancellation from an ended context was not recognized")
+	}
+	if isContextTermination(ctx, errors.New("sqlite corruption")) {
+		t.Fatal("unrelated state error was hidden by context termination")
+	}
+}
+
 func TestRunnerCoalescesWatcherHintsWithoutOverlappingCycles(t *testing.T) {
 	state := openDaemonTestStore(t)
 	root := daemonTestRoot(t, "root-1", "Personal/Data")

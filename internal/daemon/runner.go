@@ -234,6 +234,9 @@ func (r *Runner) runRoot(ctx context.Context, initial domain.SyncRoot) {
 		if pending {
 			root, ok, err := r.state.GetSyncRoot(ctx, initial.ID)
 			if err != nil {
+				if isContextTermination(ctx, err) {
+					return
+				}
 				r.report(initial.ID, "state", syncer.CycleResult{}, false, err)
 				pending = false
 			} else if !ok {
@@ -280,6 +283,9 @@ func (r *Runner) runRoot(ctx context.Context, initial domain.SyncRoot) {
 		case <-health.C:
 			root, ok, err := r.state.GetSyncRoot(ctx, initial.ID)
 			if err != nil {
+				if isContextTermination(ctx, err) {
+					return
+				}
 				r.report(initial.ID, "state", syncer.CycleResult{}, false, err)
 				continue
 			}
@@ -291,6 +297,9 @@ func (r *Runner) runRoot(ctx context.Context, initial domain.SyncRoot) {
 			} else if root.Enabled && !pending {
 				operations, listErr := r.state.ListOperations(ctx, root.ID)
 				if listErr != nil {
+					if isContextTermination(ctx, listErr) {
+						return
+					}
 					r.report(initial.ID, "state", syncer.CycleResult{}, false, listErr)
 				} else {
 					for _, operation := range operations {
@@ -325,6 +334,11 @@ func (r *Runner) runRoot(ctx context.Context, initial domain.SyncRoot) {
 			}
 		}
 	}
+}
+
+func isContextTermination(ctx context.Context, err error) bool {
+	ctxErr := ctx.Err()
+	return ctxErr != nil && errors.Is(err, ctxErr)
 }
 
 func (r *Runner) report(rootID int64, component string, result syncer.CycleResult, hasResult bool, err error) {
