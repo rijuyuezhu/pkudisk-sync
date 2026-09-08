@@ -484,7 +484,7 @@ func createTestRoot(t *testing.T, s *Store) domain.SyncRoot {
 	t.Helper()
 	root, err := s.CreateSyncRoot(context.Background(), domain.SyncRoot{
 		UUID:                "root-uuid-1",
-		LocalRoot:           "/tmp/pkudisk-sync-root",
+		LocalRoot:           filepath.Join(t.TempDir(), "pkudisk-sync-root"),
 		RemoteName:          "pkudisk",
 		RemoteRoot:          "Personal/Sync",
 		Enabled:             true,
@@ -521,7 +521,9 @@ func assertBaselineEqual(t *testing.T, got, want domain.Baseline) {
 
 func TestMigrationV1ToCurrentKeepsExistingRootsUninitializedAndDefaultsSymlinkFollow(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "state-v1.sqlite3")
+	base := t.TempDir()
+	dbPath := filepath.Join(base, "state-v1.sqlite3")
+	oldRoot := filepath.Join(base, "old-root")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -532,7 +534,7 @@ func TestMigrationV1ToCurrentKeepsExistingRootsUninitializedAndDefaultsSymlinkFo
 	}
 	if _, err := db.ExecContext(ctx, `
 INSERT INTO sync_roots(uuid, local_root, remote_name, remote_root, enabled, poll_interval_seconds, created_at_ns)
-VALUES('old-root', '/tmp/old-root', 'pkudisk', 'Personal/Old', 1, 60, 1)`); err != nil {
+VALUES('old-root', ?, 'pkudisk', 'Personal/Old', 1, 60, 1)`, oldRoot); err != nil {
 		_ = db.Close()
 		t.Fatal(err)
 	}

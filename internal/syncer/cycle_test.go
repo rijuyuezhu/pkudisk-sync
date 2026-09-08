@@ -621,7 +621,9 @@ func TestRunRootCycleBlocksWhenPinnedLocalRecoveryArtifactExists(t *testing.T) {
 	if err != nil || len(operations) != 1 {
 		t.Fatalf("operations = %+v err=%v", operations, err)
 	}
-	if operations[0].Phase != domain.OperationBlocked || !strings.Contains(operations[0].LastError, artifact) {
+	if operations[0].Phase != domain.OperationBlocked ||
+		!strings.Contains(operations[0].LastError, "local data preserved at recovery artifact") ||
+		!strings.Contains(operations[0].LastError, filepath.Base(artifact)) {
 		t.Fatalf("recovery artifact was not retained as blocked authority: %+v", operations[0])
 	}
 }

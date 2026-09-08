@@ -84,7 +84,7 @@ func TestRootAddListPauseResume(t *testing.T) {
 	if err := app.Run(ctx, []string{"root", "list"}); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"ID", "enabled", localRoot, "pkudisk:Personal/Data", "2m0s"} {
+	for _, want := range []string{"ID", "enabled", roots[0].LocalRoot, "pkudisk:Personal/Data", "2m0s"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("list output %q missing %q", stdout.String(), want)
 		}

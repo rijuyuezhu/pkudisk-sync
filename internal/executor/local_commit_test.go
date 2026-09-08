@@ -192,7 +192,7 @@ func TestDanglingFollowedSymlinkCanRecreateTargetWithoutReplacingLink(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved != target {
+	if !samePhysicalDestination(resolved, target, false) {
 		t.Fatalf("dangling symlink target = %q, want %q", resolved, target)
 	}
 	temp := filepath.Join(outside, "staged")

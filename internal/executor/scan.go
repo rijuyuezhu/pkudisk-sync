@@ -141,7 +141,11 @@ func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir str
 					continue
 				}
 				if resolvedInfo.IsDir() {
-					if sameAsAny(resolvedInfo, ancestors) || strictPathAncestor(resolved, physicalDir) {
+					resolvedIsAncestor, err := strictPhysicalPathAncestor(resolved, physicalDir)
+					if err != nil {
+						return fmt.Errorf("compare physical symlink ancestry for %q: %w", rel, err)
+					}
+					if sameAsAny(resolvedInfo, ancestors) || resolvedIsAncestor {
 						// A link to this directory or any ancestor is a lexical cycle.
 						// Excluding the alias, rather than descending, also handles
 						// links to the sync root and links to a parent directory.
@@ -224,14 +228,12 @@ func (e *RootExecutor) ownedOperationArtifacts(operations []domain.Operation) (m
 }
 
 func rejectPeerRootPath(physicalPath string, peerLocalRoots []string) error {
-	physicalPath = filepath.Clean(physicalPath)
 	for _, peer := range peerLocalRoots {
-		peer = filepath.Clean(peer)
-		rel, err := filepath.Rel(peer, physicalPath)
-		if err != nil || filepath.IsAbs(rel) {
-			continue
+		owned, err := physicalPathContains(peer, physicalPath)
+		if err != nil {
+			return fmt.Errorf("compare physical path %q with configured sync root %q: %w", physicalPath, peer, err)
 		}
-		if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+		if owned {
 			return fmt.Errorf("physical path %q is owned by configured sync root %q", physicalPath, peer)
 		}
 	}
@@ -247,7 +249,14 @@ func (e *RootExecutor) rejectForeignRootTarget(resolved string) error {
 	if !info.IsDir() {
 		probe = filepath.Dir(probe)
 	}
-	ownRoot := filepath.Clean(e.root.LocalRoot)
+	ownRoot, err := canonicalExistingLocalPath(e.root.LocalRoot)
+	if err != nil {
+		return fmt.Errorf("canonicalize current sync root %q: %w", e.root.LocalRoot, err)
+	}
+	probe, err = canonicalExistingLocalPath(probe)
+	if err != nil {
+		return fmt.Errorf("canonicalize followed target directory %q: %w", probe, err)
+	}
 	for {
 		probe = filepath.Clean(probe)
 		if probe != ownRoot {
@@ -285,12 +294,20 @@ func sameAsAny(info os.FileInfo, ancestors []os.FileInfo) bool {
 	return false
 }
 
-func strictPathAncestor(parent, child string) bool {
-	rel, err := filepath.Rel(parent, child)
-	if err != nil || rel == "." || filepath.IsAbs(rel) {
-		return false
+func strictPhysicalPathAncestor(parent, child string) (bool, error) {
+	contains, err := physicalPathContains(parent, child)
+	if err != nil || !contains {
+		return false, err
 	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	parentInfo, err := os.Stat(parent)
+	if err != nil {
+		return false, err
+	}
+	childInfo, err := os.Stat(child)
+	if err != nil {
+		return false, err
+	}
+	return !os.SameFile(parentInfo, childInfo), nil
 }
 
 // ScanRemote recursively lists the configured PKU Disk root using the backend's

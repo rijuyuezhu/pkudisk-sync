@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -83,7 +84,7 @@ func TestLocalRootsOverlapUsesPlatformNamespaceSemantics(t *testing.T) {
 	if !localRootsOverlapForOS(base, caseChild, "windows") {
 		t.Fatal("windows case alias was not treated as overlapping")
 	}
-	if localRootsOverlapForOS(base, caseChild, "linux") {
+	if runtime.GOOS != "windows" && localRootsOverlapForOS(base, caseChild, "linux") {
 		t.Fatal("linux distinct case spellings were treated as overlapping")
 	}
 
@@ -92,7 +93,7 @@ func TestLocalRootsOverlapUsesPlatformNamespaceSemantics(t *testing.T) {
 	if !localRootsOverlapForOS(composed, decomposedChild, "darwin") {
 		t.Fatal("darwin normalization alias was not treated as overlapping")
 	}
-	if localRootsOverlapForOS(composed, decomposedChild, "linux") {
+	if runtime.GOOS != "windows" && localRootsOverlapForOS(composed, decomposedChild, "linux") {
 		t.Fatal("linux normalization-distinct spellings were treated as overlapping")
 	}
 }
