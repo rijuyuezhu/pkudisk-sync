@@ -49,6 +49,33 @@ pkudisk-sync status
 
 The local root must be an actual directory, not a symlink. Local roots cannot overlap one another, and remote roots cannot overlap one another.
 
+### Symlink policy
+
+Each root has an explicit local symlink policy. The default is `follow`:
+
+```bash
+pkudisk-sync root add \
+  --local ~/Seafile/Data \
+  --remote pkudisk:Personal/Data \
+  --symlinks follow
+```
+
+The modes are:
+
+- `follow` — dereference file and directory symlinks into the synchronized virtual namespace, including links whose targets are outside the selected local root. Remote updates and deletes mutate the resolved target while preserving the symlink object. If a followed target is deleted, the dangling final link remains and can be rehydrated if that remote path later reappears. Cycles and links back to a physical ancestor are excluded instead of traversed.
+- `reject` — any symlink makes the complete local scan fail closed.
+- `ignore` — the symlink path and its virtual subtree are excluded from the local namespace for that cycle. Excluded paths carry no download or deletion authority, so ignoring a link cannot be mistaken for deleting it.
+
+Change the policy only while the root is paused and has no pending operation:
+
+```bash
+pkudisk-sync root pause 1
+pkudisk-sync root config 1 --symlinks ignore
+pkudisk-sync root resume 1
+```
+
+Filesystem watchers deliberately do not follow symlink targets. In particular, a target outside the selected root does not expand the watcher's ownership into another directory tree. Changes there are discovered by the authoritative periodic repair scan; configure a shorter `--poll` interval when lower detection latency is needed.
+
 `root add` writes an app-owned `.pkudisk-sync-root` marker. If the previous add was interrupted after writing that marker but before committing SQLite state, rerun exactly the intended add with:
 
 ```bash

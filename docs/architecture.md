@@ -32,6 +32,7 @@ Each root has its own:
 - polling state;
 - enabled/paused state;
 - initialization state.
+- symlink policy.
 
 ## Three-way reconciliation
 
@@ -83,6 +84,16 @@ Examples of fail-closed behavior include:
 
 The backend safety contract is pinned through the `rclone-pkudisk` version in `go.mod`; downstream code must not assume stronger remote semantics than that dependency exposes.
 
+### Followed symlinks and physical local targets
+
+The synchronization namespace remains lexical even when a root uses the default `follow` policy, but a local mutation is applied to the resolved physical target rather than replacing the symlink object. A followed target may live outside the selected root or on a different filesystem.
+
+Before a local create/update/delete can enter `running`, the syncer resolves and durably pins its canonical absolute physical target in the operation journal. File staging and preservation slots are then created in that target's physical parent directory, keeping no-replace rename operations on the same filesystem.
+
+For replacement or deletion of an existing target, the executor first atomically moves the exact expected target to an operation-ID-specific recovery slot and validates the object that actually moved. A symlink retarget between planning and execution therefore fails its physical-identity fence rather than mutating the new target. If a process loss leaves the recovery slot behind, restart detects that journaled artifact and blocks automatic replay while preserving the data and its exact location.
+
+`ignore` is modeled as an excluded namespace rather than absence. Reconciliation skips the excluded prefix and descendants entirely, including deletion-gate accounting. `reject` instead makes the local observation incomplete by returning an error. Follow-mode cycles and aliases to a physical ancestor are excluded so recursive traversal cannot loop.
+
 ## Deletion safety
 
 Deletion is never inferred from an incomplete observation. A destructive plan requires:
@@ -106,6 +117,8 @@ If either side changed after the conflict was recorded, the stale resolution ope
 ## Watchers and periodic repair
 
 Recursive filesystem watchers are latency hints only. Every hint requests the same complete root cycle used by periodic polling. Startup, watcher overflow/failure, resume, or missed events are repaired by full scans.
+
+Watchers recurse only through real directories under the selected local root; they never follow symlink targets. This is deliberate: following links would create a second, mutable watcher graph over arbitrary external directories and platform-specific reparse behavior. The authoritative repair scan still dereferences `follow` links, so changes under an external target are eventually observed without making watcher coverage part of correctness.
 
 A configured poll interval of zero means "use the daemon safety default", currently 60 seconds; it does not disable repair polling.
 
