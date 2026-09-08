@@ -1,6 +1,6 @@
 # Release process
 
-No public release is published yet. This document records the intended release process so packaging changes can be reviewed before the first tag is created.
+This document defines the release process for stable and pre-release builds.
 
 ## Version authority
 
@@ -10,7 +10,7 @@ No public release is published yet. This document records the intended release p
 - `scripts/build-release.sh` creates one portable archive.
 - `scripts/verify-release.sh` verifies archive contents and provenance.
 
-Release tags use `v<version>`, for example `v0.1.0`.
+Release tags use `v<version>`. Pre-releases follow SemVer identifiers such as `v0.1.0-alpha.1`, then `beta.1`, `rc.1`, and finally `v0.1.0`.
 
 ## Pre-release checklist
 
@@ -38,7 +38,7 @@ The aggregate release workflow also publishes `SHA256SUMS` covering the target a
 
 ## Signing status
 
-v0.1 packaging is currently unsigned. A future public release should clearly disclose this until code signing/notarization is added.
+v0.1 packaging is currently unsigned. Public pre-releases and releases should clearly disclose this until code signing/notarization is added.
 
 Consequences include:
 
@@ -50,6 +50,6 @@ Do not advise users to disable Gatekeeper, SmartScreen, or equivalent protection
 
 ## GitHub workflow
 
-`.github/workflows/release.yml` is intended to run only for a release tag and to build the same six-target matrix from repository authorities. Creating the repository or pushing `main` must not create a release by itself.
+`.github/workflows/release.yml` runs only for a release tag and builds the same six-target matrix from repository authorities. Creating the repository or pushing `main` does not create a release by itself.
 
-The first public release should be a separate deliberate operation after documentation, CI, native service gates, and artifact provenance have all been reviewed from the published repository.
+When `VERSION` contains a pre-release suffix such as `-alpha.1`, the workflow publishes the GitHub Release with the pre-release flag. A plain version such as `0.1.0` publishes a normal release.

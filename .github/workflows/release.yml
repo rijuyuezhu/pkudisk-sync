@@ -16,6 +16,7 @@ jobs:
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       targets: ${{ steps.release.outputs.targets }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -46,6 +47,11 @@ jobs:
           fi
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "targets=$targets" >> "$GITHUB_OUTPUT"
+          if [[ "$(./scripts/version.sh version)" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
   quality:
     name: Quality gate
@@ -176,9 +182,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
         run: |
+          release_args=()
+          if [[ "$PRERELEASE" == true ]]; then
+            release_args+=(--prerelease)
+          fi
           gh release create "$RELEASE_TAG" \
             dist/* \
             --verify-tag \
             --title "pkudisk-sync $RELEASE_TAG" \
-            --generate-notes
+            --generate-notes \
+            "${release_args[@]}"
