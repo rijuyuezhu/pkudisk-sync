@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -51,6 +52,10 @@ type CycleResult struct {
 // for a selected root. External mutations are always journaled before execution,
 // and a running/recovering intent is never blindly replayed.
 func RunRootCycle(ctx context.Context, rootID int64, state *store.Store, data DataPlane, deletePolicy reconcile.DeletePolicy) (CycleResult, error) {
+	return runRootCycle(ctx, rootID, state, data, deletePolicy, runtime.GOOS)
+}
+
+func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data DataPlane, deletePolicy reconcile.DeletePolicy, targetOS string) (CycleResult, error) {
 	if state == nil {
 		return CycleResult{}, fmt.Errorf("state store must not be nil")
 	}
@@ -76,7 +81,24 @@ func RunRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 		return result, nil
 	}
 
-	blocked, recovered, err := recoverExistingOperations(ctx, root, state, data)
+	operations, err := state.ListOperations(ctx, root.ID)
+	if err != nil {
+		return result, err
+	}
+	if len(operations) > 0 {
+		preflight, err := scanCompleteSnapshot(ctx, data)
+		if err != nil {
+			return result, fmt.Errorf("operation recovery namespace preflight: %w", err)
+		}
+		if err := validateSnapshotNamespace(preflight.Local, preflight.Remote, targetOS); err != nil {
+			result.Blocked = true
+			result.BlockReason = string(reconcile.BlockNamespaceUnsafe)
+			result.BlockDetail = err.Error()
+			return result, nil
+		}
+	}
+
+	blocked, recovered, err := recoverExistingOperations(ctx, state, data, operations)
 	result.Recovered += recovered
 	if err != nil {
 		return result, err
@@ -110,6 +132,12 @@ func RunRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 		snapshot, err := scanCompleteSnapshot(ctx, data)
 		if err != nil {
 			return result, err
+		}
+		if err := validateSnapshotNamespace(snapshot.Local, snapshot.Remote, targetOS); err != nil {
+			result.Blocked = true
+			result.BlockReason = string(reconcile.BlockNamespaceUnsafe)
+			result.BlockDetail = err.Error()
+			return result, nil
 		}
 		baselines, err := state.ListBaselines(ctx, root.ID)
 		if err != nil {
@@ -222,11 +250,7 @@ func scanCompleteSnapshot(ctx context.Context, data DataPlane) (reconcile.Snapsh
 	}, nil
 }
 
-func recoverExistingOperations(ctx context.Context, root domain.SyncRoot, state *store.Store, data DataPlane) (blocked bool, recovered int, err error) {
-	operations, err := state.ListOperations(ctx, root.ID)
-	if err != nil {
-		return false, 0, err
-	}
+func recoverExistingOperations(ctx context.Context, state *store.Store, data DataPlane, operations []domain.Operation) (blocked bool, recovered int, err error) {
 	for _, op := range operations {
 		switch op.Phase {
 		case domain.OperationBlocked:

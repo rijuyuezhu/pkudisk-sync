@@ -29,6 +29,7 @@ const (
 	BlockIncompleteLocal    BlockReason = "incomplete-local-scan"
 	BlockIncompleteRemote   BlockReason = "incomplete-remote-scan"
 	BlockRootUnhealthy      BlockReason = "root-unhealthy"
+	BlockNamespaceUnsafe    BlockReason = "unsafe-local-namespace"
 	BlockDeletePolicyUnset  BlockReason = "delete-policy-unset"
 	BlockMassDeleteCount    BlockReason = "mass-delete-count"
 	BlockMassDeleteFraction BlockReason = "mass-delete-fraction"

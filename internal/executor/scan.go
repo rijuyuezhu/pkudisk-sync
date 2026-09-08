@@ -36,6 +36,9 @@ func (e *RootExecutor) ScanLocal(ctx context.Context) (map[string]domain.LocalFi
 			return fmt.Errorf("resolve local relative path %q: %w", fullPath, err)
 		}
 		rel := filepath.ToSlash(relOS)
+		if err := domain.ValidateRelPath(rel); err != nil {
+			return fmt.Errorf("local path is not representable by the canonical sync namespace: %w", err)
+		}
 		if rel == rootmarker.FileName {
 			if entry.IsDir() {
 				return fmt.Errorf("reserved root marker path %q is a directory", rel)

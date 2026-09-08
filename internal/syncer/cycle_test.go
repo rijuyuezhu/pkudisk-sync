@@ -374,6 +374,72 @@ func TestRunRootCycleRecoversAlreadyCompletedRunningDeleteWithoutReplay(t *testi
 	}
 }
 
+func TestRunRootCycleBlocksUnsafeWindowsNamespaceBeforePlanning(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	data := &fakeDataPlane{
+		local: map[string]domain.LocalFingerprint{
+			"Foo.txt": localFileFP(3, 30),
+		},
+		remote: map[string]domain.RemoteFingerprint{
+			"foo.txt": remoteFileFP("doc-foo", "rev-foo", 3),
+		},
+	}
+
+	result, err := runRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{}, "windows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Blocked || result.BlockReason != string(reconcile.BlockNamespaceUnsafe) || !strings.Contains(result.BlockDetail, "namespace collision") {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if len(data.calls) != 0 {
+		t.Fatalf("unsafe namespace reached mutation plane: %+v", data.calls)
+	}
+	if rootState, ok, err := state.GetSyncRoot(ctx, root.ID); err != nil || !ok || rootState.Initialized {
+		t.Fatalf("unsafe namespace changed root initialization: root=%+v ok=%v err=%v", rootState, ok, err)
+	}
+}
+
+func TestRunRootCycleBlocksUnsafeNamespaceBeforeOperationRecovery(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, true)
+	planned := domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationEnsureRemote,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "foo.txt",
+		ExpectedLocal:  localFileFP(3, 30),
+		ExpectedRemote: domain.RemoteExpectation{Absent: true},
+	}
+	if _, err := state.CreateOperation(ctx, planned); err != nil {
+		t.Fatal(err)
+	}
+	data := &fakeDataPlane{
+		local: map[string]domain.LocalFingerprint{
+			"foo.txt": localFileFP(3, 30),
+		},
+		remote: map[string]domain.RemoteFingerprint{
+			"FOO.TXT": remoteFileFP("doc-other", "rev-other", 7),
+		},
+	}
+
+	result, err := runRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{}, "windows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Blocked || result.BlockReason != string(reconcile.BlockNamespaceUnsafe) || result.Recovered != 0 {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if len(data.calls) != 0 {
+		t.Fatalf("namespace-unsafe recovery mutated data: %+v", data.calls)
+	}
+	operations, err := state.ListOperations(ctx, root.ID)
+	if err != nil || len(operations) != 1 || operations[0].Phase != domain.OperationPlanned {
+		t.Fatalf("planned operation changed despite namespace block: %+v err=%v", operations, err)
+	}
+}
+
 func TestRunRootCycleMassDeleteGateHasNoSideEffects(t *testing.T) {
 	ctx := context.Background()
 	state, root := newCycleRoot(t, true, true)
