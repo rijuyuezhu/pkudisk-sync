@@ -125,7 +125,7 @@ func (s *Store) CreateSyncRoot(ctx context.Context, root domain.SyncRoot) (domai
 	if err != nil {
 		return domain.SyncRoot{}, err
 	}
-	defer reservation.Close()
+	defer func() { _ = reservation.Close() }()
 	return reservation.Commit(ctx)
 }
 
@@ -174,7 +174,7 @@ FROM sync_roots ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list sync roots: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var roots []domain.SyncRoot
 	for rows.Next() {
@@ -256,14 +256,6 @@ func (s *Store) MarkSyncRootInitialized(ctx context.Context, id int64) error {
 		return fmt.Errorf("mark sync root initialized: %w", err)
 	}
 	return requireOneRow(result, "sync root")
-}
-
-func (s *Store) checkSyncRootOwnership(ctx context.Context, candidate domain.SyncRoot) error {
-	roots, err := s.ListSyncRoots(ctx)
-	if err != nil {
-		return err
-	}
-	return checkSyncRootOwnershipAgainst(roots, candidate)
 }
 
 func checkSyncRootOwnershipAgainst(roots []domain.SyncRoot, candidate domain.SyncRoot) error {

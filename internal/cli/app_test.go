@@ -20,6 +20,22 @@ import (
 	"github.com/rijuyuezhu/pkudisk-sync/internal/userservice"
 )
 
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestCLIReportsOutputWriteFailures(t *testing.T) {
+	wantErr := errors.New("output unavailable")
+	for _, args := range [][]string{{"help"}, {"paths"}, {"version"}} {
+		t.Run(strings.Join(args, "-"), func(t *testing.T) {
+			app := New(apppaths.Paths{}, failingWriter{err: wantErr}, &bytes.Buffer{})
+			if err := app.Run(context.Background(), args); !errors.Is(err, wantErr) {
+				t.Fatalf("Run(%v) error = %v, want %v", args, err, wantErr)
+			}
+		})
+	}
+}
+
 func TestRootAddListPauseResume(t *testing.T) {
 	ctx := context.Background()
 	paths := cliTestPaths(t)
@@ -308,7 +324,7 @@ func TestRootRemoveRequiresStoppedDaemonAndPausedRootAndKeepsData(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer state.Close()
+	defer func() { _ = state.Close() }()
 	if _, ok, err := state.GetSyncRoot(ctx, 1); err != nil || ok {
 		t.Fatalf("removed root still in store: ok=%v err=%v", ok, err)
 	}
@@ -413,7 +429,7 @@ func TestConflictResolveRejectsKindMismatchWithoutQueueingOperation(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer state.Close()
+	defer func() { _ = state.Close() }()
 	if operations, err := state.ListOperations(ctx, 1); err != nil || len(operations) != 0 {
 		t.Fatalf("kind mismatch queued operations = %+v err=%v", operations, err)
 	}
@@ -540,7 +556,7 @@ func TestRemoteConfigureRequiresStoppedDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lease.Close()
+	defer func() { _ = lease.Close() }()
 
 	called := false
 	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
@@ -615,7 +631,7 @@ func TestDaemonRefusesSecondInstanceBeforeWiringRunner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 
 	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
 	app.installRcloneConfig = func(string) error {
@@ -642,7 +658,7 @@ func TestServiceDaemonTreatsExistingOwnerAsCleanExit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 
 	app := New(applicationPaths, &bytes.Buffer{}, &bytes.Buffer{})
 	app.servicePaths = func() (apppaths.Paths, error) { return servicePaths, nil }
@@ -722,7 +738,7 @@ func TestServiceStartRefusesForegroundDaemonBeforeManagerStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 
 	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
 	app.servicePaths = func() (apppaths.Paths, error) { return paths, nil }
@@ -755,7 +771,7 @@ func TestServiceInstallRefusesRunningDaemonBeforeManagerInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 
 	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
 	app.servicePaths = func() (apppaths.Paths, error) { return paths, nil }

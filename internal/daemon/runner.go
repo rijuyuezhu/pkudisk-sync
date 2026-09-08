@@ -32,8 +32,12 @@ type RootEvent struct {
 	Err       error
 }
 
+// Reporter receives non-authoritative daemon progress events. Implementations
+// must be safe for concurrent calls from different sync roots.
 type Reporter func(RootEvent)
 
+// Runner continuously reconciles all configured roots while enforcing one
+// worker per root and treating watchers as hints rather than authority.
 type Runner struct {
 	state        *store.Store
 	deletePolicy reconcile.DeletePolicy

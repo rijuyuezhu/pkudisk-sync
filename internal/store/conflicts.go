@@ -86,7 +86,7 @@ func (s *Store) ListConflicts(ctx context.Context, syncRootID int64, unresolvedO
 	if err != nil {
 		return nil, fmt.Errorf("list conflicts: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var conflicts []domain.Conflict
 	for rows.Next() {

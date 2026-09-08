@@ -389,12 +389,12 @@ func filesEqual(a, b string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("open local comparison file: %w", err)
 	}
-	defer left.Close()
+	defer func() { _ = left.Close() }()
 	right, err := os.Open(b)
 	if err != nil {
 		return false, fmt.Errorf("open downloaded comparison file: %w", err)
 	}
-	defer right.Close()
+	defer func() { _ = right.Close() }()
 
 	leftBuf := make([]byte, 256*1024)
 	rightBuf := make([]byte, 256*1024)

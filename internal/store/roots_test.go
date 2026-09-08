@@ -104,12 +104,12 @@ func TestCreateSyncRootSerializesOwnershipAcrossStoreInstances(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer firstStore.Close()
+	defer func() { _ = firstStore.Close() }()
 	secondStore, err := Open(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer secondStore.Close()
+	defer func() { _ = secondStore.Close() }()
 
 	localBase := t.TempDir()
 	first := testSyncRoot("one", filepath.Join(localBase, "one"), "pkudisk", "Personal/Shared")

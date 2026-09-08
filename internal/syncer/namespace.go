@@ -48,7 +48,7 @@ func validateSnapshotNamespace(local map[string]domain.LocalFingerprint, remote 
 		if previous, ok := owners[key]; ok && previous.rel != item.rel {
 			return fmt.Errorf("namespace collision on %s: %s path %q and %s path %q map to the same local path", targetOS, previous.side, previous.rel, item.side, item.rel)
 		}
-		owners[key] = owner{side: item.side, rel: item.rel}
+		owners[key] = owner(item)
 	}
 	return nil
 }

@@ -55,7 +55,7 @@ func TestStorePersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	gotBase, ok, err := s.GetBaseline(ctx, root.ID, "persist.txt")
 	if err != nil || !ok {
 		t.Fatalf("baseline after reopen: %+v ok=%v err=%v", gotBase, ok, err)

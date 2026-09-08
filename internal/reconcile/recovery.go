@@ -32,6 +32,9 @@ type RecoveryObservation struct {
 	PreconditionsHold bool
 }
 
+// DecideRecovery maps an observed post-crash outcome to the only safe next
+// action. It permits retry only when non-application and original preconditions
+// are both proven.
 func DecideRecovery(observation RecoveryObservation) (RecoveryAction, error) {
 	switch observation.Outcome {
 	case RecoveryPostconditionSatisfied:

@@ -72,7 +72,7 @@ FROM entries WHERE sync_root_id = ? ORDER BY rel_path`, syncRootID)
 	if err != nil {
 		return nil, fmt.Errorf("list baselines: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var baselines []domain.Baseline
 	for rows.Next() {
@@ -117,7 +117,7 @@ func (s *Store) CommitBaselineAndDeleteOperation(ctx context.Context, baseline d
 	if err != nil {
 		return fmt.Errorf("begin baseline completion transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx, upsertBaselineSQL, baselineArgs(baseline)...); err != nil {
 		return fmt.Errorf("commit observed baseline: %w", err)
@@ -148,7 +148,7 @@ func (s *Store) DropBaselineAndDeleteOperation(ctx context.Context, syncRootID i
 	if err != nil {
 		return fmt.Errorf("begin baseline drop transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM entries WHERE sync_root_id = ? AND rel_path = ?`, syncRootID, relPath); err != nil {
 		return fmt.Errorf("drop baseline: %w", err)

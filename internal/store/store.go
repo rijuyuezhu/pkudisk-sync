@@ -74,7 +74,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("begin migration: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	if version == 0 {
 		if _, err := tx.ExecContext(ctx, schemaV1); err != nil {

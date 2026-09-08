@@ -8,6 +8,7 @@ import (
 	"strings"
 )
 
+// FileName is the reserved ownership marker stored at each configured local root.
 const FileName = ".pkudisk-sync-root"
 
 // Ensure creates the root marker once, or validates the existing marker. It

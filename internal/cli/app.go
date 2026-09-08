@@ -35,6 +35,8 @@ type daemonRunner interface {
 	Run(context.Context) error
 }
 
+// Application is the command-line façade over the app-owned state, sync daemon,
+// embedded PKU Disk backend, and native per-user service manager.
 type Application struct {
 	paths  apppaths.Paths
 	stdout io.Writer
@@ -50,6 +52,8 @@ type Application struct {
 	servicePaths        func() (apppaths.Paths, error)
 }
 
+// New constructs a CLI application using the supplied app-owned paths and I/O.
+// Nil writers are replaced with io.Discard.
 func New(paths apppaths.Paths, stdout, stderr io.Writer) *Application {
 	if stdout == nil {
 		stdout = io.Discard
@@ -79,13 +83,11 @@ func New(paths apppaths.Paths, stdout, stderr io.Writer) *Application {
 
 func (a *Application) Run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		a.printUsage()
-		return nil
+		return a.printUsage()
 	}
 	switch args[0] {
 	case "help", "-h", "--help":
-		a.printUsage()
-		return nil
+		return a.printUsage()
 	case "paths":
 		return a.runPaths(args[1:])
 	case "version":
@@ -107,46 +109,44 @@ func (a *Application) Run(ctx context.Context, args []string) error {
 	}
 }
 
-func (a *Application) printUsage() {
-	fmt.Fprintln(a.stdout, "Usage: pkudisk-sync <command> [options]")
-	fmt.Fprintln(a.stdout)
-	fmt.Fprintln(a.stdout, "Commands:")
-	fmt.Fprintln(a.stdout, "  paths                              Show app-owned state/config/cache/runtime paths")
-	fmt.Fprintln(a.stdout, "  version                            Show build version and provenance")
-	fmt.Fprintln(a.stdout, "  remote configure                   Configure or re-authenticate the PKU Disk account")
-	fmt.Fprintln(a.stdout, "  status                             Summarize roots, operations, and conflicts")
-	fmt.Fprintln(a.stdout, "  conflict list [--root ID]          List unresolved conflicts")
-	fmt.Fprintln(a.stdout, "  conflict resolve ID --keep-local   Queue exact-state resolution using local data")
-	fmt.Fprintln(a.stdout, "  conflict resolve ID --keep-remote  Queue exact-state resolution using remote data")
-	fmt.Fprintln(a.stdout, "  root add --local PATH --remote pkudisk:P Add one selected directory pair")
-	fmt.Fprintln(a.stdout, "  root list                          List selected directory pairs")
-	fmt.Fprintln(a.stdout, "  root pause ID                      Pause one selected pair")
-	fmt.Fprintln(a.stdout, "  root resume ID                     Resume one selected pair")
-	fmt.Fprintln(a.stdout, "  root remove ID                     Unregister one paused pair without deleting data")
-	fmt.Fprintln(a.stdout, "  daemon                             Run the foreground sync daemon")
-	fmt.Fprintln(a.stdout, "  service install|start|stop|status  Manage the current user's background daemon")
-	fmt.Fprintln(a.stdout, "  service uninstall                  Remove the current user's background daemon")
+func (a *Application) printUsage() error {
+	const usage = `Usage: pkudisk-sync <command> [options]
+
+Commands:
+  paths                              Show app-owned state/config/cache/runtime paths
+  version                            Show build version and provenance
+  remote configure                   Configure or re-authenticate the PKU Disk account
+  status                             Summarize roots, operations, and conflicts
+  conflict list [--root ID]          List unresolved conflicts
+  conflict resolve ID --keep-local   Queue exact-state resolution using local data
+  conflict resolve ID --keep-remote  Queue exact-state resolution using remote data
+  root add --local PATH --remote pkudisk:P Add one selected directory pair
+  root list                          List selected directory pairs
+  root pause ID                      Pause one selected pair
+  root resume ID                     Resume one selected pair
+  root remove ID                     Unregister one paused pair without deleting data
+  daemon                             Run the foreground sync daemon
+  service install|start|stop|status  Manage the current user's background daemon
+  service uninstall                  Remove the current user's background daemon
+`
+	_, err := io.WriteString(a.stdout, usage)
+	return err
 }
 
 func (a *Application) runPaths(args []string) error {
 	if len(args) != 0 {
 		return fmt.Errorf("paths takes no arguments")
 	}
-	fmt.Fprintf(a.stdout, "state_db\t%s\n", a.paths.StateDB)
-	fmt.Fprintf(a.stdout, "rclone_config\t%s\n", a.paths.RcloneConfig)
-	fmt.Fprintf(a.stdout, "cache_dir\t%s\n", a.paths.CacheDir)
-	fmt.Fprintf(a.stdout, "runtime_dir\t%s\n", a.paths.RuntimeDir)
-	return nil
+	_, err := fmt.Fprintf(a.stdout, "state_db\t%s\nrclone_config\t%s\ncache_dir\t%s\nruntime_dir\t%s\n", a.paths.StateDB, a.paths.RcloneConfig, a.paths.CacheDir, a.paths.RuntimeDir)
+	return err
 }
 
 func (a *Application) runVersion(args []string) error {
 	if len(args) != 0 {
 		return fmt.Errorf("version takes no arguments")
 	}
-	fmt.Fprintf(a.stdout, "pkudisk-sync %s\n", buildinfo.Version)
-	fmt.Fprintf(a.stdout, "commit\t%s\n", buildinfo.Commit)
-	fmt.Fprintf(a.stdout, "built\t%s\n", buildinfo.BuildDate)
-	return nil
+	_, err := fmt.Fprintf(a.stdout, "pkudisk-sync %s\ncommit\t%s\nbuilt\t%s\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuildDate)
+	return err
 }
 
 func (a *Application) runRemote(ctx context.Context, args []string) error {
@@ -163,15 +163,15 @@ func (a *Application) runRemote(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("remote configure requires the foreground daemon and user service to be stopped: %w", err)
 	}
-	defer lease.Close()
+	defer func() { _ = lease.Close() }()
 	if err := a.paths.PrepareConfig(); err != nil {
 		return err
 	}
 	if err := a.configureRemote(ctx, a.paths.RcloneConfig, domain.AppRemoteName); err != nil {
 		return err
 	}
-	fmt.Fprintf(a.stdout, "configured PKU Disk remote %s in %s\n", domain.AppRemoteName, a.paths.RcloneConfig)
-	return nil
+	_, err = fmt.Fprintf(a.stdout, "configured PKU Disk remote %s in %s\n", domain.AppRemoteName, a.paths.RcloneConfig)
+	return err
 }
 
 func (a *Application) runStatus(ctx context.Context, args []string) error {
@@ -182,13 +182,15 @@ func (a *Application) runStatus(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer state.Close()
+	defer func() { _ = state.Close() }()
 	roots, err := state.ListSyncRoots(ctx)
 	if err != nil {
 		return err
 	}
 	w := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tSTATE\tINIT\tPLANNED\tRUNNING\tRECOVERING\tBLOCKED\tCONFLICTS\tLOCAL\tREMOTE")
+	if _, err := fmt.Fprintln(w, "ID\tSTATE\tINIT\tPLANNED\tRUNNING\tRECOVERING\tBLOCKED\tCONFLICTS\tLOCAL\tREMOTE"); err != nil {
+		return err
+	}
 	for _, root := range roots {
 		operations, err := state.ListOperations(ctx, root.ID)
 		if err != nil {
@@ -210,7 +212,7 @@ func (a *Application) runStatus(ctx context.Context, args []string) error {
 		if root.Initialized {
 			initialized = "yes"
 		}
-		fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s:%s\n",
+		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s:%s\n",
 			root.ID,
 			rootState,
 			initialized,
@@ -222,7 +224,9 @@ func (a *Application) runStatus(ctx context.Context, args []string) error {
 			root.LocalRoot,
 			root.RemoteName,
 			root.RemoteRoot,
-		)
+		); err != nil {
+			return err
+		}
 	}
 	return w.Flush()
 }
@@ -262,7 +266,7 @@ func (a *Application) runConflictList(ctx context.Context, args []string) error 
 	if err != nil {
 		return err
 	}
-	defer state.Close()
+	defer func() { _ = state.Close() }()
 	roots, err := state.ListSyncRoots(ctx)
 	if err != nil {
 		return err
@@ -281,14 +285,16 @@ func (a *Application) runConflictList(ctx context.Context, args []string) error 
 		}
 	}
 	w := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tROOT\tKIND\tPATH\tLOCAL\tREMOTE\tCREATED")
+	if _, err := fmt.Fprintln(w, "ID\tROOT\tKIND\tPATH\tLOCAL\tREMOTE\tCREATED"); err != nil {
+		return err
+	}
 	for _, root := range roots {
 		conflicts, err := state.ListConflicts(ctx, root.ID, true)
 		if err != nil {
 			return err
 		}
 		for _, conflict := range conflicts {
-			fmt.Fprintf(w, "%d\t%d\t%s\t%s\t%s\t%s\t%s\n",
+			if _, err := fmt.Fprintf(w, "%d\t%d\t%s\t%s\t%s\t%s\t%s\n",
 				conflict.ID,
 				root.ID,
 				conflict.Kind,
@@ -296,7 +302,9 @@ func (a *Application) runConflictList(ctx context.Context, args []string) error 
 				describeLocalConflictState(conflict.Local),
 				describeRemoteConflictState(conflict.Remote),
 				conflict.CreatedAt.Local().Format(time.RFC3339),
-			)
+			); err != nil {
+				return err
+			}
 		}
 	}
 	return w.Flush()
@@ -338,7 +346,7 @@ func (a *Application) runConflictResolve(ctx context.Context, args []string) err
 	if err != nil {
 		return err
 	}
-	defer state.Close()
+	defer func() { _ = state.Close() }()
 	conflict, ok, err := state.GetConflict(ctx, id)
 	if err != nil {
 		return err
@@ -373,9 +381,13 @@ func (a *Application) runConflictResolve(ctx context.Context, args []string) err
 	if err != nil {
 		return fmt.Errorf("queue conflict %d resolution: %w", id, err)
 	}
-	fmt.Fprintf(a.stdout, "queued conflict %d %s as operation %d\n", id, resolution, operation.ID)
+	if _, err := fmt.Fprintf(a.stdout, "queued conflict %d %s as operation %d\n", id, resolution, operation.ID); err != nil {
+		return err
+	}
 	if !root.Enabled {
-		fmt.Fprintf(a.stdout, "root %d is paused; resume it to apply the queued resolution\n", root.ID)
+		if _, err := fmt.Fprintf(a.stdout, "root %d is paused; resume it to apply the queued resolution\n", root.ID); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -436,12 +448,16 @@ func (a *Application) runService(ctx context.Context, args []string) error {
 		if err := lease.Close(); err != nil {
 			return fmt.Errorf("release service install daemon lease preflight: %w", err)
 		}
-		fmt.Fprintln(a.stdout, "service installed")
+		if _, err := fmt.Fprintln(a.stdout, "service installed"); err != nil {
+			return err
+		}
 	case "uninstall":
 		if err := manager.Uninstall(ctx); err != nil {
 			return err
 		}
-		fmt.Fprintln(a.stdout, "service uninstalled")
+		if _, err := fmt.Fprintln(a.stdout, "service uninstalled"); err != nil {
+			return err
+		}
 	case "start":
 		if err := a.paths.PrepareRuntime(); err != nil {
 			return err
@@ -459,18 +475,24 @@ func (a *Application) runService(ctx context.Context, args []string) error {
 		if err := manager.Start(ctx); err != nil {
 			return err
 		}
-		fmt.Fprintln(a.stdout, "service started")
+		if _, err := fmt.Fprintln(a.stdout, "service started"); err != nil {
+			return err
+		}
 	case "stop":
 		if err := manager.Stop(ctx); err != nil {
 			return err
 		}
-		fmt.Fprintln(a.stdout, "service stopped")
+		if _, err := fmt.Fprintln(a.stdout, "service stopped"); err != nil {
+			return err
+		}
 	case "status":
 		status, err := manager.Status(ctx)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(a.stdout, status)
+		if _, err := fmt.Fprintln(a.stdout, status); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unknown service command %q", args[0])
 	}
@@ -588,7 +610,7 @@ func (a *Application) runRootAdd(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer state.Close()
+	defer func() { _ = state.Close() }()
 	var stored domain.SyncRoot
 	if *recoverOrphanMarker {
 		stored, err = daemon.SetupRootRecoveringOrphanMarker(ctx, state, root)
@@ -598,8 +620,8 @@ func (a *Application) runRootAdd(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(a.stdout, "added root %d\t%s\t<->\t%s:%s\n", stored.ID, stored.LocalRoot, stored.RemoteName, stored.RemoteRoot)
-	return nil
+	_, err = fmt.Fprintf(a.stdout, "added root %d\t%s\t<->\t%s:%s\n", stored.ID, stored.LocalRoot, stored.RemoteName, stored.RemoteRoot)
+	return err
 }
 
 func (a *Application) runRootList(ctx context.Context, args []string) error {
@@ -610,13 +632,15 @@ func (a *Application) runRootList(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer state.Close()
+	defer func() { _ = state.Close() }()
 	roots, err := state.ListSyncRoots(ctx)
 	if err != nil {
 		return err
 	}
 	w := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tSTATE\tINIT\tPOLL\tLOCAL\tREMOTE")
+	if _, err := fmt.Fprintln(w, "ID\tSTATE\tINIT\tPOLL\tLOCAL\tREMOTE"); err != nil {
+		return err
+	}
 	for _, root := range roots {
 		status := "paused"
 		if root.Enabled {
@@ -630,7 +654,9 @@ func (a *Application) runRootList(ctx context.Context, args []string) error {
 		if root.PollIntervalSeconds > 0 {
 			poll = (time.Duration(root.PollIntervalSeconds) * time.Second).String()
 		}
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s:%s\n", root.ID, status, initialized, poll, root.LocalRoot, root.RemoteName, root.RemoteRoot)
+		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s:%s\n", root.ID, status, initialized, poll, root.LocalRoot, root.RemoteName, root.RemoteRoot); err != nil {
+			return err
+		}
 	}
 	return w.Flush()
 }
@@ -650,7 +676,7 @@ func (a *Application) runRootEnabled(ctx context.Context, args []string, enabled
 	if err != nil {
 		return err
 	}
-	defer state.Close()
+	defer func() { _ = state.Close() }()
 	if err := state.SetSyncRootEnabled(ctx, id, enabled); err != nil {
 		return err
 	}
@@ -658,8 +684,8 @@ func (a *Application) runRootEnabled(ctx context.Context, args []string, enabled
 	if enabled {
 		action = "resumed"
 	}
-	fmt.Fprintf(a.stdout, "%s root %d\n", action, id)
-	return nil
+	_, err = fmt.Fprintf(a.stdout, "%s root %d\n", action, id)
+	return err
 }
 
 func (a *Application) runRootRemove(ctx context.Context, args []string) error {
@@ -677,19 +703,19 @@ func (a *Application) runRootRemove(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("root remove requires the foreground daemon and user service to be stopped: %w", err)
 	}
-	defer lease.Close()
+	defer func() { _ = lease.Close() }()
 
 	state, err := a.openState(ctx)
 	if err != nil {
 		return err
 	}
-	defer state.Close()
+	defer func() { _ = state.Close() }()
 	removed, err := daemon.RemoveRoot(ctx, state, id)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(a.stdout, "removed root %d\t%s\t<->\t%s:%s\t(data left unchanged)\n", removed.ID, removed.LocalRoot, removed.RemoteName, removed.RemoteRoot)
-	return nil
+	_, err = fmt.Fprintf(a.stdout, "removed root %d\t%s\t<->\t%s:%s\t(data left unchanged)\n", removed.ID, removed.LocalRoot, removed.RemoteName, removed.RemoteRoot)
+	return err
 }
 
 func (a *Application) runDaemon(ctx context.Context, args []string) error {
@@ -733,7 +759,7 @@ func (a *Application) runDaemon(ctx context.Context, args []string) error {
 		}
 		return err
 	}
-	defer lease.Close()
+	defer func() { _ = lease.Close() }()
 
 	if err := paths.PrepareConfig(); err != nil {
 		return err
@@ -745,7 +771,7 @@ func (a *Application) runDaemon(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer state.Close()
+	defer func() { _ = state.Close() }()
 	runner, err := a.newRunner(state, policy, a.reportRootEvent)
 	if err != nil {
 		return err
@@ -770,7 +796,7 @@ func (a *Application) openStateAt(ctx context.Context, paths apppaths.Paths) (*s
 
 func (a *Application) reportRootEvent(event daemon.RootEvent) {
 	if event.Err != nil {
-		fmt.Fprintf(a.stderr, "root %d %s: %v\n", event.RootID, event.Component, event.Err)
+		_, _ = fmt.Fprintf(a.stderr, "root %d %s: %v\n", event.RootID, event.Component, event.Err)
 		return
 	}
 	if !event.HasResult {
@@ -778,11 +804,11 @@ func (a *Application) reportRootEvent(event daemon.RootEvent) {
 	}
 	result := event.Result
 	if result.Blocked {
-		fmt.Fprintf(a.stderr, "root %d blocked: %s %s\n", event.RootID, result.BlockReason, result.BlockDetail)
+		_, _ = fmt.Fprintf(a.stderr, "root %d blocked: %s %s\n", event.RootID, result.BlockReason, result.BlockDetail)
 		return
 	}
 	if result.Applied != 0 || result.Conflicts != 0 || result.Recovered != 0 || (result.Initial && result.Initialized) {
-		fmt.Fprintf(a.stdout, "root %d cycle: applied=%d conflicts=%d recovered=%d initialized=%t\n", event.RootID, result.Applied, result.Conflicts, result.Recovered, result.Initialized)
+		_, _ = fmt.Fprintf(a.stdout, "root %d cycle: applied=%d conflicts=%d recovered=%d initialized=%t\n", event.RootID, result.Applied, result.Conflicts, result.Recovered, result.Initialized)
 	}
 }
 

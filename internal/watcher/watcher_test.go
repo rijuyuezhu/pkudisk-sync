@@ -22,7 +22,7 @@ func TestWatcherHintsExistingNestedWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	if err := os.WriteFile(filepath.Join(dir, "x.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
@@ -36,7 +36,7 @@ func TestWatcherAddsNewDirectoryBeforeCreateHint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 
 	dir := filepath.Join(root, "new")
 	if err := os.Mkdir(dir, 0o755); err != nil {

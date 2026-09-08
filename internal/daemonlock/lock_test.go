@@ -15,7 +15,7 @@ func TestAcquireIsExclusiveAndReusable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer first.Close()
+	defer func() { _ = first.Close() }()
 
 	if _, err := Acquire(runtimeDir); !errors.Is(err, ErrAlreadyRunning) {
 		t.Fatalf("second Acquire() error = %v, want ErrAlreadyRunning", err)

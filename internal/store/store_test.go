@@ -463,7 +463,7 @@ VALUES('old-root', '/tmp/old-root', 'pkudisk', 'Personal/Old', 1, 60, 1)`); err 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	root, ok, err := s.GetSyncRoot(ctx, 1)
 	if err != nil || !ok {
