@@ -47,6 +47,7 @@ type Application struct {
 	newRunner           func(*store.Store, reconcile.DeletePolicy, daemon.Reporter) (daemonRunner, error)
 	executablePath      func() (string, error)
 	newService          func(string) (userservice.Manager, error)
+	servicePaths        func() (apppaths.Paths, error)
 }
 
 func New(paths apppaths.Paths, stdout, stderr io.Writer) *Application {
@@ -72,6 +73,7 @@ func New(paths apppaths.Paths, stdout, stderr io.Writer) *Application {
 		},
 		executablePath: os.Executable,
 		newService:     userservice.New,
+		servicePaths:   apppaths.ServiceDefault,
 	}
 }
 
@@ -693,10 +695,18 @@ func (a *Application) runDaemon(ctx context.Context, args []string) error {
 		return fmt.Errorf("at least one daemon delete threshold must remain enabled")
 	}
 
-	if err := a.paths.PrepareRuntime(); err != nil {
+	paths := a.paths
+	if *serviceMode {
+		servicePaths, err := a.servicePaths()
+		if err != nil {
+			return fmt.Errorf("resolve service daemon paths: %w", err)
+		}
+		paths = servicePaths
+	}
+	if err := paths.PrepareRuntime(); err != nil {
 		return err
 	}
-	lease, err := daemonlock.Acquire(a.paths.RuntimeDir)
+	lease, err := daemonlock.Acquire(paths.RuntimeDir)
 	if err != nil {
 		if *serviceMode && errors.Is(err, daemonlock.ErrAlreadyRunning) {
 			return nil
@@ -705,13 +715,13 @@ func (a *Application) runDaemon(ctx context.Context, args []string) error {
 	}
 	defer lease.Close()
 
-	if err := a.paths.PrepareConfig(); err != nil {
+	if err := paths.PrepareConfig(); err != nil {
 		return err
 	}
-	if err := a.installRcloneConfig(a.paths.RcloneConfig); err != nil {
+	if err := a.installRcloneConfig(paths.RcloneConfig); err != nil {
 		return fmt.Errorf("install app rclone config: %w", err)
 	}
-	state, err := a.openState(ctx)
+	state, err := a.openStateAt(ctx, paths)
 	if err != nil {
 		return err
 	}
@@ -724,10 +734,14 @@ func (a *Application) runDaemon(ctx context.Context, args []string) error {
 }
 
 func (a *Application) openState(ctx context.Context) (*store.Store, error) {
-	if err := a.paths.PrepareState(); err != nil {
+	return a.openStateAt(ctx, a.paths)
+}
+
+func (a *Application) openStateAt(ctx context.Context, paths apppaths.Paths) (*store.Store, error) {
+	if err := paths.PrepareState(); err != nil {
 		return nil, err
 	}
-	state, err := store.Open(ctx, a.paths.StateDB)
+	state, err := store.Open(ctx, paths.StateDB)
 	if err != nil {
 		return nil, fmt.Errorf("open app state: %w", err)
 	}

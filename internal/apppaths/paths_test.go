@@ -28,6 +28,26 @@ func TestDefaultHonorsExplicitOverrides(t *testing.T) {
 	}
 }
 
+func TestServiceDefaultIgnoresExplicitOverrides(t *testing.T) {
+	want, err := ServiceDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := t.TempDir()
+	t.Setenv(envStateDB, filepath.Join(base, "state", "override.db"))
+	t.Setenv(envRcloneConfig, filepath.Join(base, "config", "override.conf"))
+	t.Setenv(envCacheDir, filepath.Join(base, "cache"))
+	t.Setenv(envRuntimeDir, filepath.Join(base, "runtime"))
+
+	got, err := ServiceDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("ServiceDefault() = %+v with overrides, want %+v", got, want)
+	}
+}
+
 func TestOverridesActive(t *testing.T) {
 	for _, name := range []string{envStateDB, envRcloneConfig, envCacheDir, envRuntimeDir} {
 		t.Setenv(name, "")

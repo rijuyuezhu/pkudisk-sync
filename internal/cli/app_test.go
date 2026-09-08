@@ -633,17 +633,19 @@ func TestDaemonRefusesSecondInstanceBeforeWiringRunner(t *testing.T) {
 }
 
 func TestServiceDaemonTreatsExistingOwnerAsCleanExit(t *testing.T) {
-	paths := cliTestPaths(t)
-	if err := paths.PrepareRuntime(); err != nil {
+	applicationPaths := cliTestPaths(t)
+	servicePaths := cliTestPaths(t)
+	if err := servicePaths.PrepareRuntime(); err != nil {
 		t.Fatal(err)
 	}
-	held, err := daemonlock.Acquire(paths.RuntimeDir)
+	held, err := daemonlock.Acquire(servicePaths.RuntimeDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer held.Close()
 
-	app := New(paths, &bytes.Buffer{}, &bytes.Buffer{})
+	app := New(applicationPaths, &bytes.Buffer{}, &bytes.Buffer{})
+	app.servicePaths = func() (apppaths.Paths, error) { return servicePaths, nil }
 	app.installRcloneConfig = func(string) error {
 		t.Fatal("service-mode lock conflict reached rclone config")
 		return nil

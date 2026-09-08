@@ -17,8 +17,10 @@ const (
 	envRuntimeDir   = "PKUDISK_SYNC_RUNTIME_DIR"
 )
 
-// OverridesActive reports whether this process is using explicit path
-// overrides that a login-managed background service would not inherit.
+// OverridesActive reports whether this process is using explicit PKUDISK_SYNC_*
+// path overrides. Service install/start reject them, while daemon --service
+// independently re-resolves ServiceDefault so inherited overrides cannot leak
+// into the supervised process.
 func OverridesActive() bool {
 	for _, name := range []string{envStateDB, envRcloneConfig, envCacheDir, envRuntimeDir} {
 		if os.Getenv(name) != "" {
@@ -40,16 +42,7 @@ type Paths struct {
 // Default returns platform-appropriate per-user paths, with explicit
 // environment overrides for packaging, tests, and advanced deployments.
 func Default() (Paths, error) {
-	runtimeDir := filepath.Join(xdg.RuntimeDir, appName)
-	if xdg.RuntimeDir == "" {
-		runtimeDir = filepath.Join(xdg.StateHome, appName, "runtime")
-	}
-	p := Paths{
-		StateDB:      filepath.Join(xdg.StateHome, appName, "state.db"),
-		RcloneConfig: filepath.Join(xdg.ConfigHome, appName, "rclone.conf"),
-		CacheDir:     filepath.Join(xdg.CacheHome, appName),
-		RuntimeDir:   runtimeDir,
-	}
+	p := platformDefaults()
 	if value := os.Getenv(envStateDB); value != "" {
 		p.StateDB = value
 	}
@@ -63,6 +56,26 @@ func Default() (Paths, error) {
 		p.RuntimeDir = value
 	}
 	return p.absolute()
+}
+
+// ServiceDefault returns the paths used by the installed login-managed daemon.
+// It deliberately ignores PKUDISK_SYNC_* overrides because a supervisor may
+// inherit a different environment from the shell that ran `service start`.
+func ServiceDefault() (Paths, error) {
+	return platformDefaults().absolute()
+}
+
+func platformDefaults() Paths {
+	runtimeDir := filepath.Join(xdg.RuntimeDir, appName)
+	if xdg.RuntimeDir == "" {
+		runtimeDir = filepath.Join(xdg.StateHome, appName, "runtime")
+	}
+	return Paths{
+		StateDB:      filepath.Join(xdg.StateHome, appName, "state.db"),
+		RcloneConfig: filepath.Join(xdg.ConfigHome, appName, "rclone.conf"),
+		CacheDir:     filepath.Join(xdg.CacheHome, appName),
+		RuntimeDir:   runtimeDir,
+	}
 }
 
 func (p Paths) absolute() (Paths, error) {

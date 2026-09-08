@@ -96,7 +96,7 @@ pkudisk-sync service stop
 pkudisk-sync root remove 1
 ```
 
-`install` registers but deliberately does not start synchronization immediately. Linux uses a `systemd --user` unit, macOS uses a LaunchAgent in `~/Library/LaunchAgents`, and Windows uses an interactive current-user Scheduled Task with limited privileges. The installed service always uses the platform default app paths; `service install` and `service start` therefore refuse `PKUDISK_SYNC_*` path overrides rather than checking or starting a different state database/runtime directory. Linux and macOS restart genuine daemon failures, but an already-owned single-instance lease is an intentional clean service exit rather than a restartable failure.
+`install` registers but deliberately does not start synchronization immediately. Linux uses a `systemd --user` unit, macOS uses a LaunchAgent in `~/Library/LaunchAgents`, and Windows uses an interactive current-user Scheduled Task with limited privileges. The installed service always uses the platform default app paths: `service install` and `service start` reject `PKUDISK_SYNC_*` path overrides in the invoking CLI, and the final supervisor-only `daemon --service` process independently re-resolves service-default paths while ignoring any such variables inherited from systemd, launchd, or Task Scheduler. This keeps the start preflight lease, SQLite state, rclone config, and running daemon on the same authority. Linux and macOS restart genuine daemon failures, but an already-owned single-instance lease is an intentional clean service exit rather than a restartable failure.
 
 ## Planned implementation order
 
