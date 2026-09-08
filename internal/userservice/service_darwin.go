@@ -3,7 +3,6 @@
 package userservice
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -112,10 +111,7 @@ func (m *launchctlManager) Status(ctx context.Context) (Status, error) {
 	}
 	output, runErr := m.run(ctx, "launchctl", "print", m.target)
 	if runErr == nil {
-		if bytes.Contains(output, []byte("state = running")) || len(bytes.TrimSpace(output)) > 0 {
-			return StatusActive, nil
-		}
-		return StatusInactive, nil
+		return parseLaunchctlStatus(output), nil
 	}
 	var exitErr *exec.ExitError
 	if errors.As(runErr, &exitErr) {
