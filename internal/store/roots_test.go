@@ -505,3 +505,38 @@ func TestCreateSyncRootRejectsPreinitializedRoot(t *testing.T) {
 		t.Fatal("expected preinitialized new root to be rejected")
 	}
 }
+
+func TestInitializedRootRequiresRepairForCopyModeTransition(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	root := testSyncRoot("copy-transition", filepath.Join(t.TempDir(), "Data"), "pkudisk", "Personal/Data")
+	root.Enabled = false
+	stored, err := s.CreateSyncRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InitializeSyncRoot(ctx, stored.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetSyncRootSymlinkMode(ctx, stored.ID, domain.SymlinkCopy); err == nil || !strings.Contains(err.Error(), "requires explicit re-pairing") {
+		t.Fatalf("follow -> copy error = %v", err)
+	}
+
+	// An uninitialized pairing may select copy directly.
+	copyRoot := testSyncRoot("copy-uninitialized", filepath.Join(t.TempDir(), "Work"), "pkudisk", "Personal/Work")
+	copyRoot.Enabled = false
+	copyStored, err := s.CreateSyncRoot(ctx, copyRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetSyncRootSymlinkMode(ctx, copyStored.ID, domain.SymlinkCopy); err != nil {
+		t.Fatalf("uninitialized -> copy: %v", err)
+	}
+	if err := s.InitializeSyncRoot(ctx, copyStored.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetSyncRootSymlinkMode(ctx, copyStored.ID, domain.SymlinkFollow); err == nil || !strings.Contains(err.Error(), "requires explicit re-pairing") {
+		t.Fatalf("copy -> follow error = %v", err)
+	}
+}

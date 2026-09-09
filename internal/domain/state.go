@@ -21,6 +21,9 @@ type SymlinkMode string
 const (
 	// SymlinkFollow dereferences links into the virtual sync namespace.
 	SymlinkFollow SymlinkMode = "follow"
+	// SymlinkCopy projects dereferenced link contents into the logical namespace
+	// without granting durable global ownership of the physical referent.
+	SymlinkCopy SymlinkMode = "copy"
 	// SymlinkReject makes any symlink a complete-local-scan error.
 	SymlinkReject SymlinkMode = "reject"
 	// SymlinkIgnore excludes every symlink path and its virtual subtree.
@@ -35,10 +38,10 @@ func ParseSymlinkMode(value string) (SymlinkMode, error) {
 		mode = SymlinkFollow
 	}
 	switch mode {
-	case SymlinkFollow, SymlinkReject, SymlinkIgnore:
+	case SymlinkFollow, SymlinkCopy, SymlinkReject, SymlinkIgnore:
 		return mode, nil
 	default:
-		return "", fmt.Errorf("invalid symlink mode %q; want follow, reject, or ignore", value)
+		return "", fmt.Errorf("invalid symlink mode %q; want follow, copy, reject, or ignore", value)
 	}
 }
 
@@ -135,11 +138,16 @@ type Operation struct {
 	SrcPath         string
 	DstPath         string
 	LocalTargetPath string
-	// LocalTargetIdentity is the physical anchor pinned with LocalTargetPath:
-	// the target object's identity when ExpectedLocal is present, otherwise
-	// the containing directory identity. Empty is retained only for migrated
-	// pre-v6 operations that must fail closed before automatic replay.
+	// LocalTargetIdentity is the operation-local anchor pinned with LocalTargetPath:
+	// the target/object identity when appropriate, otherwise the containing
+	// directory identity. Empty is retained only for incomplete legacy pins.
 	LocalTargetIdentity string
+	// LocalTargetAuthority says whether the pin is lexical, strict-follow
+	// physical ownership, or copy-mode operation-local physical authority.
+	LocalTargetAuthority LocalMutationAuthority
+	// LocalSymlinkTarget is the lexical readlink value for a copy-mode final
+	// symlink object. It is empty for ordinary paths and physical pins.
+	LocalSymlinkTarget string
 	ExpectedLocal       LocalFingerprint
 	ExpectedRemote      RemoteExpectation
 	Phase               OperationPhase
@@ -186,6 +194,22 @@ func (o Operation) Validate() error {
 		if o.LocalTargetPath == "" {
 			return fmt.Errorf("operation local target identity requires a pinned local target path")
 		}
+	}
+	if o.LocalTargetAuthority != "" {
+		if o.Kind != OperationEnsureLocal && o.Kind != OperationDeleteLocal {
+			return fmt.Errorf("operation kind %q must not carry local target authority", o.Kind)
+		}
+		if o.LocalTargetPath == "" || o.LocalTargetIdentity == "" {
+			return fmt.Errorf("operation local target authority requires a complete local target pin")
+		}
+		switch o.LocalTargetAuthority {
+		case LocalMutationLexical, LocalMutationFollowPhysical, LocalMutationCopyPhysical:
+		default:
+			return fmt.Errorf("invalid operation local target authority %q", o.LocalTargetAuthority)
+		}
+	}
+	if o.LocalSymlinkTarget != "" && o.LocalTargetAuthority != LocalMutationLexical && o.LocalTargetAuthority != LocalMutationCopyPhysical {
+		return fmt.Errorf("operation local symlink target requires lexical or copy-physical local target authority")
 	}
 	if err := o.ExpectedLocal.Validate(); err != nil {
 		return fmt.Errorf("operation expected local state: %w", err)

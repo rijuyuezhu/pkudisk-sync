@@ -66,6 +66,9 @@ func (s *Store) PrepareSyncRootCreate(ctx context.Context, root domain.SyncRoot)
 	if err := checkSyncRootAgainstFollowedClaims(ctx, conn, root); err != nil {
 		return fail(err)
 	}
+	if err := checkSyncRootAgainstCopyMutationPins(ctx, conn, root); err != nil {
+		return fail(err)
+	}
 	if root.CreatedAt.IsZero() {
 		root.CreatedAt = s.now()
 	} else {
@@ -130,6 +133,42 @@ func (s *Store) CreateSyncRoot(ctx context.Context, root domain.SyncRoot) (domai
 	}
 	defer func() { _ = reservation.Close() }()
 	return reservation.Commit(ctx)
+}
+
+func checkSyncRootAgainstCopyMutationPins(ctx context.Context, q rowsQuerier, candidate domain.SyncRoot) error {
+	rows, err := q.QueryContext(ctx, `
+SELECT id, sync_root_id, src_path, entry_kind, local_target_path, local_symlink_target
+FROM operations
+WHERE local_target_authority = 'copy-physical'
+  AND local_target_path <> ''
+ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("list in-flight copy-physical mutation pins: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var operationID, ownerRootID int64
+		var srcPath, kindRaw, targetPath, symlinkTarget string
+		if err := rows.Scan(&operationID, &ownerRootID, &srcPath, &kindRaw, &targetPath, &symlinkTarget); err != nil {
+			return fmt.Errorf("scan in-flight copy-physical mutation pin: %w", err)
+		}
+		kind := domain.EntryKind(kindRaw)
+		if kind != domain.KindFile && kind != domain.KindDir {
+			return fmt.Errorf("copy-physical operation %d has invalid entry kind %q", operationID, kindRaw)
+		}
+		if symlinkTarget != "" {
+			// A final copied symlink is a lexical object even when it resides
+			// below a copied directory. Its authority is only that pathname.
+			kind = domain.KindFile
+		}
+		if copyMutationOverlapsConfiguredRoot(candidate.LocalRoot, targetPath, kind) {
+			return fmt.Errorf("local sync root %q overlaps in-flight copy-physical operation %d from sync root %d path %q at %q", candidate.LocalRoot, operationID, ownerRootID, srcPath, targetPath)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate in-flight copy-physical mutation pins: %w", err)
+	}
+	return nil
 }
 
 func validateNewSyncRoot(root domain.SyncRoot) error {
@@ -215,6 +254,8 @@ func (s *Store) SetSyncRootEnabled(ctx context.Context, id int64, enabled bool) 
 
 // SetSyncRootSymlinkMode changes local symlink policy only while a root is
 // paused and has no pending operation created under the previous policy.
+// Copy changes pairing semantics, so an initialized pairing may not transition
+// to or from copy without an explicit remove/re-add (re-pair) lifecycle.
 func (s *Store) SetSyncRootSymlinkMode(ctx context.Context, id int64, mode domain.SymlinkMode) error {
 	if id <= 0 {
 		return fmt.Errorf("sync root ID must be positive")
@@ -228,7 +269,14 @@ UPDATE sync_roots
 SET symlink_mode = ?
 WHERE id = ?
   AND enabled = 0
-  AND NOT EXISTS (SELECT 1 FROM operations WHERE operations.sync_root_id = sync_roots.id)`, parsed, id)
+  AND NOT EXISTS (SELECT 1 FROM operations WHERE operations.sync_root_id = sync_roots.id)
+  AND NOT (
+      initialized = 1
+      AND (
+          (symlink_mode = 'copy' AND ? <> 'copy')
+          OR (symlink_mode <> 'copy' AND ? = 'copy')
+      )
+  )`, parsed, id, parsed, parsed)
 	if err != nil {
 		return fmt.Errorf("update sync root symlink mode: %w", err)
 	}
@@ -239,10 +287,15 @@ WHERE id = ?
 	if rows == 1 {
 		return nil
 	}
-	if _, ok, getErr := s.GetSyncRoot(ctx, id); getErr != nil {
+	root, ok, getErr := s.GetSyncRoot(ctx, id)
+	if getErr != nil {
 		return getErr
-	} else if !ok {
+	}
+	if !ok {
 		return fmt.Errorf("sync root %d not found", id)
+	}
+	if root.Initialized && (root.EffectiveSymlinkMode() == domain.SymlinkCopy) != (parsed == domain.SymlinkCopy) {
+		return fmt.Errorf("sync root %d is initialized; changing to or from symlink mode copy requires explicit re-pairing", id)
 	}
 	return fmt.Errorf("sync root %d must be paused and have no pending operations before changing symlink mode", id)
 }
@@ -331,6 +384,46 @@ func localRootContains(parent, child string) bool {
 
 func physicalOwnershipPathsOverlap(aPath string, aKind domain.EntryKind, bPath string, bKind domain.EntryKind) bool {
 	return physicalOwnershipPathsOverlapForOS(aPath, aKind, bPath, bKind, runtime.GOOS)
+}
+
+// physicalMutationPathname canonicalizes only the mutation path's parent. The
+// leaf pathname remains lexical so distinct hard links are distinct mutation
+// authorities, while parent aliases such as /var -> /private/var and Windows
+// short-name spellings converge when the parent is available.
+func physicalMutationPathname(value string) string {
+	value = filepath.Clean(value)
+	parent := filepath.Dir(value)
+	if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+		if abs, absErr := filepath.Abs(resolved); absErr == nil {
+			parent = filepath.Clean(abs)
+		} else {
+			parent = filepath.Clean(resolved)
+		}
+	}
+	return filepath.Join(parent, filepath.Base(value))
+}
+
+func physicalConfiguredRootPath(value string) string {
+	value = filepath.Clean(value)
+	resolved, err := filepath.EvalSymlinks(value)
+	if err != nil {
+		return value
+	}
+	if abs, absErr := filepath.Abs(resolved); absErr == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(resolved)
+}
+
+func copyMutationOverlapsConfiguredRoot(rootPath, targetPath string, targetKind domain.EntryKind) bool {
+	// Canonicalize the configured root as a directory object, but only the
+	// mutation parent. The target leaf remains pathname authority: native root
+	// aliases such as macOS /var -> /private/var converge without collapsing
+	// distinct hard-link leaf pathnames.
+	return physicalOwnershipPathsOverlap(
+		physicalConfiguredRootPath(rootPath), domain.KindDir,
+		physicalMutationPathname(targetPath), targetKind,
+	)
 }
 
 func physicalOwnershipPathsOverlapForOS(aPath string, aKind domain.EntryKind, bPath string, bKind domain.EntryKind, targetOS string) bool {

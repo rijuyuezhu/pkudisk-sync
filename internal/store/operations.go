@@ -34,10 +34,11 @@ func (s *Store) CreateOperation(ctx context.Context, operation domain.Operation)
 	result, err := s.db.ExecContext(ctx, `
 INSERT INTO operations(
     sync_root_id, kind, entry_kind, src_path, dst_path, local_target_path, local_target_identity,
+    local_target_authority, local_symlink_target,
     expected_local_present, expected_local_kind, expected_local_size, expected_local_mtime_ns,
     expected_remote_absent, expected_remote_id, expected_remote_rev,
     phase, attempts, last_error, created_at_ns, updated_at_ns
-) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		operation.SyncRootID,
 		string(operation.Kind),
 		string(operation.EntryKind),
@@ -45,6 +46,8 @@ INSERT INTO operations(
 		operation.DstPath,
 		operation.LocalTargetPath,
 		operation.LocalTargetIdentity,
+		string(operation.LocalTargetAuthority),
+		operation.LocalSymlinkTarget,
 		boolInt(operation.ExpectedLocal.Present),
 		string(operation.ExpectedLocal.Kind),
 		operation.ExpectedLocal.Size,
@@ -165,7 +168,7 @@ WHERE id = ? AND phase = ?`,
 
 const operationSelect = `
 SELECT id, sync_root_id, kind, entry_kind, src_path, dst_path,
-       local_target_path, local_target_identity,
+       local_target_path, local_target_identity, local_target_authority, local_symlink_target,
        expected_local_present, expected_local_kind, expected_local_size, expected_local_mtime_ns,
        expected_remote_absent, expected_remote_id, expected_remote_rev,
        phase, attempts, last_error, created_at_ns, updated_at_ns
@@ -173,7 +176,7 @@ FROM operations`
 
 func scanOperation(row rowScanner) (domain.Operation, error) {
 	var operation domain.Operation
-	var kind, entryKind, phase, expectedLocalKind string
+	var kind, entryKind, phase, expectedLocalKind, localTargetAuthority string
 	var localPresent, remoteAbsent int
 	var createdNS, updatedNS int64
 	if err := row.Scan(
@@ -185,6 +188,8 @@ func scanOperation(row rowScanner) (domain.Operation, error) {
 		&operation.DstPath,
 		&operation.LocalTargetPath,
 		&operation.LocalTargetIdentity,
+		&localTargetAuthority,
+		&operation.LocalSymlinkTarget,
 		&localPresent,
 		&expectedLocalKind,
 		&operation.ExpectedLocal.Size,
@@ -202,6 +207,7 @@ func scanOperation(row rowScanner) (domain.Operation, error) {
 	}
 	operation.Kind = domain.OperationKind(kind)
 	operation.EntryKind = domain.EntryKind(entryKind)
+	operation.LocalTargetAuthority = domain.LocalMutationAuthority(localTargetAuthority)
 	operation.ExpectedLocal.Present = localPresent != 0
 	if operation.ExpectedLocal.Present {
 		operation.ExpectedLocal.Kind = domain.EntryKind(expectedLocalKind)

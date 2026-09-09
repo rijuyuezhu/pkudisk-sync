@@ -10,7 +10,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 6
+const schemaVersion = 7
 
 // Store is the durable semantic authority for sync roots, committed baselines,
 // external-side-effect intents, and conflicts.
@@ -207,6 +207,46 @@ WHERE kind IN ('ensure-local', 'delete-local')
 			return fmt.Errorf("migrate local mutation authority v5 to v6: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 6"); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+		version = 6
+	}
+	if version == 6 {
+		// SQLite cannot alter a CHECK constraint in place. Rename the old mode
+		// column, add the expanded v7 column, copy values, then drop the legacy
+		// column. No pairing/baseline/claim data changes in this migration.
+		if _, err := tx.ExecContext(ctx, `
+ALTER TABLE sync_roots RENAME COLUMN symlink_mode TO symlink_mode_v6;
+ALTER TABLE sync_roots
+ADD COLUMN symlink_mode TEXT NOT NULL DEFAULT 'follow'
+CHECK (symlink_mode IN ('follow', 'copy', 'reject', 'ignore'));
+UPDATE sync_roots SET symlink_mode = symlink_mode_v6;
+ALTER TABLE sync_roots DROP COLUMN symlink_mode_v6`); err != nil {
+			return fmt.Errorf("migrate symlink mode constraint v6 to v7: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+ALTER TABLE operations
+ADD COLUMN local_target_authority TEXT NOT NULL DEFAULT ''
+CHECK (local_target_authority IN ('', 'lexical', 'follow-physical', 'copy-physical'));
+ALTER TABLE operations
+ADD COLUMN local_symlink_target TEXT NOT NULL DEFAULT '';
+
+-- v6 did not record whether a complete local pin was lexical or traversed a
+-- followed boundary, so v7 must not guess that authority from the root mode.
+-- Planned/unattempted local mutations have no external side effect and can
+-- safely discard their old pin so v7 resolves it again under the new model.
+-- Started legacy mutations retain path/identity for inspection but keep empty
+-- authority, causing automatic recovery to fail closed rather than inventing
+-- lexical/follow semantics after an upgrade.
+UPDATE operations
+SET local_target_path = '', local_target_identity = ''
+WHERE kind IN ('ensure-local', 'delete-local')
+  AND phase = 'planned'
+  AND attempts = 0
+  AND (local_target_path <> '' OR local_target_identity <> '')`); err != nil {
+			return fmt.Errorf("migrate operation-local authority v6 to v7: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 7"); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
 	}

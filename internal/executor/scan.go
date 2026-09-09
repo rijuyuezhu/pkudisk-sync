@@ -19,34 +19,35 @@ const tempNamePrefix = ".pkudisk-sync-tmp-"
 // ScanLocal performs a complete ordinary-files/directories walk under the
 // configured symlink policy. Excluded prefixes are intentionally outside local
 // authority for this cycle and must not be interpreted as deletions.
-func (e *RootExecutor) ScanLocal(ctx context.Context, operations []domain.Operation, peerLocalRoots []string) (map[string]domain.LocalFingerprint, []string, map[string]domain.FollowedPhysicalClaim, error) {
+func (e *RootExecutor) ScanLocal(ctx context.Context, operations []domain.Operation, peerLocalRoots []string) (map[string]domain.LocalFingerprint, []string, map[string]domain.FollowedPhysicalClaim, map[string]domain.CopyProjectionEvidence, error) {
 	entries := make(map[string]domain.LocalFingerprint)
 	var excluded []string
 	rootInfo, err := os.Stat(e.root.LocalRoot)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("scan local root %q: stat root: %w", e.root.LocalRoot, err)
+		return nil, nil, nil, nil, fmt.Errorf("scan local root %q: stat root: %w", e.root.LocalRoot, err)
 	}
 	if !rootInfo.IsDir() {
-		return nil, nil, nil, fmt.Errorf("scan local root %q: root is not a directory", e.root.LocalRoot)
+		return nil, nil, nil, nil, fmt.Errorf("scan local root %q: root is not a directory", e.root.LocalRoot)
 	}
 	ownedArtifacts, err := e.ownedOperationArtifacts(operations)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	rootIdentity, err := physicalObjectIdentity(e.root.LocalRoot, rootInfo)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("identify local root %q: %w", e.root.LocalRoot, err)
+		return nil, nil, nil, nil, fmt.Errorf("identify local root %q: %w", e.root.LocalRoot, err)
 	}
 	state := &localScanState{
 		claims:                 map[string]string{rootIdentity: "."},
 		ownedArtifacts:         ownedArtifacts,
 		peerLocalRoots:         peerLocalRoots,
 		followedPhysicalClaims: make(map[string]domain.FollowedPhysicalClaim),
+		copyProjectionEvidence: make(map[string]domain.CopyProjectionEvidence),
 	}
-	if err := e.scanLocalDir(ctx, e.root.LocalRoot, "", []os.FileInfo{rootInfo}, entries, &excluded, state); err != nil {
-		return nil, nil, nil, fmt.Errorf("scan local root %q: %w", e.root.LocalRoot, err)
+	if err := e.scanLocalDir(ctx, e.root.LocalRoot, "", []os.FileInfo{rootInfo}, false, entries, &excluded, state); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("scan local root %q: %w", e.root.LocalRoot, err)
 	}
-	return entries, excluded, state.followedPhysicalClaims, nil
+	return entries, excluded, state.followedPhysicalClaims, state.copyProjectionEvidence, nil
 }
 
 type localScanState struct {
@@ -54,6 +55,21 @@ type localScanState struct {
 	ownedArtifacts         map[string]struct{}
 	peerLocalRoots         []string
 	followedPhysicalClaims map[string]domain.FollowedPhysicalClaim
+	copyProjectionEvidence map[string]domain.CopyProjectionEvidence
+}
+
+func copyProjectionEvidenceFor(resolved string, info os.FileInfo) (domain.CopyProjectionEvidence, error) {
+	kind := domain.KindFile
+	if info.IsDir() {
+		kind = domain.KindDir
+	} else if !info.Mode().IsRegular() {
+		return domain.CopyProjectionEvidence{}, fmt.Errorf("unsupported copy projection target %q (%s)", resolved, info.Mode().Type())
+	}
+	identity, err := physicalObjectIdentity(resolved, info)
+	if err != nil {
+		return domain.CopyProjectionEvidence{}, err
+	}
+	return domain.CopyProjectionEvidence{Kind: kind, Identity: identity, TargetPath: filepath.Clean(resolved)}, nil
 }
 
 func (s *localScanState) claim(physicalPath, rel string, info os.FileInfo) (string, error) {
@@ -68,7 +84,7 @@ func (s *localScanState) claim(physicalPath, rel string, info os.FileInfo) (stri
 	return identity, nil
 }
 
-func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir string, ancestors []os.FileInfo, out map[string]domain.LocalFingerprint, excluded *[]string, state *localScanState) error {
+func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir string, ancestors []os.FileInfo, insideCopyProjection bool, out map[string]domain.LocalFingerprint, excluded *[]string, state *localScanState) error {
 	listed, err := os.ReadDir(physicalDir)
 	if err != nil {
 		return fmt.Errorf("read local directory %q: %w", relDir, err)
@@ -115,6 +131,55 @@ func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir str
 			case domain.SymlinkIgnore:
 				*excluded = append(*excluded, rel)
 				continue
+			case domain.SymlinkCopy:
+				resolved, present, resolveErr := resolveFollowedLocalPath(physicalPath, true)
+				if resolveErr != nil || !present {
+					// An unavailable projection is not local-deletion evidence.
+					*excluded = append(*excluded, rel)
+					continue
+				}
+				if err := rejectPeerRootPath(resolved, state.peerLocalRoots); err != nil {
+					return fmt.Errorf("copy symlink %q: %w", rel, err)
+				}
+				if err := e.rejectForeignRootTarget(resolved); err != nil {
+					return fmt.Errorf("copy symlink %q: %w", rel, err)
+				}
+				resolvedInfo, statErr := os.Stat(resolved)
+				if statErr != nil {
+					*excluded = append(*excluded, rel)
+					continue
+				}
+				if resolvedInfo.IsDir() {
+					resolvedIsAncestor, err := strictPhysicalPathAncestor(resolved, physicalDir)
+					if err != nil {
+						return fmt.Errorf("compare physical copy-symlink ancestry for %q: %w", rel, err)
+					}
+					if sameAsAny(resolvedInfo, ancestors) || resolvedIsAncestor {
+						*excluded = append(*excluded, rel)
+						continue
+					}
+					evidence, err := copyProjectionEvidenceFor(resolved, resolvedInfo)
+					if err != nil {
+						return fmt.Errorf("identify copy projection %q: %w", rel, err)
+					}
+					state.copyProjectionEvidence[rel] = evidence
+					out[rel] = domain.LocalFingerprint{Present: true, Kind: domain.KindDir}
+					if err := e.scanLocalDir(ctx, resolved, rel, append(ancestors, resolvedInfo), true, out, excluded, state); err != nil {
+						return err
+					}
+					continue
+				}
+				if resolvedInfo.Mode().IsRegular() {
+					evidence, err := copyProjectionEvidenceFor(resolved, resolvedInfo)
+					if err != nil {
+						return fmt.Errorf("identify copy projection %q: %w", rel, err)
+					}
+					state.copyProjectionEvidence[rel] = evidence
+					out[rel] = localFileFingerprint(resolvedInfo)
+					continue
+				}
+				*excluded = append(*excluded, rel)
+				continue
 			case domain.SymlinkFollow:
 				resolved, present, resolveErr := resolveFollowedLocalPath(physicalPath, true)
 				if resolveErr != nil {
@@ -157,7 +222,7 @@ func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir str
 					}
 					state.followedPhysicalClaims[rel] = domain.FollowedPhysicalClaim{Kind: domain.KindDir, Identity: identity, TargetPath: resolved}
 					out[rel] = domain.LocalFingerprint{Present: true, Kind: domain.KindDir}
-					if err := e.scanLocalDir(ctx, resolved, rel, append(ancestors, resolvedInfo), out, excluded, state); err != nil {
+					if err := e.scanLocalDir(ctx, resolved, rel, append(ancestors, resolvedInfo), false, out, excluded, state); err != nil {
 						return err
 					}
 					continue
@@ -186,16 +251,20 @@ func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir str
 				*excluded = append(*excluded, rel)
 				continue
 			}
-			if _, err := state.claim(physicalPath, rel, info); err != nil {
-				return err
+			if !insideCopyProjection {
+				if _, err := state.claim(physicalPath, rel, info); err != nil {
+					return err
+				}
 			}
 			out[rel] = domain.LocalFingerprint{Present: true, Kind: domain.KindDir}
-			if err := e.scanLocalDir(ctx, physicalPath, rel, append(ancestors, info), out, excluded, state); err != nil {
+			if err := e.scanLocalDir(ctx, physicalPath, rel, append(ancestors, info), insideCopyProjection, out, excluded, state); err != nil {
 				return err
 			}
 		case info.Mode().IsRegular():
-			if _, err := state.claim(physicalPath, rel, info); err != nil {
-				return err
+			if !insideCopyProjection {
+				if _, err := state.claim(physicalPath, rel, info); err != nil {
+					return err
+				}
 			}
 			out[rel] = localFileFingerprint(info)
 		default:
@@ -214,20 +283,51 @@ func (e *RootExecutor) ownedOperationArtifacts(operations []domain.Operation) (m
 		if op.LocalTargetPath == "" || (op.Kind != domain.OperationEnsureLocal && op.Kind != domain.OperationDeleteLocal) {
 			continue
 		}
+		plannedDownloadOnly := false
 		switch op.Phase {
 		case domain.OperationRunning, domain.OperationRecovering, domain.OperationBlocked:
+		case domain.OperationPlanned:
+			if !operationOwnsPlannedDownloadArtifact(op) {
+				continue
+			}
+			plannedDownloadOnly = true
 		default:
 			continue
 		}
 		if !filepath.IsAbs(op.LocalTargetPath) || filepath.Clean(op.LocalTargetPath) != op.LocalTargetPath {
 			return nil, fmt.Errorf("operation %d has invalid pinned local target %q", op.ID, op.LocalTargetPath)
 		}
+		if plannedDownloadOnly {
+			// A fully pinned, unattempted EnsureLocal may have created its exact
+			// download staging slot before the first user-data side effect. A hard
+			// crash cannot run the executor's deferred cleanup, so restart preflight
+			// must recognize only that exact disposable slot as journal-owned. It
+			// must not grant recovery-slot ownership before the operation has crossed
+			// the durable running boundary.
+			owned[operationPhysicalTempPath(op.LocalTargetPath, op.ID, "download")] = struct{}{}
+			continue
+		}
 		owned[operationPhysicalTempPath(op.LocalTargetPath, op.ID, "recovery")] = struct{}{}
-		if op.Kind == domain.OperationEnsureLocal {
+		if op.Kind == domain.OperationEnsureLocal && op.EntryKind == domain.KindFile {
 			owned[operationPhysicalTempPath(op.LocalTargetPath, op.ID, "download")] = struct{}{}
 		}
 	}
 	return owned, nil
+}
+
+func operationOwnsPlannedDownloadArtifact(op domain.Operation) bool {
+	if op.Kind != domain.OperationEnsureLocal || op.EntryKind != domain.KindFile || op.Phase != domain.OperationPlanned || op.Attempts != 0 || op.ID <= 0 {
+		return false
+	}
+	if op.LocalTargetPath == "" || op.LocalTargetIdentity == "" {
+		return false
+	}
+	switch op.LocalTargetAuthority {
+	case domain.LocalMutationLexical, domain.LocalMutationFollowPhysical, domain.LocalMutationCopyPhysical:
+		return true
+	default:
+		return false
+	}
 }
 
 func rejectPeerRootPath(physicalPath string, peerLocalRoots []string) error {

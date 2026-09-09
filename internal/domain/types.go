@@ -24,14 +24,47 @@ type FollowedPhysicalClaim struct {
 	TargetPath string
 }
 
-// LocalMutationTarget is the physical destination resolved immediately before
-// a local mutation is durably pinned. FollowedClaims contains every followed
-// symlink boundary traversed on the logical path so the store can bind the
-// mutation to the same global physical-ownership authority used by scans.
+// CopyProjectionEvidence records what one complete scan observed for a copy
+// symlink boundary. It is continuity evidence only: unlike
+// FollowedPhysicalClaim it grants no root-lifetime/global ownership.
+type CopyProjectionEvidence struct {
+	Kind       EntryKind
+	Identity   string
+	TargetPath string
+}
+
+// LocalMutationAuthority describes what one operation-local target pin means.
+// It is distinct from root-level followed physical ownership.
+type LocalMutationAuthority string
+
+const (
+	// LocalMutationLexical pins the lexical path/parent. Copy-mode final
+	// symlink leaves/roots use this authority so the referent is not owned.
+	LocalMutationLexical LocalMutationAuthority = "lexical"
+	// LocalMutationFollowPhysical is the strict follow-mode physical referent
+	// authority backed by durable FollowedPhysicalClaim ownership.
+	LocalMutationFollowPhysical LocalMutationAuthority = "follow-physical"
+	// LocalMutationCopyPhysical pins the physical destination reached through
+	// one or more copy-directory ancestors for this operation only.
+	LocalMutationCopyPhysical LocalMutationAuthority = "copy-physical"
+)
+
+// LocalMutationTarget is the destination resolved immediately before a local
+// mutation is durably pinned. FollowedClaims is populated only for strict
+// follow ownership; copy physical targets are operation-local authority.
 type LocalMutationTarget struct {
 	Path           string
 	AnchorIdentity string
+	Authority      LocalMutationAuthority
+	// SymlinkTarget is the lexical readlink value when a copy-mode final
+	// symlink object itself is the mutation authority. It is empty otherwise.
+	SymlinkTarget  string
 	FollowedClaims map[string]FollowedPhysicalClaim
+	// CopyProjectionEvidence contains the copy-symlink boundaries traversed
+	// while resolving this target. The syncer compares it with the evidence
+	// from the complete scan that produced the decision; it is never persisted
+	// as root-lifetime ownership.
+	CopyProjectionEvidence map[string]CopyProjectionEvidence
 }
 
 // LocalFingerprint is the local state used by reconciliation and local-side

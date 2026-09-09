@@ -212,8 +212,28 @@ func (s *Store) AuthorizeAndPinLocalMutation(ctx context.Context, operationID in
 	if target.AnchorIdentity == "" {
 		return false, "", fmt.Errorf("local mutation target %q has no physical anchor identity", target.Path)
 	}
-	if err := validateLocalMutationClaims(target.FollowedClaims); err != nil {
-		return false, "", err
+	authority := target.Authority
+	if authority == "" {
+		if len(target.FollowedClaims) > 0 {
+			authority = domain.LocalMutationFollowPhysical
+		} else {
+			authority = domain.LocalMutationLexical
+		}
+	}
+	switch authority {
+	case domain.LocalMutationLexical, domain.LocalMutationFollowPhysical, domain.LocalMutationCopyPhysical:
+	default:
+		return false, "", fmt.Errorf("invalid local mutation authority %q", authority)
+	}
+	if authority == domain.LocalMutationFollowPhysical {
+		if err := validateLocalMutationClaims(target.FollowedClaims); err != nil {
+			return false, "", err
+		}
+	} else if len(target.FollowedClaims) != 0 {
+		return false, "", fmt.Errorf("local mutation authority %q must not carry followed physical claims", authority)
+	}
+	if target.SymlinkTarget != "" && authority != domain.LocalMutationLexical && authority != domain.LocalMutationCopyPhysical {
+		return false, "", fmt.Errorf("local symlink target metadata requires lexical or copy-physical mutation authority")
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -232,12 +252,15 @@ func (s *Store) AuthorizeAndPinLocalMutation(ctx context.Context, operationID in
 	}
 
 	var rootID int64
-	var operationKind, srcPath, phase, pinned string
+	var operationKind, entryKindRaw, srcPath, phase, pinned string
+	var rootSymlinkMode string
 	var attempts int
 	if err := tx.QueryRowContext(ctx, `
-SELECT sync_root_id, kind, src_path, phase, attempts, local_target_path
+SELECT operations.sync_root_id, operations.kind, operations.entry_kind, operations.src_path, operations.phase,
+       operations.attempts, operations.local_target_path, sync_roots.symlink_mode
 FROM operations
-WHERE id = ?`, operationID).Scan(&rootID, &operationKind, &srcPath, &phase, &attempts, &pinned); err != nil {
+JOIN sync_roots ON sync_roots.id = operations.sync_root_id
+WHERE operations.id = ?`, operationID).Scan(&rootID, &operationKind, &entryKindRaw, &srcPath, &phase, &attempts, &pinned, &rootSymlinkMode); err != nil {
 		if err == sql.ErrNoRows {
 			return false, "", fmt.Errorf("operation %d not found", operationID)
 		}
@@ -252,74 +275,99 @@ WHERE id = ?`, operationID).Scan(&rootID, &operationKind, &srcPath, &phase, &att
 	if err := domain.ValidateRelPath(srcPath); err != nil {
 		return false, "", fmt.Errorf("operation %d source path: %w", operationID, err)
 	}
-
-	durable, err := listFollowedPhysicalClaimsTx(ctx, tx, rootID)
-	if err != nil {
-		return false, "", err
+	if authority == domain.LocalMutationCopyPhysical && rootSymlinkMode != string(domain.SymlinkCopy) {
+		return false, "", fmt.Errorf("copy-physical mutation authority requires root symlink mode copy")
 	}
-
-	for relPath, current := range target.FollowedClaims {
-		if !followedClaimAppliesToMutation(relPath, current.Kind, srcPath) {
-			return false, "", fmt.Errorf("followed claim %q does not belong to mutation path %q", relPath, srcPath)
+	if target.SymlinkTarget != "" && rootSymlinkMode != string(domain.SymlinkCopy) {
+		return false, "", fmt.Errorf("copy lexical symlink metadata requires root symlink mode copy")
+	}
+	if authority == domain.LocalMutationCopyPhysical {
+		targetKind := domain.EntryKind(entryKindRaw)
+		if targetKind != domain.KindFile && targetKind != domain.KindDir {
+			return false, "", fmt.Errorf("operation %d has invalid entry kind %q", operationID, entryKindRaw)
 		}
-		prior, exists := durable[relPath]
-		if !exists {
-			return false, fmt.Sprintf("followed %s %q appeared after the authoritative scan; rescan before mutating %q", current.Kind, relPath, srcPath), nil
+		if target.SymlinkTarget != "" {
+			targetKind = domain.KindFile
 		}
-		if prior.Kind != current.Kind {
-			return false, fmt.Sprintf("followed path %q changed kind from %q to %q before local mutation pin", relPath, prior.Kind, current.Kind), nil
-		}
-		if prior.TargetPath != "" && prior.TargetPath != current.TargetPath {
-			return false, fmt.Sprintf("followed %s %q changed physical target from %q to %q before local mutation pin", current.Kind, relPath, prior.TargetPath, current.TargetPath), nil
-		}
-		if current.Identity == "" {
-			if current.Kind != domain.KindFile {
-				return false, fmt.Sprintf("followed directory %q is unavailable at local mutation pin; directory identity continuity cannot be proven", relPath), nil
-			}
-			if prior.TargetPath == "" || prior.TargetPath != current.TargetPath {
-				return false, fmt.Sprintf("dangling followed file %q has no matching durable target authority", relPath), nil
-			}
-		}
-		if current.Kind == domain.KindDir && prior.Identity != current.Identity {
-			return false, fmt.Sprintf("followed directory %q changed physical identity from %q to %q before local mutation pin", relPath, prior.Identity, current.Identity), nil
-		}
-		if conflict, err := followedOwnershipConflictTx(ctx, tx, rootID, relPath, current, false); err != nil {
+		if conflict, err := copyMutationConfiguredRootConflictTx(ctx, tx, rootID, target.Path, targetKind); err != nil {
 			return false, "", err
 		} else if conflict != "" {
 			return false, conflict, nil
 		}
-		if current.Identity != "" && prior != current {
-			if _, err := tx.ExecContext(ctx, `
+	}
+
+	if authority == domain.LocalMutationFollowPhysical {
+		durable, err := listFollowedPhysicalClaimsTx(ctx, tx, rootID)
+		if err != nil {
+			return false, "", err
+		}
+
+		for relPath, current := range target.FollowedClaims {
+			if !followedClaimAppliesToMutation(relPath, current.Kind, srcPath) {
+				return false, "", fmt.Errorf("followed claim %q does not belong to mutation path %q", relPath, srcPath)
+			}
+			prior, exists := durable[relPath]
+			if !exists {
+				return false, fmt.Sprintf("followed %s %q appeared after the authoritative scan; rescan before mutating %q", current.Kind, relPath, srcPath), nil
+			}
+			if prior.Kind != current.Kind {
+				return false, fmt.Sprintf("followed path %q changed kind from %q to %q before local mutation pin", relPath, prior.Kind, current.Kind), nil
+			}
+			if prior.TargetPath != "" && prior.TargetPath != current.TargetPath {
+				return false, fmt.Sprintf("followed %s %q changed physical target from %q to %q before local mutation pin", current.Kind, relPath, prior.TargetPath, current.TargetPath), nil
+			}
+			if current.Identity == "" {
+				if current.Kind != domain.KindFile {
+					return false, fmt.Sprintf("followed directory %q is unavailable at local mutation pin; directory identity continuity cannot be proven", relPath), nil
+				}
+				if prior.TargetPath == "" || prior.TargetPath != current.TargetPath {
+					return false, fmt.Sprintf("dangling followed file %q has no matching durable target authority", relPath), nil
+				}
+			}
+			if current.Kind == domain.KindDir && prior.Identity != current.Identity {
+				return false, fmt.Sprintf("followed directory %q changed physical identity from %q to %q before local mutation pin", relPath, prior.Identity, current.Identity), nil
+			}
+			if conflict, err := followedOwnershipConflictTx(ctx, tx, rootID, relPath, current, false); err != nil {
+				return false, "", err
+			} else if conflict != "" {
+				return false, conflict, nil
+			}
+			if current.Identity != "" && prior != current {
+				if _, err := tx.ExecContext(ctx, `
 UPDATE followed_physical_claims
 SET physical_identity = ?, physical_target_path = ?
 WHERE sync_root_id = ? AND rel_path = ?`, current.Identity, current.TargetPath, rootID, relPath); err != nil {
-				return false, "", fmt.Errorf("refresh followed physical authority %q during local mutation pin: %w", relPath, err)
+					return false, "", fmt.Errorf("refresh followed physical authority %q during local mutation pin: %w", relPath, err)
+				}
 			}
 		}
-	}
 
-	for relPath, prior := range durable {
-		if !followedClaimAppliesToMutation(relPath, prior.Kind, srcPath) {
-			continue
+		for relPath, prior := range durable {
+			if !followedClaimAppliesToMutation(relPath, prior.Kind, srcPath) {
+				continue
+			}
+			if _, exists := target.FollowedClaims[relPath]; !exists {
+				return false, fmt.Sprintf("durable followed %s %q is no longer traversed while pinning local mutation %q", prior.Kind, relPath, srcPath), nil
+			}
 		}
-		if _, exists := target.FollowedClaims[relPath]; !exists {
-			return false, fmt.Sprintf("durable followed %s %q is no longer traversed while pinning local mutation %q", prior.Kind, relPath, srcPath), nil
-		}
-	}
 
-	if expected, hasBoundary, err := mutationTargetFromDeepestClaim(srcPath, target.FollowedClaims); err != nil {
-		return false, "", err
-	} else if hasBoundary {
-		if filepath.Clean(expected) != target.Path {
-			return false, fmt.Sprintf("resolved local mutation target %q is not derived from durable followed authority %q", target.Path, expected), nil
+		if expected, hasBoundary, err := mutationTargetFromDeepestClaim(srcPath, target.FollowedClaims); err != nil {
+			return false, "", err
+		} else if hasBoundary {
+			if filepath.Clean(expected) != target.Path {
+				return false, fmt.Sprintf("resolved local mutation target %q is not derived from durable followed authority %q", target.Path, expected), nil
+			}
 		}
 	}
 
 	result, err = tx.ExecContext(ctx, `
 UPDATE operations
-SET local_target_path = ?, local_target_identity = ?, updated_at_ns = ?
-WHERE id = ? AND phase = ? AND attempts = 0 AND local_target_path = '' AND local_target_identity = ''`,
-		target.Path, target.AnchorIdentity, s.now().UnixNano(), operationID, string(domain.OperationPlanned))
+SET local_target_path = ?, local_target_identity = ?, local_target_authority = ?,
+    local_symlink_target = ?, updated_at_ns = ?
+WHERE id = ? AND phase = ? AND attempts = 0 AND local_target_path = ''
+  AND local_target_identity = '' AND local_target_authority = ''`,
+		target.Path, target.AnchorIdentity, string(authority), target.SymlinkTarget,
+		s.now().UnixNano(), operationID, string(domain.OperationPlanned))
 	if err != nil {
 		return false, "", fmt.Errorf("pin authorized local mutation target: %w", err)
 	}
@@ -466,6 +514,28 @@ ORDER BY sync_root_id, rel_path`, rootID, relPath)
 	}
 	if err := rootRows.Err(); err != nil {
 		return "", fmt.Errorf("iterate configured roots for followed ownership: %w", err)
+	}
+	return "", nil
+}
+
+func copyMutationConfiguredRootConflictTx(ctx context.Context, tx *sql.Tx, rootID int64, targetPath string, targetKind domain.EntryKind) (string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, local_root FROM sync_roots WHERE id <> ? ORDER BY id`, rootID)
+	if err != nil {
+		return "", fmt.Errorf("list configured roots for copy mutation authority: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var peerRootID int64
+		var peerLocalRoot string
+		if err := rows.Scan(&peerRootID, &peerLocalRoot); err != nil {
+			return "", fmt.Errorf("scan configured root for copy mutation authority: %w", err)
+		}
+		if copyMutationOverlapsConfiguredRoot(peerLocalRoot, targetPath, targetKind) {
+			return fmt.Sprintf("copy-physical mutation target %q overlaps configured sync root %d at %q", targetPath, peerRootID, peerLocalRoot), nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("iterate configured roots for copy mutation authority: %w", err)
 	}
 	return "", nil
 }

@@ -469,6 +469,75 @@ func TestRunRootCycleDropsStalePlannedIntentThenReplans(t *testing.T) {
 	}
 }
 
+type failBeforeLocalSideEffectDataPlane struct {
+	*fakeDataPlane
+	failDelete bool
+}
+
+func (f *failBeforeLocalSideEffectDataPlane) DeleteLocal(ctx context.Context, op domain.Operation, peers []string, beginSideEffect func() error) error {
+	if f.failDelete {
+		f.failDelete = false
+		return fmt.Errorf("copy alias retargeted before first side effect")
+	}
+	return f.fakeDataPlane.DeleteLocal(ctx, op, peers, beginSideEffect)
+}
+
+func TestRunRootCycleDoesNotRecoverKnownUnstartedCopyDeleteAgainstStalePin(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	if err := state.SetSyncRootEnabled(ctx, root.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootSymlinkMode(ctx, root.ID, domain.SymlinkCopy); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootEnabled(ctx, root.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MarkSyncRootInitialized(ctx, root.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	local := localFileFP(4, 40)
+	remote := remoteFileFP("doc", "rev", 4)
+	if err := state.PutBaseline(ctx, domain.Baseline{SyncRootID: root.ID, RelPath: "alias/x.txt", Local: local, Remote: remote}); err != nil {
+		t.Fatal(err)
+	}
+	data := &failBeforeLocalSideEffectDataPlane{
+		fakeDataPlane: &fakeDataPlane{
+			local:  map[string]domain.LocalFingerprint{"alias/x.txt": local},
+			remote: make(map[string]domain.RemoteFingerprint),
+			mutationTargets: map[string]domain.LocalMutationTarget{
+				"alias/x.txt": {Path: filepath.Join(t.TempDir(), "A", "x.txt"), AnchorIdentity: "copy-a", Authority: domain.LocalMutationCopyPhysical},
+			},
+		},
+		failDelete: true,
+	}
+
+	if _, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1}); err == nil {
+		t.Fatal("known pre-side-effect failure unexpectedly succeeded")
+	}
+	if len(data.localOps) != 0 {
+		t.Fatalf("known pre-side-effect failure mutated local data: %+v", data.localOps)
+	}
+	if operations, err := state.ListOperations(ctx, root.ID); err != nil || len(operations) != 0 {
+		t.Fatalf("known-unstarted operation was retained for recovery: %+v err=%v", operations, err)
+	}
+
+	freshTarget := filepath.Join(t.TempDir(), "B", "x.txt")
+	data.mutationTargets["alias/x.txt"] = domain.LocalMutationTarget{Path: freshTarget, AnchorIdentity: "copy-b", Authority: domain.LocalMutationCopyPhysical}
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Blocked || result.Applied != 1 || result.Recovered != 0 {
+		t.Fatalf("fresh replan result = %+v", result)
+	}
+	if len(data.localOps) != 1 || data.localOps[0].LocalTargetPath != freshTarget {
+		t.Fatalf("fresh delete used stale pin: %+v", data.localOps)
+	}
+}
+
 func TestRunRootCycleRecoversAlreadyCompletedRunningDeleteWithoutReplay(t *testing.T) {
 	ctx := context.Background()
 	state, root := newCycleRoot(t, true, true)
@@ -586,14 +655,15 @@ func TestRunRootCycleBlocksWhenPinnedLocalRecoveryArtifactExists(t *testing.T) {
 	state, root := newCycleRoot(t, true, true)
 	target := filepath.Join(t.TempDir(), "outside-target.txt")
 	op, err := state.CreateOperation(ctx, domain.Operation{
-		SyncRootID:          root.ID,
-		Kind:                domain.OperationDeleteLocal,
-		EntryKind:           domain.KindFile,
-		SrcPath:             "linked.txt",
-		LocalTargetPath:     target,
-		LocalTargetIdentity: "test-anchor-linked",
-		ExpectedLocal:       localFileFP(4, 40),
-		ExpectedRemote:      domain.RemoteExpectation{Absent: true},
+		SyncRootID:           root.ID,
+		Kind:                 domain.OperationDeleteLocal,
+		EntryKind:            domain.KindFile,
+		SrcPath:              "linked.txt",
+		LocalTargetPath:      target,
+		LocalTargetIdentity:  "test-anchor-linked",
+		LocalTargetAuthority: domain.LocalMutationFollowPhysical,
+		ExpectedLocal:        localFileFP(4, 40),
+		ExpectedRemote:       domain.RemoteExpectation{Absent: true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -693,6 +763,151 @@ func TestRunRootCycleDeletesChildrenBeforeParentDirectory(t *testing.T) {
 	}
 	if got := strings.Join(data.calls, ","); got != "delete-remote-file:docs/a.txt,delete-remote-dir:docs" {
 		t.Fatalf("delete order = %q", got)
+	}
+}
+
+func TestRunRootCycleCopyProjectionDeleteOrdersDescendantsBeforeLexicalAlias(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	if err := state.SetSyncRootEnabled(ctx, root.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootSymlinkMode(ctx, root.ID, domain.SymlinkCopy); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootEnabled(ctx, root.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MarkSyncRootInitialized(ctx, root.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	local := map[string]domain.LocalFingerprint{
+		"alias":           localDirFP(),
+		"alias/a.txt":     localFileFP(1, 10),
+		"alias/sub":       localDirFP(),
+		"alias/sub/b.txt": localFileFP(1, 20),
+	}
+	remote := map[string]domain.RemoteFingerprint{
+		"alias":           remoteDirFP("dir-alias"),
+		"alias/a.txt":     remoteFileFP("doc-a", "rev-a", 1),
+		"alias/sub":       remoteDirFP("dir-sub"),
+		"alias/sub/b.txt": remoteFileFP("doc-b", "rev-b", 1),
+	}
+	for rel, localFP := range local {
+		if err := state.PutBaseline(ctx, domain.Baseline{SyncRootID: root.ID, RelPath: rel, Local: localFP, Remote: remote[rel]}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	physical := t.TempDir()
+	data := &fakeDataPlane{
+		local:  cloneLocal(local),
+		remote: make(map[string]domain.RemoteFingerprint),
+		mutationTargets: map[string]domain.LocalMutationTarget{
+			"alias":           {Path: filepath.Join(root.LocalRoot, "alias"), AnchorIdentity: "lexical-alias", Authority: domain.LocalMutationLexical},
+			"alias/a.txt":     {Path: filepath.Join(physical, "a.txt"), AnchorIdentity: "copy-a", Authority: domain.LocalMutationCopyPhysical},
+			"alias/sub":       {Path: filepath.Join(physical, "sub"), AnchorIdentity: "copy-sub", Authority: domain.LocalMutationCopyPhysical},
+			"alias/sub/b.txt": {Path: filepath.Join(physical, "sub", "b.txt"), AnchorIdentity: "copy-b", Authority: domain.LocalMutationCopyPhysical},
+		},
+	}
+
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Blocked || result.Applied != 4 {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if got := strings.Join(data.calls, ","); got != "delete-local:alias/sub/b.txt,delete-local:alias/a.txt,delete-local:alias/sub,delete-local:alias" {
+		t.Fatalf("copy projection delete order = %q", got)
+	}
+	if len(data.localOps) != 4 {
+		t.Fatalf("local operation count = %d, want 4", len(data.localOps))
+	}
+	for i, op := range data.localOps[:3] {
+		if op.LocalTargetAuthority != domain.LocalMutationCopyPhysical {
+			t.Fatalf("descendant operation %d authority = %q, want copy-physical", i, op.LocalTargetAuthority)
+		}
+	}
+	if got := data.localOps[3].LocalTargetAuthority; got != domain.LocalMutationLexical {
+		t.Fatalf("projection-root authority = %q, want lexical", got)
+	}
+}
+
+func TestRunRootCycleCopyProjectionMassDeleteGateMutatesNothing(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	if err := state.SetSyncRootEnabled(ctx, root.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootSymlinkMode(ctx, root.ID, domain.SymlinkCopy); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootEnabled(ctx, root.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MarkSyncRootInitialized(ctx, root.ID); err != nil {
+		t.Fatal(err)
+	}
+	local := map[string]domain.LocalFingerprint{
+		"alias":       localDirFP(),
+		"alias/a.txt": localFileFP(1, 10),
+	}
+	remote := map[string]domain.RemoteFingerprint{
+		"alias":       remoteDirFP("dir-alias"),
+		"alias/a.txt": remoteFileFP("doc-a", "rev-a", 1),
+	}
+	for rel, localFP := range local {
+		if err := state.PutBaseline(ctx, domain.Baseline{SyncRootID: root.ID, RelPath: rel, Local: localFP, Remote: remote[rel]}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data := &fakeDataPlane{local: cloneLocal(local), remote: make(map[string]domain.RemoteFingerprint)}
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 1, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Blocked || result.BlockReason != string(reconcile.BlockMassDeleteCount) {
+		t.Fatalf("cycle result = %+v", result)
+	}
+	if len(data.calls) != 0 || len(data.localOps) != 0 {
+		t.Fatalf("mass-delete gate allowed mutations: calls=%v ops=%+v", data.calls, data.localOps)
+	}
+	if operations, err := state.ListOperations(ctx, root.ID); err != nil || len(operations) != 0 {
+		t.Fatalf("mass-delete gate journaled operations: %+v err=%v", operations, err)
+	}
+}
+
+func TestRecoveredCopyDownloadProofUsesPinnedDestinationAfterAliasRetarget(t *testing.T) {
+	pinned := localFileFP(4, 40)
+	remote := remoteFileFP("doc", "rev", 4)
+	data := &fakeDataPlane{
+		local:       map[string]domain.LocalFingerprint{"alias/x.txt": localFileFP(9, 90)},
+		pinnedLocal: map[string]domain.LocalFingerprint{"alias/x.txt": pinned},
+		remote:      map[string]domain.RemoteFingerprint{"alias/x.txt": remote},
+		contentEqual: map[string]bool{
+			"alias/x.txt": true,
+		},
+	}
+	op := domain.Operation{
+		ID:                   99,
+		Kind:                 domain.OperationEnsureLocal,
+		EntryKind:            domain.KindFile,
+		SrcPath:              "alias/x.txt",
+		LocalTargetPath:      filepath.Join(t.TempDir(), "x.txt"),
+		LocalTargetIdentity:  "copy-x",
+		LocalTargetAuthority: domain.LocalMutationCopyPhysical,
+		ExpectedLocal:        domain.LocalFingerprint{},
+		ExpectedRemote:       expectationFromRemote(remote),
+		Phase:                domain.OperationRecovering,
+		Attempts:             1,
+	}
+	satisfied, gotLocal, gotRemote, err := proveRecoveredPostcondition(context.Background(), data, op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !satisfied || !domain.LocalEquivalent(gotLocal, pinned) || !domain.RemoteEquivalent(gotRemote, remote) {
+		t.Fatalf("pinned recovery proof = satisfied=%v local=%+v remote=%+v", satisfied, gotLocal, gotRemote)
 	}
 }
 
@@ -910,7 +1125,7 @@ func TestPinLocalMutationRejectsRetargetIntoPeerOwnedPhysicalTarget(t *testing.T
 		},
 	}
 
-	if _, err := pinLocalMutationTarget(ctx, state, data, op); err == nil || !strings.Contains(err.Error(), "authority changed before pin") {
+	if _, err := pinLocalMutationTarget(ctx, state, data, op, nil); err == nil || !strings.Contains(err.Error(), "authority changed before pin") {
 		t.Fatalf("retargeted peer-owned mutation pin error = %v", err)
 	}
 	if _, ok, err := state.GetOperation(ctx, op.ID); err != nil || ok {
@@ -922,6 +1137,188 @@ func TestPinLocalMutationRejectsRetargetIntoPeerOwnedPhysicalTarget(t *testing.T
 	}
 	if got := claimsB["peer.txt"]; got != claimB {
 		t.Fatalf("peer ownership changed during rejected pin: got=%+v want=%+v", got, claimB)
+	}
+}
+
+func TestPinLocalMutationRejectsCopyRetargetSinceCompleteScan(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	if err := state.SetSyncRootEnabled(ctx, root.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootSymlinkMode(ctx, root.ID, domain.SymlinkCopy); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootEnabled(ctx, root.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	expected := localFileFP(4, 40)
+	op, err := state.CreateOperation(ctx, domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationDeleteLocal,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "alias/x.txt",
+		ExpectedLocal:  expected,
+		ExpectedRemote: domain.RemoteExpectation{Absent: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetB := filepath.Join(t.TempDir(), "x.txt")
+	scanA := domain.CopyProjectionEvidence{Kind: domain.KindDir, Identity: "scan-a", TargetPath: filepath.Join(t.TempDir(), "A")}
+	currentB := domain.CopyProjectionEvidence{Kind: domain.KindDir, Identity: "pin-b", TargetPath: filepath.Dir(targetB)}
+	data := &fakeDataPlane{
+		local: map[string]domain.LocalFingerprint{"alias/x.txt": expected},
+		mutationTargets: map[string]domain.LocalMutationTarget{
+			"alias/x.txt": {
+				Path:           targetB,
+				AnchorIdentity: "copy-b-anchor",
+				Authority:      domain.LocalMutationCopyPhysical,
+				CopyProjectionEvidence: map[string]domain.CopyProjectionEvidence{
+					"alias": currentB,
+				},
+			},
+		},
+	}
+	scanEvidence := map[string]domain.CopyProjectionEvidence{"alias": scanA}
+	if _, err := pinLocalMutationTarget(ctx, state, data, op, scanEvidence); err == nil || !strings.Contains(err.Error(), "changed since complete scan") {
+		t.Fatalf("scan-to-pin copy retarget was accepted: %v", err)
+	}
+	if _, ok, err := state.GetOperation(ctx, op.ID); err != nil || ok {
+		t.Fatalf("stale copy operation survived scan-authority change: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRecoverExistingOperationsDiscardsUnpinnedCopyPlanWithoutScanEvidence(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	if err := state.SetSyncRootEnabled(ctx, root.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootSymlinkMode(ctx, root.ID, domain.SymlinkCopy); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootEnabled(ctx, root.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	op, err := state.CreateOperation(ctx, domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationDeleteLocal,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "alias/x.txt",
+		ExpectedLocal:  localFileFP(4, 40),
+		ExpectedRemote: domain.RemoteExpectation{Absent: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := &fakeDataPlane{}
+	blocked, recovered, err := recoverExistingOperations(ctx, state, data, []domain.Operation{op}, true)
+	if err != nil || blocked || recovered != 0 {
+		t.Fatalf("discard stale unpinned copy plan = blocked=%v recovered=%d err=%v", blocked, recovered, err)
+	}
+	if _, ok, err := state.GetOperation(ctx, op.ID); err != nil || ok {
+		t.Fatalf("unproven copy plan survived recovery preflight: ok=%v err=%v", ok, err)
+	}
+	if len(data.calls) != 0 {
+		t.Fatalf("unproven copy plan executed without fresh scan evidence: %v", data.calls)
+	}
+}
+
+func TestRecoverExistingOperationsCleansPlannedDownloadBeforeStaleDiscard(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, true)
+	expectedLocal := localFileFP(4, 40)
+	remote := remoteFileFP("doc", "rev", 4)
+	target := filepath.Join(t.TempDir(), "target.txt")
+	op, err := state.CreateOperation(ctx, domain.Operation{
+		SyncRootID:           root.ID,
+		Kind:                 domain.OperationEnsureLocal,
+		EntryKind:            domain.KindFile,
+		SrcPath:              "file.txt",
+		LocalTargetPath:      target,
+		LocalTargetIdentity:  "pinned-parent",
+		LocalTargetAuthority: domain.LocalMutationLexical,
+		ExpectedLocal:        expectedLocal,
+		ExpectedRemote:       expectationFromRemote(remote),
+		Phase:                domain.OperationPlanned,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(filepath.Dir(target), fmt.Sprintf(".pkudisk-sync-tmp-op-%d-download", op.ID))
+	if err := os.WriteFile(artifact, []byte("partial download"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data := &plannedDownloadCleanupDataPlane{
+		fakeDataPlane: &fakeDataPlane{
+			// Local state changed while the daemon was down, so the old planned
+			// operation must be discarded after restart cleanup.
+			local:  map[string]domain.LocalFingerprint{"file.txt": localFileFP(9, 90)},
+			remote: map[string]domain.RemoteFingerprint{"file.txt": remote},
+		},
+		artifact: artifact,
+	}
+	blocked, recovered, err := recoverExistingOperations(ctx, state, data, []domain.Operation{op}, false)
+	if err != nil || blocked || recovered != 0 {
+		t.Fatalf("recover stale planned download = blocked=%v recovered=%d err=%v", blocked, recovered, err)
+	}
+	if data.cleanupCalls != 1 {
+		t.Fatalf("planned download cleanup calls = %d, want 1", data.cleanupCalls)
+	}
+	if _, err := os.Lstat(artifact); !os.IsNotExist(err) {
+		t.Fatalf("discarded planned operation left download staging behind: %v", err)
+	}
+	if _, ok, err := state.GetOperation(ctx, op.ID); err != nil || ok {
+		t.Fatalf("stale planned operation survived recovery: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRecoverExistingOperationsCleansPlannedDownloadBeforeKnownUnstartedExecutorDiscard(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, true)
+	expectedLocal := localFileFP(4, 40)
+	remote := remoteFileFP("doc", "rev", 4)
+	target := filepath.Join(t.TempDir(), "target.txt")
+	op, err := state.CreateOperation(ctx, domain.Operation{
+		SyncRootID:           root.ID,
+		Kind:                 domain.OperationEnsureLocal,
+		EntryKind:            domain.KindFile,
+		SrcPath:              "alias/file.txt",
+		LocalTargetPath:      target,
+		LocalTargetIdentity:  "pinned-parent",
+		LocalTargetAuthority: domain.LocalMutationCopyPhysical,
+		ExpectedLocal:        expectedLocal,
+		ExpectedRemote:       expectationFromRemote(remote),
+		Phase:                domain.OperationPlanned,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(filepath.Dir(target), fmt.Sprintf(".pkudisk-sync-tmp-op-%d-download", op.ID))
+	if err := os.WriteFile(artifact, []byte("partial download"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data := &plannedDownloadCleanupDataPlane{
+		fakeDataPlane: &fakeDataPlane{
+			local:  map[string]domain.LocalFingerprint{"alias/file.txt": expectedLocal},
+			remote: map[string]domain.RemoteFingerprint{"alias/file.txt": remote},
+		},
+		artifact:                   artifact,
+		failEnsureBeforeSideEffect: true,
+	}
+	blocked, recovered, err := recoverExistingOperations(ctx, state, data, []domain.Operation{op}, false)
+	if err == nil || blocked || recovered != 0 {
+		t.Fatalf("known-unstarted executor failure = blocked=%v recovered=%d err=%v", blocked, recovered, err)
+	}
+	if data.cleanupCalls != 1 {
+		t.Fatalf("planned download cleanup calls = %d, want 1", data.cleanupCalls)
+	}
+	if _, err := os.Lstat(artifact); !os.IsNotExist(err) {
+		t.Fatalf("known-unstarted discard left download staging behind: %v", err)
+	}
+	if _, ok, err := state.GetOperation(ctx, op.ID); err != nil || ok {
+		t.Fatalf("known-unstarted planned operation survived executor failure: ok=%v err=%v", ok, err)
 	}
 }
 
@@ -940,7 +1337,7 @@ func TestPinLocalMutationRejectsIncompleteExistingPin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pinLocalMutationTarget(ctx, state, &fakeDataPlane{}, op); err == nil || !strings.Contains(err.Error(), "incomplete physical local target pin") {
+	if _, err := pinLocalMutationTarget(ctx, state, &fakeDataPlane{}, op, nil); err == nil || !strings.Contains(err.Error(), "incomplete physical local target pin") {
 		t.Fatalf("incomplete planned local pin was accepted: %v", err)
 	}
 }
@@ -958,16 +1355,17 @@ func TestRunRootCycleCleansStaleRecoveryAfterProvenPostcondition(t *testing.T) {
 		t.Fatal(err)
 	}
 	op, err := state.CreateOperation(ctx, domain.Operation{
-		SyncRootID:          root.ID,
-		Kind:                domain.OperationDeleteLocal,
-		EntryKind:           domain.KindFile,
-		SrcPath:             "gone.txt",
-		LocalTargetPath:     filepath.Join(root.LocalRoot, "gone.txt"),
-		LocalTargetIdentity: "test-anchor-gone",
-		ExpectedLocal:       baseline.Local,
-		ExpectedRemote:      domain.RemoteExpectation{Absent: true},
-		Phase:               domain.OperationRecovering,
-		Attempts:            1,
+		SyncRootID:           root.ID,
+		Kind:                 domain.OperationDeleteLocal,
+		EntryKind:            domain.KindFile,
+		SrcPath:              "gone.txt",
+		LocalTargetPath:      filepath.Join(root.LocalRoot, "gone.txt"),
+		LocalTargetIdentity:  "test-anchor-gone",
+		LocalTargetAuthority: domain.LocalMutationLexical,
+		ExpectedLocal:        baseline.Local,
+		ExpectedRemote:       domain.RemoteExpectation{Absent: true},
+		Phase:                domain.OperationRecovering,
+		Attempts:             1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1043,13 +1441,17 @@ func assertRootInitialized(t *testing.T, state *store.Store, rootID int64, want 
 
 type fakeDataPlane struct {
 	local                map[string]domain.LocalFingerprint
+	pinnedLocal          map[string]domain.LocalFingerprint
+	pinnedNonOrdinary    map[string]bool
 	remote               map[string]domain.RemoteFingerprint
 	followedClaims       map[string]domain.FollowedPhysicalClaim
+	copyEvidence         map[string]domain.CopyProjectionEvidence
 	mutationTargets      map[string]domain.LocalMutationTarget
 	excluded             []string
 	remoteRootMissing    bool
 	contentEqual         map[string]bool
 	calls                []string
+	localOps             []domain.Operation
 	scans                int
 	revCounter           int
 	uploadPostOverride   map[string]domain.RemoteFingerprint
@@ -1067,6 +1469,28 @@ type recoveryArtifactDataPlane struct {
 	cleaned  bool
 }
 
+type plannedDownloadCleanupDataPlane struct {
+	*fakeDataPlane
+	artifact                   string
+	cleanupCalls               int
+	failEnsureBeforeSideEffect bool
+}
+
+func (f *plannedDownloadCleanupDataPlane) CleanupLocalDownloadArtifact(context.Context, domain.Operation) error {
+	f.cleanupCalls++
+	if err := os.Remove(f.artifact); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (f *plannedDownloadCleanupDataPlane) EnsureLocalFile(ctx context.Context, op domain.Operation, peerRoots []string, beginSideEffect func() error) (domain.LocalFingerprint, error) {
+	if f.failEnsureBeforeSideEffect {
+		return domain.LocalFingerprint{}, fmt.Errorf("local symlink target changed before download for %q", op.SrcPath)
+	}
+	return f.fakeDataPlane.EnsureLocalFile(ctx, op, peerRoots, beginSideEffect)
+}
+
 func (f *recoveryArtifactDataPlane) LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error) {
 	return f.artifact, true, nil
 }
@@ -1082,9 +1506,9 @@ func (f *cancelUploadDataPlane) Upload(ctx context.Context, _ string, _ domain.L
 	return domain.RemoteFingerprint{}, ctx.Err()
 }
 
-func (f *fakeDataPlane) ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]domain.FollowedPhysicalClaim, error) {
+func (f *fakeDataPlane) ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]domain.FollowedPhysicalClaim, map[string]domain.CopyProjectionEvidence, error) {
 	f.scans++
-	return cloneLocal(f.local), append([]string(nil), f.excluded...), cloneFollowedClaims(f.followedClaims), nil
+	return cloneLocal(f.local), append([]string(nil), f.excluded...), cloneFollowedClaims(f.followedClaims), cloneCopyEvidence(f.copyEvidence), nil
 }
 
 func (f *fakeDataPlane) ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error) {
@@ -1096,11 +1520,21 @@ func (f *fakeDataPlane) ObserveLocalEntry(_ context.Context, rel string) (domain
 	return f.local[rel], nil
 }
 
+func (f *fakeDataPlane) ObservePinnedLocalEntry(_ context.Context, op domain.Operation) (domain.LocalFingerprint, bool, error) {
+	if f.pinnedNonOrdinary[op.SrcPath] {
+		return domain.LocalFingerprint{}, false, nil
+	}
+	if pinned, ok := f.pinnedLocal[op.SrcPath]; ok {
+		return pinned, true, nil
+	}
+	return f.local[op.SrcPath], true, nil
+}
+
 func (f *fakeDataPlane) ObserveRemoteEntry(_ context.Context, rel string) (domain.RemoteFingerprint, error) {
 	return f.remote[rel], nil
 }
 
-func (f *fakeDataPlane) ResolveLocalMutationTarget(_ context.Context, rel string, expected domain.LocalFingerprint, _ domain.EntryKind) (domain.LocalMutationTarget, error) {
+func (f *fakeDataPlane) ResolveLocalMutationTarget(_ context.Context, rel string, expected domain.LocalFingerprint, _ domain.EntryKind, _ []string) (domain.LocalMutationTarget, error) {
 	if !domain.LocalEquivalent(f.local[rel], expected) {
 		return domain.LocalMutationTarget{}, fmt.Errorf("local target precondition mismatch for %q", rel)
 	}
@@ -1113,8 +1547,17 @@ func (f *fakeDataPlane) ResolveLocalMutationTarget(_ context.Context, rel string
 	}, nil
 }
 
+func (f *fakeDataPlane) PinnedLocalPreconditionHolds(ctx context.Context, op domain.Operation) (bool, error) {
+	current, ordinary, err := f.ObservePinnedLocalEntry(ctx, op)
+	return err == nil && ordinary && domain.LocalEquivalent(current, op.ExpectedLocal), err
+}
+
 func (f *fakeDataPlane) LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error) {
 	return "", false, nil
+}
+
+func (f *fakeDataPlane) CleanupLocalDownloadArtifact(context.Context, domain.Operation) error {
+	return nil
 }
 
 func (f *fakeDataPlane) CleanupLocalRecoveryArtifact(context.Context, domain.Operation) error {
@@ -1127,6 +1570,21 @@ func (f *fakeDataPlane) CompareFileContent(_ context.Context, rel string, local 
 	}
 	f.calls = append(f.calls, "compare:"+rel)
 	return f.contentEqual[rel], nil
+}
+
+func (f *fakeDataPlane) ComparePinnedFileContent(ctx context.Context, op domain.Operation, remote domain.RemoteExpectation) (bool, error) {
+	local, ordinary, err := f.ObservePinnedLocalEntry(ctx, op)
+	if err != nil {
+		return false, err
+	}
+	if !ordinary || !fakeRemoteMatches(f.remote[op.SrcPath], remote, domain.KindFile) {
+		return false, fmt.Errorf("pinned compare precondition mismatch for %q", op.SrcPath)
+	}
+	if !local.Present || local.Kind != domain.KindFile {
+		return false, nil
+	}
+	f.calls = append(f.calls, "compare:"+op.SrcPath)
+	return f.contentEqual[op.SrcPath], nil
 }
 
 func (f *fakeDataPlane) Upload(_ context.Context, rel string, local domain.LocalFingerprint, remote domain.RemoteExpectation) (domain.RemoteFingerprint, error) {
@@ -1164,10 +1622,13 @@ func (f *fakeDataPlane) EnsureRemoteDir(_ context.Context, rel string, expected 
 	return nil
 }
 
-func (f *fakeDataPlane) EnsureLocalFile(_ context.Context, op domain.Operation) (domain.LocalFingerprint, error) {
+func (f *fakeDataPlane) EnsureLocalFile(_ context.Context, op domain.Operation, _ []string, beginSideEffect func() error) (domain.LocalFingerprint, error) {
 	rel := op.SrcPath
 	if !domain.LocalEquivalent(f.local[rel], op.ExpectedLocal) || !fakeRemoteMatches(f.remote[rel], op.ExpectedRemote, domain.KindFile) {
 		return domain.LocalFingerprint{}, fmt.Errorf("local file precondition mismatch for %q", rel)
+	}
+	if err := beginSideEffect(); err != nil {
+		return domain.LocalFingerprint{}, err
 	}
 	f.calls = append(f.calls, "ensure-local-file:"+rel)
 	remote := f.remote[rel]
@@ -1185,11 +1646,14 @@ func (f *fakeDataPlane) EnsureLocalFile(_ context.Context, op domain.Operation) 
 	return written, nil
 }
 
-func (f *fakeDataPlane) EnsureLocalDir(_ context.Context, op domain.Operation) error {
+func (f *fakeDataPlane) EnsureLocalDir(_ context.Context, op domain.Operation, _ []string, beginSideEffect func() error) error {
 	rel := op.SrcPath
 	expected := op.ExpectedLocal
 	if !domain.LocalEquivalent(f.local[rel], expected) || expected.Present {
 		return fmt.Errorf("local dir precondition mismatch for %q", rel)
+	}
+	if err := beginSideEffect(); err != nil {
+		return err
 	}
 	f.calls = append(f.calls, "ensure-local-dir:"+rel)
 	f.local[rel] = localDirFP()
@@ -1222,7 +1686,7 @@ func (f *fakeDataPlane) DeleteRemoteDir(_ context.Context, expected domain.Remot
 	return nil
 }
 
-func (f *fakeDataPlane) DeleteLocal(_ context.Context, op domain.Operation) error {
+func (f *fakeDataPlane) DeleteLocal(_ context.Context, op domain.Operation, _ []string, beginSideEffect func() error) error {
 	rel := op.SrcPath
 	expected := op.ExpectedLocal
 	if !domain.LocalEquivalent(f.local[rel], expected) {
@@ -1236,7 +1700,11 @@ func (f *fakeDataPlane) DeleteLocal(_ context.Context, op domain.Operation) erro
 			}
 		}
 	}
+	if err := beginSideEffect(); err != nil {
+		return err
+	}
 	f.calls = append(f.calls, "delete-local:"+rel)
+	f.localOps = append(f.localOps, op)
 	delete(f.local, rel)
 	return nil
 }
@@ -1265,6 +1733,14 @@ func cloneFollowedClaims(in map[string]domain.FollowedPhysicalClaim) map[string]
 			claim.TargetPath = fakeFollowedTarget(rel)
 		}
 		out[rel] = claim
+	}
+	return out
+}
+
+func cloneCopyEvidence(in map[string]domain.CopyProjectionEvidence) map[string]domain.CopyProjectionEvidence {
+	out := make(map[string]domain.CopyProjectionEvidence, len(in))
+	for rel, evidence := range in {
+		out[rel] = evidence
 	}
 	return out
 }

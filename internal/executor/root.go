@@ -64,10 +64,10 @@ func NewRoot(ctx context.Context, root domain.SyncRoot, remoteConfig configmap.M
 	}
 
 	localConfig := configmap.Simple{}
-	if root.EffectiveSymlinkMode() == domain.SymlinkFollow {
+	if mode := root.EffectiveSymlinkMode(); mode == domain.SymlinkFollow || mode == domain.SymlinkCopy {
 		// Match rclone --copy-links for source reads. Local mutation code still
-		// resolves the physical target explicitly so downloads never replace the
-		// symlink object itself.
+		// chooses strict-follow physical ownership versus copy lexical/materialized
+		// mutation semantics explicitly; source reads only need projection content.
 		localConfig["copy_links"] = "true"
 	}
 	localFS, err := local.NewFs(ctx, "local", root.LocalRoot, localConfig)

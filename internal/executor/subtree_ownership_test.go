@@ -24,7 +24,7 @@ func TestScanLocalFollowRejectsParentContainingConfiguredPeerRoot(t *testing.T) 
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	_, _, _, err := exec.ScanLocal(context.Background(), nil, []string{peer})
+	_, _, _, _, err := exec.ScanLocal(context.Background(), nil, []string{peer})
 	if err == nil || !strings.Contains(err.Error(), "contains configured sync root") {
 		t.Fatalf("followed parent containing configured peer root error = %v", err)
 	}
