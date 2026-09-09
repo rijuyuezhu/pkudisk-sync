@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
 )
 
@@ -1292,7 +1293,7 @@ func (e *RootExecutor) CompareFileContent(ctx context.Context, relPath string, e
 	if err != nil {
 		return false, fmt.Errorf("open remote comparison source %q: %w", relPath, err)
 	}
-	remoteReader, err := remoteObject.Open(ctx,
+	remoteReader, err := operations.Open(ctx, remoteObject,
 		&fs.HTTPOption{Key: syncExpectedIDDownloadHeader, Value: expectedRemote.ID},
 		&fs.HTTPOption{Key: syncExpectedRevDownloadHeader, Value: expectedRemote.Rev},
 	)
@@ -1412,17 +1413,19 @@ func readersEqual(left, right io.Reader) (bool, error) {
 	for {
 		ln, le := io.ReadFull(left, leftBuf)
 		rn, re := io.ReadFull(right, rightBuf)
+		leftDone := le == io.EOF || le == io.ErrUnexpectedEOF
+		rightDone := re == io.EOF || re == io.ErrUnexpectedEOF
+		if le != nil && !leftDone {
+			return false, fmt.Errorf("read local comparison file: %w", le)
+		}
+		if re != nil && !rightDone {
+			return false, fmt.Errorf("read downloaded comparison file: %w", re)
+		}
 		if ln != rn || string(leftBuf[:ln]) != string(rightBuf[:rn]) {
 			return false, nil
 		}
-		if le == io.EOF || le == io.ErrUnexpectedEOF || re == io.EOF || re == io.ErrUnexpectedEOF {
-			return (le == io.EOF || le == io.ErrUnexpectedEOF) && (re == io.EOF || re == io.ErrUnexpectedEOF), nil
-		}
-		if le != nil {
-			return false, fmt.Errorf("read local comparison file: %w", le)
-		}
-		if re != nil {
-			return false, fmt.Errorf("read downloaded comparison file: %w", re)
+		if leftDone || rightDone {
+			return leftDone && rightDone, nil
 		}
 	}
 }
