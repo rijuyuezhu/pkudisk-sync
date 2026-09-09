@@ -1,6 +1,6 @@
 # Operations guide
 
-This guide covers day-to-day configuration, recovery, and native background-service behavior. The current public pre-release is `v0.1.0-alpha.2`; newer development commits may still require building from source until another release is published.
+This guide covers day-to-day configuration, recovery, and native background-service behavior. The current public pre-release is `v0.1.0-alpha.3`; newer development commits may still require building from source until another release is published.
 
 ## Build from source
 
