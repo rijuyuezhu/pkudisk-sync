@@ -1266,10 +1266,10 @@ func (e *RootExecutor) CommitDownloadedTemp(ctx context.Context, relPath, tempRe
 	return temp, nil
 }
 
-// CompareFileContent obtains the exact planned remote revision through the same
-// guarded download path and compares it byte-for-byte with an unchanged local
-// file. Comparison staging lives outside the sync root so a hard crash cannot
-// leave an unowned reserved path that wedges the next complete scan.
+// CompareFileContent opens the exact planned remote revision as a guarded
+// stream and compares it byte-for-byte with an unchanged local file. Plan-time
+// comparison creates no local staging artifact, so a crash cannot leak internal
+// bytes into any lexical or projected sync namespace.
 func (e *RootExecutor) CompareFileContent(ctx context.Context, relPath string, expectedLocal domain.LocalFingerprint, expectedRemote domain.RemoteExpectation) (bool, error) {
 	if err := validateFilePathAndLocalExpectation(relPath, expectedLocal); err != nil {
 		return false, err
@@ -1288,21 +1288,24 @@ func (e *RootExecutor) CompareFileContent(ctx context.Context, relPath string, e
 		return false, fmt.Errorf("local content comparison precondition failed for %q", relPath)
 	}
 
-	tempDir, err := newComparisonTempDir(e.root.LocalRoot)
+	remoteObject, err := e.remote.NewObject(ctx, relPath)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("open remote comparison source %q: %w", relPath, err)
 	}
-	defer func() { _ = os.RemoveAll(tempDir) }()
-	tempPath := filepath.Join(tempDir, "remote")
-	if err := e.downloadToPhysicalTemp(ctx, relPath, tempPath, expectedRemote); err != nil {
-		return false, err
+	remoteReader, err := remoteObject.Open(ctx,
+		&fs.HTTPOption{Key: syncExpectedIDDownloadHeader, Value: expectedRemote.ID},
+		&fs.HTTPOption{Key: syncExpectedRevDownloadHeader, Value: expectedRemote.Rev},
+	)
+	if err != nil {
+		return false, fmt.Errorf("open exact remote revision %q: %w", relPath, err)
+	}
+	localPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
+	equal, compareErr := fileReaderEqual(localPath, remoteReader)
+	_ = remoteReader.Close()
+	if compareErr != nil {
+		return false, compareErr
 	}
 
-	localPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
-	equal, err := filesEqual(localPath, tempPath)
-	if err != nil {
-		return false, err
-	}
 	after, err := e.ObserveLocalEntry(ctx, relPath)
 	if err != nil {
 		return false, err
@@ -1380,24 +1383,13 @@ func newTempName() (string, error) {
 	return tempNamePrefix + hex.EncodeToString(random[:]), nil
 }
 
-func newComparisonTempDir(localRoot string) (string, error) {
-	tempRoot, err := filepath.EvalSymlinks(os.TempDir())
+func fileReaderEqual(localPath string, remote io.Reader) (bool, error) {
+	local, err := os.Open(localPath)
 	if err != nil {
-		return "", fmt.Errorf("resolve system temporary directory: %w", err)
+		return false, fmt.Errorf("open local comparison file: %w", err)
 	}
-	tempRoot, err = filepath.Abs(tempRoot)
-	if err != nil {
-		return "", fmt.Errorf("canonicalize system temporary directory: %w", err)
-	}
-	rel, relErr := filepath.Rel(filepath.Clean(localRoot), filepath.Clean(tempRoot))
-	if relErr == nil && filepath.IsLocal(rel) {
-		return "", fmt.Errorf("system temporary directory %q is inside sync root %q", tempRoot, localRoot)
-	}
-	dir, err := os.MkdirTemp(tempRoot, "pkudisk-sync-compare-*")
-	if err != nil {
-		return "", fmt.Errorf("create content comparison temp directory: %w", err)
-	}
-	return dir, nil
+	defer func() { _ = local.Close() }()
+	return readersEqual(local, remote)
 }
 
 func filesEqual(a, b string) (bool, error) {
@@ -1411,7 +1403,10 @@ func filesEqual(a, b string) (bool, error) {
 		return false, fmt.Errorf("open downloaded comparison file: %w", err)
 	}
 	defer func() { _ = right.Close() }()
+	return readersEqual(left, right)
+}
 
+func readersEqual(left, right io.Reader) (bool, error) {
 	leftBuf := make([]byte, 256*1024)
 	rightBuf := make([]byte, 256*1024)
 	for {

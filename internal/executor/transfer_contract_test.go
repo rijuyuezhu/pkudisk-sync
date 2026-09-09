@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,6 +46,27 @@ func (o *fingerprintObject) Size() int64                       { return o.size }
 func (o *fingerprintObject) ModTime(context.Context) time.Time { return o.mtime }
 func (o *fingerprintObject) Metadata(context.Context) (fs.Metadata, error) {
 	return fs.Metadata{"rev": o.rev}, nil
+}
+
+type guardedContentObject struct {
+	fingerprintObject
+	t    *testing.T
+	data string
+}
+
+func (o *guardedContentObject) Open(_ context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	o.t.Helper()
+	got := map[string]string{}
+	for _, option := range options {
+		key, value := option.Header()
+		if key != "" {
+			got[key] = value
+		}
+	}
+	if got[syncExpectedIDDownloadHeader] != o.id || got[syncExpectedRevDownloadHeader] != o.rev {
+		o.t.Fatalf("guarded stream options = %#v, want id=%q rev=%q", got, o.id, o.rev)
+	}
+	return io.NopCloser(strings.NewReader(o.data)), nil
 }
 
 func testLocalFS(t *testing.T, root string) fs.Fs {
@@ -352,13 +374,22 @@ func TestCommitDownloadedTempRevalidatesRemoteAndMovesNoReplace(t *testing.T) {
 	}
 }
 
-func TestCompareFileContentUsesGuardedDownloadAndRevalidatesBothSides(t *testing.T) {
+func TestCompareFileContentStreamsGuardedRevisionWithoutStaging(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("same"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}, local: testLocalFS(t, root)}
+	remoteObject := &guardedContentObject{
+		fingerprintObject: fingerprintObject{remote: "a.txt", id: "doc", rev: "rev", size: 4},
+		t:                 t,
+		data:              "same",
+	}
+	exec := &RootExecutor{
+		root:   domain.SyncRoot{LocalRoot: root},
+		local:  testLocalFS(t, root),
+		remote: &lookupFS{object: remoteObject},
+	}
 	expectedLocal, err := exec.ObserveLocalFile(ctx, "a.txt")
 	if err != nil {
 		t.Fatal(err)
@@ -367,20 +398,8 @@ func TestCompareFileContentUsesGuardedDownloadAndRevalidatesBothSides(t *testing
 	exec.observeRemoteFn = func(context.Context, string) (domain.RemoteFingerprint, error) {
 		return domain.RemoteFingerprint{Present: true, Kind: domain.KindFile, ID: "doc", Rev: "rev", Size: 4}, nil
 	}
-	var stagedPath string
-	exec.copyFileFn = func(copyCtx context.Context, dst, _ fs.Fs, dstRemote, _ string) error {
-		assertDownloadConfig(t, copyCtx, "doc", "rev")
-		stagedPath = filepath.Join(dst.Root(), filepath.FromSlash(dstRemote))
-		if err := os.WriteFile(stagedPath, []byte("same"), 0o600); err != nil {
-			return err
-		}
-		matches, err := filepath.Glob(filepath.Join(root, tempNamePrefix+"*"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(matches) != 0 {
-			t.Fatalf("comparison left reserved staging inside sync root during download: %v", matches)
-		}
+	exec.copyFileFn = func(context.Context, fs.Fs, fs.Fs, string, string) error {
+		t.Fatal("plan-time content comparison must not stage through CopyFile")
 		return nil
 	}
 	equal, err := exec.CompareFileContent(ctx, "a.txt", expectedLocal, expectedRemote)
@@ -389,27 +408,6 @@ func TestCompareFileContentUsesGuardedDownloadAndRevalidatesBothSides(t *testing
 	}
 	if !equal {
 		t.Fatal("equal local/remote contents reported different")
-	}
-	if stagedPath == "" {
-		t.Fatal("comparison download did not stage a file")
-	}
-	if _, err := os.Lstat(stagedPath); !os.IsNotExist(err) {
-		t.Fatalf("comparison staging survived normal cleanup: %v", err)
-	}
-}
-
-func TestComparisonTempDirRejectsSystemTempInsideSyncRoot(t *testing.T) {
-	tempRoot, err := filepath.EvalSymlinks(os.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	tempRoot, err = filepath.Abs(tempRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if dir, err := newComparisonTempDir(tempRoot); err == nil {
-		_ = os.RemoveAll(dir)
-		t.Fatal("comparison temp staging unexpectedly accepted a sync root containing the system temp directory")
 	}
 }
 
@@ -424,9 +422,15 @@ func TestCopySymlinkContentComparisonUsesProjectedFileBytes(t *testing.T) {
 	if err := os.Symlink(target, filepath.Join(root, "link.txt")); err != nil {
 		t.Fatal(err)
 	}
+	remoteObject := &guardedContentObject{
+		fingerprintObject: fingerprintObject{remote: "link.txt", id: "doc", rev: "rev", size: 4},
+		t:                 t,
+		data:              "same",
+	}
 	exec := &RootExecutor{
-		root:  domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy},
-		local: testLocalCopyLinksFS(t, root),
+		root:   domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy},
+		local:  testLocalCopyLinksFS(t, root),
+		remote: &lookupFS{object: remoteObject},
 	}
 	expectedLocal, err := exec.ObserveLocalFile(ctx, "link.txt")
 	if err != nil {
@@ -435,13 +439,6 @@ func TestCopySymlinkContentComparisonUsesProjectedFileBytes(t *testing.T) {
 	expectedRemote := domain.RemoteExpectation{ID: "doc", Rev: "rev"}
 	exec.observeRemoteFn = func(context.Context, string) (domain.RemoteFingerprint, error) {
 		return domain.RemoteFingerprint{Present: true, Kind: domain.KindFile, ID: "doc", Rev: "rev", Size: 4}, nil
-	}
-	exec.copyFileFn = func(copyCtx context.Context, dst, _ fs.Fs, dstRemote, srcRemote string) error {
-		assertDownloadConfig(t, copyCtx, "doc", "rev")
-		if srcRemote != "link.txt" {
-			t.Fatalf("remote source = %q", srcRemote)
-		}
-		return os.WriteFile(filepath.Join(dst.Root(), filepath.FromSlash(dstRemote)), []byte("same"), 0o600)
 	}
 	equal, err := exec.CompareFileContent(ctx, "link.txt", expectedLocal, expectedRemote)
 	if err != nil {
