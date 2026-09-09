@@ -772,6 +772,52 @@ func TestCopyDescendantDeleteRecoveryUsesPinnedReferentAfterRetarget(t *testing.
 	}
 }
 
+func TestDeleteLocalUnlinksOnlySelectedOrdinaryHardlinkPath(t *testing.T) {
+	root := t.TempDir()
+	first := filepath.Join(root, "a.txt")
+	second := filepath.Join(root, "b.txt")
+	if err := os.WriteFile(first, []byte("shared"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(first, second); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy}}
+	expected, err := exec.ObserveLocalEntry(context.Background(), "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := exec.ResolveLocalMutationTarget(context.Background(), "a.txt", expected, domain.KindFile, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := domain.Operation{
+		ID:                   440,
+		Kind:                 domain.OperationDeleteLocal,
+		EntryKind:            domain.KindFile,
+		SrcPath:              "a.txt",
+		LocalTargetPath:      target.Path,
+		LocalTargetIdentity:  target.AnchorIdentity,
+		LocalTargetAuthority: target.Authority,
+		ExpectedLocal:        expected,
+		ExpectedRemote:       domain.RemoteExpectation{Absent: true},
+	}
+	if err := exec.DeleteLocal(context.Background(), op, nil, allowLocalSideEffectForTest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(first); !os.IsNotExist(err) {
+		t.Fatalf("selected hardlink pathname still exists: %v", err)
+	}
+	got, err := os.ReadFile(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "shared" {
+		t.Fatalf("sibling hardlink content = %q", got)
+	}
+}
+
 func TestDeleteLocalRejectsSamePathDirectoryReplacementAfterPin(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "dir")

@@ -39,6 +39,8 @@ func (e *RootExecutor) ScanLocal(ctx context.Context, operations []domain.Operat
 	}
 	state := &localScanState{
 		claims:                 map[string]string{rootIdentity: "."},
+		lexicalFileClaims:      make(map[string]string),
+		followedFileClaims:     make(map[string]string),
 		ownedArtifacts:         ownedArtifacts,
 		peerLocalRoots:         peerLocalRoots,
 		followedPhysicalClaims: make(map[string]domain.FollowedPhysicalClaim),
@@ -52,6 +54,8 @@ func (e *RootExecutor) ScanLocal(ctx context.Context, operations []domain.Operat
 
 type localScanState struct {
 	claims                 map[string]string
+	lexicalFileClaims      map[string]string
+	followedFileClaims     map[string]string
 	ownedArtifacts         map[string]struct{}
 	peerLocalRoots         []string
 	followedPhysicalClaims map[string]domain.FollowedPhysicalClaim
@@ -81,6 +85,35 @@ func (s *localScanState) claim(physicalPath, rel string, info os.FileInfo) (stri
 		return "", fmt.Errorf("physical local object for %q is already owned by logical path %q", rel, prior)
 	}
 	s.claims[identity] = rel
+	return identity, nil
+}
+
+func (s *localScanState) claimLexicalFile(physicalPath, rel string, info os.FileInfo) error {
+	identity, err := physicalObjectIdentity(physicalPath, info)
+	if err != nil {
+		return fmt.Errorf("identify local entry %q: %w", rel, err)
+	}
+	if prior, exists := s.followedFileClaims[identity]; exists {
+		return fmt.Errorf("physical local file for %q is already owned by followed logical path %q", rel, prior)
+	}
+	if _, exists := s.lexicalFileClaims[identity]; !exists {
+		s.lexicalFileClaims[identity] = rel
+	}
+	return nil
+}
+
+func (s *localScanState) claimFollowedFile(physicalPath, rel string, info os.FileInfo) (string, error) {
+	identity, err := physicalObjectIdentity(physicalPath, info)
+	if err != nil {
+		return "", fmt.Errorf("identify local entry %q: %w", rel, err)
+	}
+	if prior, exists := s.followedFileClaims[identity]; exists && prior != rel {
+		return "", fmt.Errorf("physical local file for %q is already owned by followed logical path %q", rel, prior)
+	}
+	if prior, exists := s.lexicalFileClaims[identity]; exists {
+		return "", fmt.Errorf("physical local file for followed path %q is already exposed by lexical path %q", rel, prior)
+	}
+	s.followedFileClaims[identity] = rel
 	return identity, nil
 }
 
@@ -228,7 +261,7 @@ func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir str
 					continue
 				}
 				if resolvedInfo.Mode().IsRegular() {
-					identity, err := state.claim(resolved, rel, resolvedInfo)
+					identity, err := state.claimFollowedFile(resolved, rel, resolvedInfo)
 					if err != nil {
 						return err
 					}
@@ -262,7 +295,7 @@ func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir str
 			}
 		case info.Mode().IsRegular():
 			if !insideCopyProjection {
-				if _, err := state.claim(physicalPath, rel, info); err != nil {
+				if err := state.claimLexicalFile(physicalPath, rel, info); err != nil {
 					return err
 				}
 			}
