@@ -421,6 +421,81 @@ func TestScanLocalFollowRejectsDuplicatePhysicalOwnership(t *testing.T) {
 	}
 }
 
+func TestScanLocalAllowsOrdinaryHardlinkedFiles(t *testing.T) {
+	for _, mode := range []domain.SymlinkMode{domain.SymlinkFollow, domain.SymlinkCopy} {
+		t.Run(string(mode), func(t *testing.T) {
+			root := t.TempDir()
+			first := filepath.Join(root, "a.txt")
+			second := filepath.Join(root, "b.txt")
+			if err := os.WriteFile(first, []byte("shared"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Link(first, second); err != nil {
+				t.Fatal(err)
+			}
+
+			exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: mode}}
+			got, excluded, claims, evidence, err := exec.ScanLocal(context.Background(), nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(excluded) != 0 || len(claims) != 0 || len(evidence) != 0 {
+				t.Fatalf("hardlink scan excluded=%v claims=%+v evidence=%+v", excluded, claims, evidence)
+			}
+			for _, rel := range []string{"a.txt", "b.txt"} {
+				if !got[rel].Present || got[rel].Kind != domain.KindFile || got[rel].Size != int64(len("shared")) {
+					t.Fatalf("hardlink entry %q = %+v snapshot=%+v", rel, got[rel], got)
+				}
+			}
+		})
+	}
+}
+
+func TestScanLocalFollowRejectsFileSymlinkSharingOrdinaryFileInBothOrders(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		target string
+		link   string
+	}{
+		{name: "lexical-first", target: "a.txt", link: "z-link.txt"},
+		{name: "follow-first", target: "z.txt", link: "a-link.txt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, tc.target), []byte("shared"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(tc.target, filepath.Join(root, tc.link)); err != nil {
+				t.Fatal(err)
+			}
+
+			exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkFollow}}
+			if _, _, _, _, err := exec.ScanLocal(context.Background(), nil, nil); err == nil {
+				t.Fatal("follow policy allowed a file symlink to share an inode with an ordinary lexical file")
+			}
+		})
+	}
+}
+
+func TestScanLocalFollowRejectsDuplicateFileSymlinkReferent(t *testing.T) {
+	root := t.TempDir()
+	external := filepath.Join(t.TempDir(), "shared.txt")
+	if err := os.WriteFile(external, []byte("shared"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(root, "a.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(root, "b.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkFollow}}
+	if _, _, _, _, err := exec.ScanLocal(context.Background(), nil, nil); err == nil {
+		t.Fatal("follow policy allowed two file symlinks to own the same physical referent")
+	}
+}
+
 func TestScanLocalCopyAllowsDuplicateAndInternalProjections(t *testing.T) {
 	root := t.TempDir()
 	real := filepath.Join(root, "real")
