@@ -1268,7 +1268,8 @@ func (e *RootExecutor) CommitDownloadedTemp(ctx context.Context, relPath, tempRe
 
 // CompareFileContent obtains the exact planned remote revision through the same
 // guarded download path and compares it byte-for-byte with an unchanged local
-// file. The temporary file is always client-owned and excluded from snapshots.
+// file. Comparison staging lives outside the sync root so a hard crash cannot
+// leave an unowned reserved path that wedges the next complete scan.
 func (e *RootExecutor) CompareFileContent(ctx context.Context, relPath string, expectedLocal domain.LocalFingerprint, expectedRemote domain.RemoteExpectation) (bool, error) {
 	if err := validateFilePathAndLocalExpectation(relPath, expectedLocal); err != nil {
 		return false, err
@@ -1287,17 +1288,17 @@ func (e *RootExecutor) CompareFileContent(ctx context.Context, relPath string, e
 		return false, fmt.Errorf("local content comparison precondition failed for %q", relPath)
 	}
 
-	tempRel, err := newTempRelPath(relPath)
+	tempDir, err := newComparisonTempDir(e.root.LocalRoot)
 	if err != nil {
 		return false, err
 	}
-	defer e.removeLocalTemp(tempRel)
-	if err := e.DownloadToTemp(ctx, relPath, tempRel, expectedRemote); err != nil {
+	defer func() { _ = os.RemoveAll(tempDir) }()
+	tempPath := filepath.Join(tempDir, "remote")
+	if err := e.downloadToPhysicalTemp(ctx, relPath, tempPath, expectedRemote); err != nil {
 		return false, err
 	}
 
 	localPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
-	tempPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(tempRel))
 	equal, err := filesEqual(localPath, tempPath)
 	if err != nil {
 		return false, err
@@ -1379,26 +1380,24 @@ func newTempName() (string, error) {
 	return tempNamePrefix + hex.EncodeToString(random[:]), nil
 }
 
-func newTempRelPath(relPath string) (string, error) {
-	if err := domain.ValidateRelPath(relPath); err != nil {
-		return "", err
-	}
-	name, err := newTempName()
+func newComparisonTempDir(localRoot string) (string, error) {
+	tempRoot, err := filepath.EvalSymlinks(os.TempDir())
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("resolve system temporary directory: %w", err)
 	}
-	dir := path.Dir(relPath)
-	if dir == "." {
-		return name, nil
+	tempRoot, err = filepath.Abs(tempRoot)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize system temporary directory: %w", err)
 	}
-	return path.Join(dir, name), nil
-}
-
-func (e *RootExecutor) removeLocalTemp(tempRelPath string) {
-	if err := domain.ValidateRelPath(tempRelPath); err != nil {
-		return
+	rel, relErr := filepath.Rel(filepath.Clean(localRoot), filepath.Clean(tempRoot))
+	if relErr == nil && filepath.IsLocal(rel) {
+		return "", fmt.Errorf("system temporary directory %q is inside sync root %q", tempRoot, localRoot)
 	}
-	_ = os.Remove(filepath.Join(e.root.LocalRoot, filepath.FromSlash(tempRelPath)))
+	dir, err := os.MkdirTemp(tempRoot, "pkudisk-sync-compare-*")
+	if err != nil {
+		return "", fmt.Errorf("create content comparison temp directory: %w", err)
+	}
+	return dir, nil
 }
 
 func filesEqual(a, b string) (bool, error) {

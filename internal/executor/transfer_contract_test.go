@@ -367,9 +367,18 @@ func TestCompareFileContentUsesGuardedDownloadAndRevalidatesBothSides(t *testing
 	exec.observeRemoteFn = func(context.Context, string) (domain.RemoteFingerprint, error) {
 		return domain.RemoteFingerprint{Present: true, Kind: domain.KindFile, ID: "doc", Rev: "rev", Size: 4}, nil
 	}
+	var stagedPath string
 	exec.copyFileFn = func(copyCtx context.Context, dst, _ fs.Fs, dstRemote, _ string) error {
 		assertDownloadConfig(t, copyCtx, "doc", "rev")
-		return os.WriteFile(filepath.Join(dst.Root(), filepath.FromSlash(dstRemote)), []byte("same"), 0o600)
+		stagedPath = filepath.Join(dst.Root(), filepath.FromSlash(dstRemote))
+		relToRoot, err := filepath.Rel(root, stagedPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if filepath.IsLocal(relToRoot) {
+			t.Fatalf("comparison staging %q is inside sync root %q", stagedPath, root)
+		}
+		return os.WriteFile(stagedPath, []byte("same"), 0o600)
 	}
 	equal, err := exec.CompareFileContent(ctx, "a.txt", expectedLocal, expectedRemote)
 	if err != nil {
@@ -377,6 +386,27 @@ func TestCompareFileContentUsesGuardedDownloadAndRevalidatesBothSides(t *testing
 	}
 	if !equal {
 		t.Fatal("equal local/remote contents reported different")
+	}
+	if stagedPath == "" {
+		t.Fatal("comparison download did not stage a file")
+	}
+	if _, err := os.Lstat(stagedPath); !os.IsNotExist(err) {
+		t.Fatalf("comparison staging survived normal cleanup: %v", err)
+	}
+}
+
+func TestComparisonTempDirRejectsSystemTempInsideSyncRoot(t *testing.T) {
+	tempRoot, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempRoot, err = filepath.Abs(tempRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir, err := newComparisonTempDir(tempRoot); err == nil {
+		_ = os.RemoveAll(dir)
+		t.Fatal("comparison temp staging unexpectedly accepted a sync root containing the system temp directory")
 	}
 }
 
