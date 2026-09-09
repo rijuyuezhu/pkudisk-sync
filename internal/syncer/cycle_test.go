@@ -1125,7 +1125,7 @@ func TestPinLocalMutationRejectsRetargetIntoPeerOwnedPhysicalTarget(t *testing.T
 		},
 	}
 
-	if _, err := pinLocalMutationTarget(ctx, state, data, op); err == nil || !strings.Contains(err.Error(), "authority changed before pin") {
+	if _, err := pinLocalMutationTarget(ctx, state, data, op, nil); err == nil || !strings.Contains(err.Error(), "authority changed before pin") {
 		t.Fatalf("retargeted peer-owned mutation pin error = %v", err)
 	}
 	if _, ok, err := state.GetOperation(ctx, op.ID); err != nil || ok {
@@ -1137,6 +1137,91 @@ func TestPinLocalMutationRejectsRetargetIntoPeerOwnedPhysicalTarget(t *testing.T
 	}
 	if got := claimsB["peer.txt"]; got != claimB {
 		t.Fatalf("peer ownership changed during rejected pin: got=%+v want=%+v", got, claimB)
+	}
+}
+
+func TestPinLocalMutationRejectsCopyRetargetSinceCompleteScan(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	if err := state.SetSyncRootEnabled(ctx, root.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootSymlinkMode(ctx, root.ID, domain.SymlinkCopy); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootEnabled(ctx, root.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	expected := localFileFP(4, 40)
+	op, err := state.CreateOperation(ctx, domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationDeleteLocal,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "alias/x.txt",
+		ExpectedLocal:  expected,
+		ExpectedRemote: domain.RemoteExpectation{Absent: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetB := filepath.Join(t.TempDir(), "x.txt")
+	scanA := domain.CopyProjectionEvidence{Kind: domain.KindDir, Identity: "scan-a", TargetPath: filepath.Join(t.TempDir(), "A")}
+	currentB := domain.CopyProjectionEvidence{Kind: domain.KindDir, Identity: "pin-b", TargetPath: filepath.Dir(targetB)}
+	data := &fakeDataPlane{
+		local: map[string]domain.LocalFingerprint{"alias/x.txt": expected},
+		mutationTargets: map[string]domain.LocalMutationTarget{
+			"alias/x.txt": {
+				Path:           targetB,
+				AnchorIdentity: "copy-b-anchor",
+				Authority:      domain.LocalMutationCopyPhysical,
+				CopyProjectionEvidence: map[string]domain.CopyProjectionEvidence{
+					"alias": currentB,
+				},
+			},
+		},
+	}
+	scanEvidence := map[string]domain.CopyProjectionEvidence{"alias": scanA}
+	if _, err := pinLocalMutationTarget(ctx, state, data, op, scanEvidence); err == nil || !strings.Contains(err.Error(), "changed since complete scan") {
+		t.Fatalf("scan-to-pin copy retarget was accepted: %v", err)
+	}
+	if _, ok, err := state.GetOperation(ctx, op.ID); err != nil || ok {
+		t.Fatalf("stale copy operation survived scan-authority change: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRecoverExistingOperationsDiscardsUnpinnedCopyPlanWithoutScanEvidence(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	if err := state.SetSyncRootEnabled(ctx, root.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootSymlinkMode(ctx, root.ID, domain.SymlinkCopy); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootEnabled(ctx, root.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	op, err := state.CreateOperation(ctx, domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationDeleteLocal,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "alias/x.txt",
+		ExpectedLocal:  localFileFP(4, 40),
+		ExpectedRemote: domain.RemoteExpectation{Absent: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := &fakeDataPlane{}
+	blocked, recovered, err := recoverExistingOperations(ctx, state, data, []domain.Operation{op}, true)
+	if err != nil || blocked || recovered != 0 {
+		t.Fatalf("discard stale unpinned copy plan = blocked=%v recovered=%d err=%v", blocked, recovered, err)
+	}
+	if _, ok, err := state.GetOperation(ctx, op.ID); err != nil || ok {
+		t.Fatalf("unproven copy plan survived recovery preflight: ok=%v err=%v", ok, err)
+	}
+	if len(data.calls) != 0 {
+		t.Fatalf("unproven copy plan executed without fresh scan evidence: %v", data.calls)
 	}
 }
 
@@ -1155,7 +1240,7 @@ func TestPinLocalMutationRejectsIncompleteExistingPin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pinLocalMutationTarget(ctx, state, &fakeDataPlane{}, op); err == nil || !strings.Contains(err.Error(), "incomplete physical local target pin") {
+	if _, err := pinLocalMutationTarget(ctx, state, &fakeDataPlane{}, op, nil); err == nil || !strings.Contains(err.Error(), "incomplete physical local target pin") {
 		t.Fatalf("incomplete planned local pin was accepted: %v", err)
 	}
 }
@@ -1263,6 +1348,7 @@ type fakeDataPlane struct {
 	pinnedNonOrdinary    map[string]bool
 	remote               map[string]domain.RemoteFingerprint
 	followedClaims       map[string]domain.FollowedPhysicalClaim
+	copyEvidence         map[string]domain.CopyProjectionEvidence
 	mutationTargets      map[string]domain.LocalMutationTarget
 	excluded             []string
 	remoteRootMissing    bool
@@ -1301,9 +1387,9 @@ func (f *cancelUploadDataPlane) Upload(ctx context.Context, _ string, _ domain.L
 	return domain.RemoteFingerprint{}, ctx.Err()
 }
 
-func (f *fakeDataPlane) ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]domain.FollowedPhysicalClaim, error) {
+func (f *fakeDataPlane) ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]domain.FollowedPhysicalClaim, map[string]domain.CopyProjectionEvidence, error) {
 	f.scans++
-	return cloneLocal(f.local), append([]string(nil), f.excluded...), cloneFollowedClaims(f.followedClaims), nil
+	return cloneLocal(f.local), append([]string(nil), f.excluded...), cloneFollowedClaims(f.followedClaims), cloneCopyEvidence(f.copyEvidence), nil
 }
 
 func (f *fakeDataPlane) ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error) {
@@ -1524,6 +1610,14 @@ func cloneFollowedClaims(in map[string]domain.FollowedPhysicalClaim) map[string]
 			claim.TargetPath = fakeFollowedTarget(rel)
 		}
 		out[rel] = claim
+	}
+	return out
+}
+
+func cloneCopyEvidence(in map[string]domain.CopyProjectionEvidence) map[string]domain.CopyProjectionEvidence {
+	out := make(map[string]domain.CopyProjectionEvidence, len(in))
+	for rel, evidence := range in {
+		out[rel] = evidence
 	}
 	return out
 }

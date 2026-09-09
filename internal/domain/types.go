@@ -24,6 +24,15 @@ type FollowedPhysicalClaim struct {
 	TargetPath string
 }
 
+// CopyProjectionEvidence records what one complete scan observed for a copy
+// symlink boundary. It is continuity evidence only: unlike
+// FollowedPhysicalClaim it grants no root-lifetime/global ownership.
+type CopyProjectionEvidence struct {
+	Kind       EntryKind
+	Identity   string
+	TargetPath string
+}
+
 // LocalMutationAuthority describes what one operation-local target pin means.
 // It is distinct from root-level followed physical ownership.
 type LocalMutationAuthority string
@@ -51,6 +60,11 @@ type LocalMutationTarget struct {
 	// symlink object itself is the mutation authority. It is empty otherwise.
 	SymlinkTarget  string
 	FollowedClaims map[string]FollowedPhysicalClaim
+	// CopyProjectionEvidence contains the copy-symlink boundaries traversed
+	// while resolving this target. The syncer compares it with the evidence
+	// from the complete scan that produced the decision; it is never persisted
+	// as root-lifetime ownership.
+	CopyProjectionEvidence map[string]CopyProjectionEvidence
 }
 
 // LocalFingerprint is the local state used by reconciliation and local-side

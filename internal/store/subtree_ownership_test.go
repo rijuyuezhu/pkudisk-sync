@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -310,6 +311,217 @@ func TestRootCreateAndFollowedReservationSerializeSubtreeOwnership(t *testing.T)
 	}
 	if !rootCreated && !strings.Contains(rootErr.Error(), "overlaps followed") {
 		t.Fatalf("losing root creation did not report followed subtree conflict: %v", rootErr)
+	}
+}
+
+func newCopyPhysicalDeleteOperation(t *testing.T, ctx context.Context, s *Store, rootID int64, relPath string) domain.Operation {
+	t.Helper()
+	op, err := s.CreateOperation(ctx, domain.Operation{
+		SyncRootID: rootID,
+		Kind:       domain.OperationDeleteLocal,
+		EntryKind:  domain.KindFile,
+		SrcPath:    relPath,
+		ExpectedLocal: domain.LocalFingerprint{
+			Present: true,
+			Kind:    domain.KindFile,
+			Size:    4,
+			MtimeNS: 40,
+		},
+		ExpectedRemote: domain.RemoteExpectation{Absent: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return op
+}
+
+func createCopyModeTestRoot(t *testing.T, ctx context.Context, s *Store, uuid, localRoot, remoteRoot string) domain.SyncRoot {
+	t.Helper()
+	root := testSyncRoot(uuid, localRoot, domain.AppRemoteName, remoteRoot)
+	root.SymlinkMode = domain.SymlinkCopy
+	created, err := s.CreateSyncRoot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created
+}
+
+func TestCopyPhysicalPinBlocksOverlappingRootCreateUntilOperationEnds(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	rootA := createCopyModeTestRoot(t, ctx, s, "copy-pin-owner", t.TempDir(), "Personal/CopyPinOwner")
+	futurePeer := t.TempDir()
+	target := filepath.Join(futurePeer, "x.txt")
+	op := newCopyPhysicalDeleteOperation(t, ctx, s, rootA.ID, "alias/x.txt")
+
+	ok, detail, err := s.AuthorizeAndPinLocalMutation(ctx, op.ID, domain.LocalMutationTarget{
+		Path:           target,
+		AnchorIdentity: "copy-pin-anchor",
+		Authority:      domain.LocalMutationCopyPhysical,
+	})
+	if err != nil || !ok {
+		t.Fatalf("pin copy-physical operation = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+	candidate := testSyncRoot("copy-pin-peer", futurePeer, domain.AppRemoteName, "Personal/CopyPinPeer")
+	if _, err := s.CreateSyncRoot(ctx, candidate); err == nil || !strings.Contains(err.Error(), "copy-physical") {
+		t.Fatalf("overlapping root creation was not fenced by in-flight copy pin: %v", err)
+	}
+	if err := s.DeleteOperation(ctx, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateSyncRoot(ctx, candidate); err != nil {
+		t.Fatalf("completed copy operation kept root-lifetime ownership: %v", err)
+	}
+}
+
+func TestExistingRootBlocksOverlappingCopyPhysicalPin(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	rootA := createCopyModeTestRoot(t, ctx, s, "copy-pin-after-root", t.TempDir(), "Personal/CopyPinAfterRoot")
+	peer := t.TempDir()
+	if _, err := s.CreateSyncRoot(ctx, testSyncRoot("copy-existing-peer", peer, domain.AppRemoteName, "Personal/CopyExistingPeer")); err != nil {
+		t.Fatal(err)
+	}
+	op := newCopyPhysicalDeleteOperation(t, ctx, s, rootA.ID, "alias/x.txt")
+	ok, detail, err := s.AuthorizeAndPinLocalMutation(ctx, op.ID, domain.LocalMutationTarget{
+		Path:           filepath.Join(peer, "x.txt"),
+		AnchorIdentity: "copy-pin-anchor",
+		Authority:      domain.LocalMutationCopyPhysical,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || !strings.Contains(detail, "configured sync root") {
+		t.Fatalf("copy pin crossed existing peer root: ok=%v detail=%q", ok, detail)
+	}
+}
+
+func TestCopyPhysicalDirectoryPinBlocksDescendantRootCreate(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	rootA := createCopyModeTestRoot(t, ctx, s, "copy-dir-pin-owner", t.TempDir(), "Personal/CopyDirPinOwner")
+	shared := t.TempDir()
+	op, err := s.CreateOperation(ctx, domain.Operation{
+		SyncRootID:     rootA.ID,
+		Kind:           domain.OperationDeleteLocal,
+		EntryKind:      domain.KindDir,
+		SrcPath:        "alias/subdir",
+		ExpectedLocal:  domain.LocalFingerprint{Present: true, Kind: domain.KindDir},
+		ExpectedRemote: domain.RemoteExpectation{Absent: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, detail, err := s.AuthorizeAndPinLocalMutation(ctx, op.ID, domain.LocalMutationTarget{
+		Path:           shared,
+		AnchorIdentity: "copy-dir-anchor",
+		Authority:      domain.LocalMutationCopyPhysical,
+	})
+	if err != nil || !ok {
+		t.Fatalf("pin copy-physical directory = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+	candidatePath := filepath.Join(shared, "nested-root")
+	if err := os.Mkdir(candidatePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateSyncRoot(ctx, testSyncRoot("copy-dir-descendant-peer", candidatePath, domain.AppRemoteName, "Personal/CopyDirDescendantPeer")); err == nil || !strings.Contains(err.Error(), "copy-physical") {
+		t.Fatalf("root inside copy-physical directory pin was not fenced: %v", err)
+	}
+}
+
+func TestExistingDescendantRootBlocksParentCopyPhysicalDirectoryPin(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	rootA := createCopyModeTestRoot(t, ctx, s, "copy-dir-pin-after-root", t.TempDir(), "Personal/CopyDirPinAfterRoot")
+	shared := t.TempDir()
+	peer := filepath.Join(shared, "nested-root")
+	if err := os.Mkdir(peer, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateSyncRoot(ctx, testSyncRoot("copy-existing-descendant-peer", peer, domain.AppRemoteName, "Personal/CopyExistingDescendantPeer")); err != nil {
+		t.Fatal(err)
+	}
+	op, err := s.CreateOperation(ctx, domain.Operation{
+		SyncRootID:     rootA.ID,
+		Kind:           domain.OperationDeleteLocal,
+		EntryKind:      domain.KindDir,
+		SrcPath:        "alias/subdir",
+		ExpectedLocal:  domain.LocalFingerprint{Present: true, Kind: domain.KindDir},
+		ExpectedRemote: domain.RemoteExpectation{Absent: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, detail, err := s.AuthorizeAndPinLocalMutation(ctx, op.ID, domain.LocalMutationTarget{
+		Path:           shared,
+		AnchorIdentity: "copy-parent-dir-anchor",
+		Authority:      domain.LocalMutationCopyPhysical,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || !strings.Contains(detail, "configured sync root") {
+		t.Fatalf("parent copy directory pin crossed existing descendant root: ok=%v detail=%q", ok, detail)
+	}
+}
+
+func TestCopyPhysicalPinAndRootCreateSerializeWithExactlyOneWinner(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	pinStore, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pinStore.Close() }()
+	rootStore, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rootStore.Close() }()
+
+	rootA := createCopyModeTestRoot(t, ctx, pinStore, "copy-concurrent-owner", t.TempDir(), "Personal/CopyConcurrentOwner")
+	futurePeer := t.TempDir()
+	target := filepath.Join(futurePeer, "x.txt")
+	op := newCopyPhysicalDeleteOperation(t, ctx, pinStore, rootA.ID, "alias/x.txt")
+	candidate := testSyncRoot("copy-concurrent-peer", futurePeer, domain.AppRemoteName, "Personal/CopyConcurrentPeer")
+
+	type pinResult struct {
+		ok     bool
+		detail string
+		err    error
+	}
+	pinCh := make(chan pinResult, 1)
+	rootCh := make(chan error, 1)
+	start := make(chan struct{})
+	go func() {
+		<-start
+		ok, detail, err := pinStore.AuthorizeAndPinLocalMutation(ctx, op.ID, domain.LocalMutationTarget{
+			Path:           target,
+			AnchorIdentity: "copy-concurrent-anchor",
+			Authority:      domain.LocalMutationCopyPhysical,
+		})
+		pinCh <- pinResult{ok: ok, detail: detail, err: err}
+	}()
+	go func() {
+		<-start
+		_, err := rootStore.CreateSyncRoot(ctx, candidate)
+		rootCh <- err
+	}()
+	close(start)
+	pin := <-pinCh
+	rootErr := <-rootCh
+	if pin.err != nil {
+		t.Fatalf("copy pin returned database error: %v", pin.err)
+	}
+	rootCreated := rootErr == nil
+	if pin.ok == rootCreated {
+		t.Fatalf("copy pin and overlapping root creation must have exactly one winner: pin=%+v rootErr=%v", pin, rootErr)
+	}
+	if !pin.ok && !strings.Contains(pin.detail, "configured sync root") {
+		t.Fatalf("losing copy pin did not report configured-root conflict: %+v", pin)
+	}
+	if !rootCreated && !strings.Contains(rootErr.Error(), "copy-physical") {
+		t.Fatalf("losing root creation did not report copy-pin conflict: %v", rootErr)
 	}
 }
 

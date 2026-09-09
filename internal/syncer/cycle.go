@@ -18,7 +18,7 @@ const maxCyclePasses = 8
 // DataPlane is the narrow in-process execution surface needed by one complete
 // reconciliation cycle. executor.RootExecutor implements this interface.
 type DataPlane interface {
-	ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]domain.FollowedPhysicalClaim, error)
+	ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]domain.FollowedPhysicalClaim, map[string]domain.CopyProjectionEvidence, error)
 	ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error)
 	ObserveLocalEntry(context.Context, string) (domain.LocalFingerprint, error)
 	ObservePinnedLocalEntry(context.Context, domain.Operation) (domain.LocalFingerprint, bool, error)
@@ -96,7 +96,7 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 		if err != nil {
 			return result, err
 		}
-		preflight, _, followedClaims, err := scanCompleteSnapshot(ctx, data, root.Initialized, operations, peerRoots)
+		preflight, _, followedClaims, _, err := scanCompleteSnapshot(ctx, data, root.Initialized, operations, peerRoots)
 		if err != nil {
 			return result, fmt.Errorf("operation recovery namespace preflight: %w", err)
 		}
@@ -118,7 +118,7 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 		}
 	}
 
-	blocked, recovered, err := recoverExistingOperations(ctx, state, data, operations)
+	blocked, recovered, err := recoverExistingOperations(ctx, state, data, operations, root.EffectiveSymlinkMode() == domain.SymlinkCopy)
 	result.Recovered += recovered
 	if err != nil {
 		return result, err
@@ -153,7 +153,7 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 		if err != nil {
 			return result, err
 		}
-		snapshot, remoteRootPresent, followedClaims, err := scanCompleteSnapshot(ctx, data, root.Initialized, nil, peerRoots)
+		snapshot, remoteRootPresent, followedClaims, copyEvidence, err := scanCompleteSnapshot(ctx, data, root.Initialized, nil, peerRoots)
 		if err != nil {
 			return result, err
 		}
@@ -265,7 +265,7 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 			if err != nil {
 				return result, fmt.Errorf("journal operation %q: %w", decision.RelPath, err)
 			}
-			op, err = pinLocalMutationTarget(ctx, state, data, op)
+			op, err = pinLocalMutationTarget(ctx, state, data, op, copyEvidence)
 			if err != nil {
 				return result, fmt.Errorf("pin local mutation target %q: %w", decision.RelPath, err)
 			}
@@ -292,17 +292,17 @@ func configuredPeerLocalRoots(ctx context.Context, state *store.Store, rootID in
 	return peers, nil
 }
 
-func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot bool, operations []domain.Operation, peerLocalRoots []string) (reconcile.Snapshot, bool, map[string]domain.FollowedPhysicalClaim, error) {
-	local, excluded, followedClaims, err := data.ScanLocal(ctx, operations, peerLocalRoots)
+func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot bool, operations []domain.Operation, peerLocalRoots []string) (reconcile.Snapshot, bool, map[string]domain.FollowedPhysicalClaim, map[string]domain.CopyProjectionEvidence, error) {
+	local, excluded, followedClaims, copyEvidence, err := data.ScanLocal(ctx, operations, peerLocalRoots)
 	if err != nil {
-		return reconcile.Snapshot{}, false, nil, fmt.Errorf("complete local scan: %w", err)
+		return reconcile.Snapshot{}, false, nil, nil, fmt.Errorf("complete local scan: %w", err)
 	}
 	remote, remoteRootPresent, err := data.ScanRemote(ctx)
 	if err != nil {
-		return reconcile.Snapshot{}, remoteRootPresent, nil, fmt.Errorf("complete remote scan: %w", err)
+		return reconcile.Snapshot{}, remoteRootPresent, nil, nil, fmt.Errorf("complete remote scan: %w", err)
 	}
 	if requireRemoteRoot && !remoteRootPresent {
-		return reconcile.Snapshot{}, false, nil, fmt.Errorf("complete remote scan: selected remote root is missing after initialization")
+		return reconcile.Snapshot{}, false, nil, nil, fmt.Errorf("complete remote scan: selected remote root is missing after initialization")
 	}
 	for relPath := range remote {
 		if reconcile.PathExcluded(excluded, relPath) {
@@ -317,7 +317,7 @@ func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot
 		LocalComplete:  true,
 		RemoteComplete: true,
 		RootHealthy:    true,
-	}, remoteRootPresent, followedClaims, nil
+	}, remoteRootPresent, followedClaims, copyEvidence, nil
 }
 
 func followedPhysicalAuthority(ctx context.Context, state *store.Store, root domain.SyncRoot, snapshot reconcile.Snapshot, observed map[string]domain.FollowedPhysicalClaim) (bool, string, error) {
@@ -354,7 +354,39 @@ func isLocalMutation(op domain.Operation) bool {
 	return op.Kind == domain.OperationEnsureLocal || op.Kind == domain.OperationDeleteLocal
 }
 
-func pinLocalMutationTarget(ctx context.Context, state *store.Store, data DataPlane, op domain.Operation) (domain.Operation, error) {
+func copyProjectionEvidenceApplies(boundary string, evidence domain.CopyProjectionEvidence, relPath string) bool {
+	return boundary == relPath || (evidence.Kind == domain.KindDir && strings.HasPrefix(relPath, boundary+"/"))
+}
+
+func copyProjectionContinuityHolds(relPath string, scanned, current map[string]domain.CopyProjectionEvidence) (bool, string) {
+	for boundary, evidence := range scanned {
+		if !copyProjectionEvidenceApplies(boundary, evidence, relPath) {
+			continue
+		}
+		currentEvidence, ok := current[boundary]
+		if !ok {
+			return false, fmt.Sprintf("scan-time copy boundary %q disappeared", boundary)
+		}
+		if currentEvidence != evidence {
+			return false, fmt.Sprintf("copy boundary %q retargeted from %q to %q", boundary, evidence.TargetPath, currentEvidence.TargetPath)
+		}
+	}
+	for boundary, evidence := range current {
+		if !copyProjectionEvidenceApplies(boundary, evidence, relPath) {
+			return false, fmt.Sprintf("resolved copy boundary %q does not authorize mutation path %q", boundary, relPath)
+		}
+		scanEvidence, ok := scanned[boundary]
+		if !ok {
+			return false, fmt.Sprintf("copy boundary %q appeared after the complete scan", boundary)
+		}
+		if scanEvidence != evidence {
+			return false, fmt.Sprintf("copy boundary %q changed since the complete scan", boundary)
+		}
+	}
+	return true, ""
+}
+
+func pinLocalMutationTarget(ctx context.Context, state *store.Store, data DataPlane, op domain.Operation, scanCopyEvidence map[string]domain.CopyProjectionEvidence) (domain.Operation, error) {
 	if !isLocalMutation(op) {
 		return op, nil
 	}
@@ -382,6 +414,14 @@ func pinLocalMutationTarget(ctx context.Context, state *store.Store, data DataPl
 		}
 		return op, err
 	}
+	if scanCopyEvidence != nil {
+		if ok, detail := copyProjectionContinuityHolds(op.SrcPath, scanCopyEvidence, target.CopyProjectionEvidence); !ok {
+			if deleteErr := state.DeleteOperation(ctx, op.ID); deleteErr != nil {
+				return op, fmt.Errorf("copy projection authority changed since complete scan: %s; discard stale planned operation: %w", detail, deleteErr)
+			}
+			return op, fmt.Errorf("copy projection authority changed since complete scan: %s", detail)
+		}
+	}
 	ok, detail, err := state.AuthorizeAndPinLocalMutation(ctx, op.ID, target)
 	if err != nil {
 		return op, err
@@ -406,13 +446,23 @@ func pinLocalMutationTarget(ctx context.Context, state *store.Store, data DataPl
 	return op, nil
 }
 
-func recoverExistingOperations(ctx context.Context, state *store.Store, data DataPlane, operations []domain.Operation) (blocked bool, recovered int, err error) {
+func recoverExistingOperations(ctx context.Context, state *store.Store, data DataPlane, operations []domain.Operation, discardUnpinnedCopyPlans bool) (blocked bool, recovered int, err error) {
 	for _, op := range operations {
 		switch op.Phase {
 		case domain.OperationBlocked:
 			return true, recovered, nil
 		case domain.OperationPlanned:
-			op, err = pinLocalMutationTarget(ctx, state, data, op)
+			if discardUnpinnedCopyPlans && isLocalMutation(op) && op.Attempts == 0 && op.LocalTargetPath == "" && op.LocalTargetIdentity == "" && op.LocalTargetAuthority == "" {
+				// This operation survived from a prior cycle without a durable pin,
+				// so the in-memory copy projection evidence that produced it is
+				// gone. No side effect has started: discard and force a fresh full
+				// scan/replan instead of reconstructing authority from fingerprints.
+				if err := state.DeleteOperation(ctx, op.ID); err != nil {
+					return false, recovered, err
+				}
+				continue
+			}
+			op, err = pinLocalMutationTarget(ctx, state, data, op, nil)
 			if err != nil {
 				return false, recovered, err
 			}

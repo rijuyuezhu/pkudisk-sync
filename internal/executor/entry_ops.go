@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/rclone/rclone/fs"
@@ -684,6 +685,7 @@ func (e *RootExecutor) resolveCopyLocalMutationAuthority(relPath string, present
 	parts := strings.Split(relPath, "/")
 	physicalDir := e.root.LocalRoot
 	throughCopyDir := false
+	copyEvidence := make(map[string]domain.CopyProjectionEvidence)
 	for i, part := range parts {
 		logical := strings.Join(parts[:i+1], "/")
 		candidate := filepath.Join(physicalDir, filepath.FromSlash(part))
@@ -694,7 +696,7 @@ func (e *RootExecutor) resolveCopyLocalMutationAuthority(relPath string, present
 				if throughCopyDir {
 					authority = domain.LocalMutationCopyPhysical
 				}
-				return domain.LocalMutationTarget{Path: filepath.Clean(candidate), Authority: authority}, nil
+				return domain.LocalMutationTarget{Path: filepath.Clean(candidate), Authority: authority, CopyProjectionEvidence: copyEvidence}, nil
 			}
 			return domain.LocalMutationTarget{}, fmt.Errorf("local copy mutation path component %q disappeared", logical)
 		}
@@ -742,11 +744,16 @@ func (e *RootExecutor) resolveCopyLocalMutationAuthority(relPath string, present
 				default:
 					return domain.LocalMutationTarget{}, fmt.Errorf("unsupported final copy symlink %q (%s)", logical, resolvedInfo.Mode().Type())
 				}
+				evidence, err := copyProjectionEvidenceFor(resolved, resolvedInfo)
+				if err != nil {
+					return domain.LocalMutationTarget{}, fmt.Errorf("identify final copy symlink %q: %w", logical, err)
+				}
+				copyEvidence[logical] = evidence
 				authority := domain.LocalMutationLexical
 				if throughCopyDir {
 					authority = domain.LocalMutationCopyPhysical
 				}
-				return domain.LocalMutationTarget{Path: filepath.Clean(candidate), Authority: authority, SymlinkTarget: linkTarget}, nil
+				return domain.LocalMutationTarget{Path: filepath.Clean(candidate), Authority: authority, SymlinkTarget: linkTarget, CopyProjectionEvidence: copyEvidence}, nil
 			}
 			resolved, resolvedPresent, err := resolveFollowedLocalPath(candidate, false)
 			if err != nil || !resolvedPresent {
@@ -768,6 +775,11 @@ func (e *RootExecutor) resolveCopyLocalMutationAuthority(relPath string, present
 			if !resolvedInfo.IsDir() {
 				return domain.LocalMutationTarget{}, fmt.Errorf("copy file %q cannot contain descendants", logical)
 			}
+			evidence, err := copyProjectionEvidenceFor(resolved, resolvedInfo)
+			if err != nil {
+				return domain.LocalMutationTarget{}, fmt.Errorf("identify copy directory boundary %q: %w", logical, err)
+			}
+			copyEvidence[logical] = evidence
 			physicalDir = filepath.Clean(resolved)
 			throughCopyDir = true
 			continue
@@ -778,7 +790,7 @@ func (e *RootExecutor) resolveCopyLocalMutationAuthority(relPath string, present
 			if throughCopyDir {
 				authority = domain.LocalMutationCopyPhysical
 			}
-			return domain.LocalMutationTarget{Path: filepath.Clean(candidate), Authority: authority}, nil
+			return domain.LocalMutationTarget{Path: filepath.Clean(candidate), Authority: authority, CopyProjectionEvidence: copyEvidence}, nil
 		}
 		if !info.IsDir() {
 			return domain.LocalMutationTarget{}, fmt.Errorf("local copy mutation path component %q is not a directory", logical)
@@ -788,28 +800,31 @@ func (e *RootExecutor) resolveCopyLocalMutationAuthority(relPath string, present
 	return domain.LocalMutationTarget{}, fmt.Errorf("failed to resolve copy local mutation target %q", relPath)
 }
 
-func samePhysicalDestination(a, b string, present bool) bool {
-	if present {
-		ai, aErr := os.Stat(a)
-		bi, bErr := os.Stat(b)
-		return aErr == nil && bErr == nil && os.SameFile(ai, bi)
+func canonicalLocalMutationPathname(name string) (string, error) {
+	parent, err := canonicalExistingLocalPath(filepath.Dir(name))
+	if err != nil {
+		return "", err
 	}
-	if filepath.Base(a) != filepath.Base(b) {
+	return filepath.Join(parent, filepath.Base(name)), nil
+}
+
+func samePhysicalDestination(a, b string, _ bool) bool {
+	canonicalA, aErr := canonicalLocalMutationPathname(a)
+	canonicalB, bErr := canonicalLocalMutationPathname(b)
+	if aErr != nil || bErr != nil {
 		return false
 	}
-	ai, aErr := os.Stat(filepath.Dir(a))
-	bi, bErr := os.Stat(filepath.Dir(b))
-	return aErr == nil && bErr == nil && os.SameFile(ai, bi)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(canonicalA, canonicalB)
+	}
+	return canonicalA == canonicalB
 }
 
 func localMutationTargetMatchesPin(op domain.Operation, current domain.LocalMutationTarget) bool {
-	// Existing ordinary/physical targets are compared by object identity rather
-	// than path spelling. This matters on platforms where the same directory may
-	// be rendered through aliases such as /var vs /private/var or Windows 8.3
-	// names. Lexical symlink objects and absent leaves compare parent identity +
-	// basename so checking them never follows the referent.
-	presentPhysicalTarget := op.ExpectedLocal.Present && op.LocalSymlinkTarget == "" && current.SymlinkTarget == ""
-	if !samePhysicalDestination(op.LocalTargetPath, current.Path, presentPhysicalTarget) {
+	// Mutation authority is a pathname, not merely an inode/file ID. Canonicalize
+	// only the parent spelling so /var vs /private/var and Windows parent aliases
+	// compare equal without allowing a retarget to a distinct hard-link pathname.
+	if !samePhysicalDestination(op.LocalTargetPath, current.Path, false) {
 		return false
 	}
 	if op.LocalTargetAuthority != "" && current.Authority != op.LocalTargetAuthority {

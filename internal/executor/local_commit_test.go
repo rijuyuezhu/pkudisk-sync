@@ -592,6 +592,72 @@ func TestCopyDescendantDeleteRejectsRetargetBeforeFirstSideEffect(t *testing.T) 
 	}
 }
 
+func TestCopyDescendantDeleteRejectsRetargetToDistinctHardlinkPath(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	targetA := t.TempDir()
+	targetB := t.TempDir()
+	fileA := filepath.Join(targetA, "x.txt")
+	fileB := filepath.Join(targetB, "x.txt")
+	if err := os.WriteFile(fileA, []byte("same"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(fileA, fileB); err != nil {
+		t.Fatal(err)
+	}
+
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(targetA, alias); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy}}
+	expected, err := exec.ObserveLocalEntry(ctx, "alias/x.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := exec.ResolveLocalMutationTarget(ctx, "alias/x.txt", expected, domain.KindFile, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.Authority != domain.LocalMutationCopyPhysical || !samePhysicalDestination(target.Path, fileA, false) {
+		t.Fatalf("copy descendant pin = %+v, want pathname %q", target, fileA)
+	}
+
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(targetB, alias); err != nil {
+		t.Fatal(err)
+	}
+	op := domain.Operation{
+		ID:                   430,
+		Kind:                 domain.OperationDeleteLocal,
+		EntryKind:            domain.KindFile,
+		SrcPath:              "alias/x.txt",
+		LocalTargetPath:      target.Path,
+		LocalTargetIdentity:  target.AnchorIdentity,
+		LocalTargetAuthority: target.Authority,
+		ExpectedLocal:        expected,
+		ExpectedRemote:       domain.RemoteExpectation{Absent: true},
+	}
+	began := false
+	begin := func() error {
+		began = true
+		return nil
+	}
+	if err := exec.DeleteLocal(ctx, op, nil, begin); err == nil {
+		t.Fatal("copy descendant delete accepted retarget to a distinct hard-link pathname")
+	}
+	if began {
+		t.Fatal("hard-link pathname retarget crossed the first-side-effect boundary")
+	}
+	for _, name := range []string{fileA, fileB} {
+		if _, err := os.Stat(name); err != nil {
+			t.Fatalf("hard-link retarget mutated %q: %v", name, err)
+		}
+	}
+}
+
 func TestCopyDescendantMutationPinRejectsRetargetIntoPeerRoot(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
