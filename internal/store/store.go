@@ -231,16 +231,19 @@ CHECK (local_target_authority IN ('', 'lexical', 'follow-physical', 'copy-physic
 ALTER TABLE operations
 ADD COLUMN local_symlink_target TEXT NOT NULL DEFAULT '';
 
--- Copy mode did not exist before v7. Existing complete pins on follow roots
--- are strict physical authority; complete pins on other roots are lexical.
--- Incomplete legacy pins intentionally remain authority-less and fail closed.
+-- v6 did not record whether a complete local pin was lexical or traversed a
+-- followed boundary, so v7 must not guess that authority from the root mode.
+-- Planned/unattempted local mutations have no external side effect and can
+-- safely discard their old pin so v7 resolves it again under the new model.
+-- Started legacy mutations retain path/identity for inspection but keep empty
+-- authority, causing automatic recovery to fail closed rather than inventing
+-- lexical/follow semantics after an upgrade.
 UPDATE operations
-SET local_target_authority = CASE
-    WHEN (SELECT symlink_mode FROM sync_roots WHERE sync_roots.id = operations.sync_root_id) = 'follow'
-        THEN 'follow-physical'
-    ELSE 'lexical'
-END
-WHERE local_target_path <> '' AND local_target_identity <> ''`); err != nil {
+SET local_target_path = '', local_target_identity = ''
+WHERE kind IN ('ensure-local', 'delete-local')
+  AND phase = 'planned'
+  AND attempts = 0
+  AND (local_target_path <> '' OR local_target_identity <> '')`); err != nil {
 			return fmt.Errorf("migrate operation-local authority v6 to v7: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 7"); err != nil {

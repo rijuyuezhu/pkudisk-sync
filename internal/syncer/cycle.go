@@ -31,11 +31,11 @@ type DataPlane interface {
 	ComparePinnedFileContent(context.Context, domain.Operation, domain.RemoteExpectation) (bool, error)
 	Upload(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (domain.RemoteFingerprint, error)
 	EnsureRemoteDir(context.Context, string, domain.RemoteExpectation) error
-	EnsureLocalFile(context.Context, domain.Operation, []string) (domain.LocalFingerprint, error)
-	EnsureLocalDir(context.Context, domain.Operation, []string) error
+	EnsureLocalFile(context.Context, domain.Operation, []string, func() error) (domain.LocalFingerprint, error)
+	EnsureLocalDir(context.Context, domain.Operation, []string, func() error) error
 	DeleteRemoteFile(context.Context, domain.RemoteExpectation) error
 	DeleteRemoteDir(context.Context, domain.RemoteExpectation) error
-	DeleteLocal(context.Context, domain.Operation, []string) error
+	DeleteLocal(context.Context, domain.Operation, []string, func() error) error
 }
 
 // CycleResult summarizes one selected-root cycle without making caller-visible
@@ -502,13 +502,35 @@ func executePersistedOperation(ctx context.Context, state *store.Store, data Dat
 		}
 		return fmt.Errorf("operation %d uses unsupported move recovery", op.ID)
 	}
-	if err := state.SetOperationPhase(ctx, op.ID, domain.OperationRunning, "", true); err != nil {
+	localMutation := isLocalMutation(op)
+	var peerRoots []string
+	if localMutation {
+		var peerErr error
+		peerRoots, peerErr = configuredPeerLocalRoots(ctx, state, op.SyncRootID)
+		if peerErr != nil {
+			if op.Phase == domain.OperationPlanned && op.Attempts == 0 {
+				if deleteErr := state.DeleteOperation(ctx, op.ID); deleteErr != nil {
+					return fmt.Errorf("load peer roots before local mutation: %v; discard known-unstarted operation: %w", peerErr, deleteErr)
+				}
+			} else {
+				_ = state.SetOperationPhase(ctx, op.ID, domain.OperationRecovering, peerErr.Error(), false)
+			}
+			return peerErr
+		}
+	} else if err := state.SetOperationPhase(ctx, op.ID, domain.OperationRunning, "", true); err != nil {
 		return err
 	}
-	peerRoots, peerErr := configuredPeerLocalRoots(ctx, state, op.SyncRootID)
-	if peerErr != nil {
-		_ = state.SetOperationPhase(ctx, op.ID, domain.OperationRecovering, peerErr.Error(), false)
-		return peerErr
+
+	localSideEffectStarted := false
+	beginLocalSideEffect := func() error {
+		if localSideEffectStarted {
+			return fmt.Errorf("operation %d attempted to begin its local side effect more than once", op.ID)
+		}
+		if err := state.SetOperationPhase(ctx, op.ID, domain.OperationRunning, "", true); err != nil {
+			return err
+		}
+		localSideEffectStarted = true
+		return nil
 	}
 
 	var (
@@ -528,9 +550,9 @@ func executePersistedOperation(ctx context.Context, state *store.Store, data Dat
 		}
 	case domain.OperationEnsureLocal:
 		if op.EntryKind == domain.KindDir {
-			err = data.EnsureLocalDir(ctx, op, peerRoots)
+			err = data.EnsureLocalDir(ctx, op, peerRoots, beginLocalSideEffect)
 		} else {
-			exactDownloadResult, err = data.EnsureLocalFile(ctx, op, peerRoots)
+			exactDownloadResult, err = data.EnsureLocalFile(ctx, op, peerRoots, beginLocalSideEffect)
 			hasExactDownloadResult = err == nil
 		}
 	case domain.OperationDeleteRemote:
@@ -540,13 +562,33 @@ func executePersistedOperation(ctx context.Context, state *store.Store, data Dat
 			err = data.DeleteRemoteFile(ctx, op.ExpectedRemote)
 		}
 	case domain.OperationDeleteLocal:
-		err = data.DeleteLocal(ctx, op, peerRoots)
+		err = data.DeleteLocal(ctx, op, peerRoots, beginLocalSideEffect)
 	default:
 		err = fmt.Errorf("unsupported operation kind %q", op.Kind)
 	}
 	if err != nil {
-		_ = state.SetOperationPhase(ctx, op.ID, domain.OperationRecovering, err.Error(), false)
+		if localMutation && op.Phase == domain.OperationPlanned && op.Attempts == 0 && !localSideEffectStarted {
+			// The executor returned before crossing the durable side-effect boundary.
+			// The current pin is therefore stale authority, not an unknown outcome:
+			// discard it and require a fresh complete scan/replan next cycle.
+			if deleteErr := state.DeleteOperation(ctx, op.ID); deleteErr != nil {
+				return fmt.Errorf("execute operation %d (%s %q): %v; discard known-unstarted operation: %w", op.ID, op.Kind, op.SrcPath, err, deleteErr)
+			}
+		} else {
+			_ = state.SetOperationPhase(ctx, op.ID, domain.OperationRecovering, err.Error(), false)
+		}
 		return fmt.Errorf("execute operation %d (%s %q): %w", op.ID, op.Kind, op.SrcPath, err)
+	}
+	if localMutation && !localSideEffectStarted {
+		err := fmt.Errorf("operation %d returned local-mutation success without durably entering the side-effect phase", op.ID)
+		if op.Phase == domain.OperationPlanned && op.Attempts == 0 {
+			if deleteErr := state.DeleteOperation(ctx, op.ID); deleteErr != nil {
+				return fmt.Errorf("%v; discard known-unstarted operation: %w", err, deleteErr)
+			}
+		} else {
+			_ = state.SetOperationPhase(ctx, op.ID, domain.OperationRecovering, err.Error(), false)
+		}
+		return err
 	}
 
 	local, ordinary, err := observeOperationLocalPostState(ctx, data, op)

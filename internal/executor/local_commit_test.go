@@ -7,7 +7,10 @@ import (
 	"testing"
 
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
+	"github.com/rijuyuezhu/pkudisk-sync/internal/rootmarker"
 )
+
+func allowLocalSideEffectForTest() error { return nil }
 
 func TestInstallDownloadedTempAbsentNeverReplacesConcurrentCreate(t *testing.T) {
 	root := t.TempDir()
@@ -169,7 +172,7 @@ func TestDeleteLocalPreservesSymlinkAndDeletesPinnedTarget(t *testing.T) {
 		LocalTargetIdentity: physicalIdentityForTest(t, target),
 		ExpectedLocal:       expected,
 	}
-	if err := exec.DeleteLocal(context.Background(), op, nil); err != nil {
+	if err := exec.DeleteLocal(context.Background(), op, nil, allowLocalSideEffectForTest); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Lstat(link)
@@ -230,7 +233,7 @@ func TestCopyFileSymlinkRemoteUpdateMaterializesLexicalPath(t *testing.T) {
 	if err := os.WriteFile(temp, []byte("remote-new"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := exec.commitDownloadedPhysicalTemp(ctx, op, temp, nil); err != nil {
+	if _, err := exec.commitDownloadedPhysicalTemp(ctx, op, temp, nil, allowLocalSideEffectForTest); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Lstat(link)
@@ -281,7 +284,7 @@ func TestCopyFileSymlinkRemoteDeleteRemovesOnlyLexicalObject(t *testing.T) {
 		ExpectedLocal:        expected,
 		ExpectedRemote:       domain.RemoteExpectation{Absent: true},
 	}
-	if err := exec.DeleteLocal(ctx, op, nil); err != nil {
+	if err := exec.DeleteLocal(ctx, op, nil, allowLocalSideEffectForTest); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(link); !os.IsNotExist(err) {
@@ -289,6 +292,154 @@ func TestCopyFileSymlinkRemoteDeleteRemovesOnlyLexicalObject(t *testing.T) {
 	}
 	if got, err := os.ReadFile(target); err != nil || string(got) != "external" {
 		t.Fatalf("copy delete changed referent: content=%q err=%v", got, err)
+	}
+}
+
+func TestCopyFinalSymlinkMutationPinRejectsRetargetIntoPeerRoot(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	safe := t.TempDir()
+	peer := t.TempDir()
+	safeFile := filepath.Join(safe, "x.txt")
+	peerFile := filepath.Join(peer, "x.txt")
+	for _, name := range []string{safeFile, peerFile} {
+		if err := os.WriteFile(name, []byte("same"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	safeInfo, err := os.Stat(safeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(peerFile, safeInfo.ModTime(), safeInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(safeFile, link); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy}}
+	expected, err := exec.ObserveLocalEntry(ctx, "link.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(peerFile, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.ResolveLocalMutationTarget(ctx, "link.txt", expected, domain.KindFile, []string{peer}); err == nil {
+		t.Fatal("final copy symlink mutation pin accepted retarget into peer root")
+	}
+}
+
+func TestCopyFinalSymlinkMutationPinRejectsDanglingExpectedAbsent(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy}}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(filepath.Join(root, "missing.txt"), link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.ResolveLocalMutationTarget(ctx, "link.txt", domain.LocalFingerprint{}, domain.KindFile, nil); err == nil {
+		t.Fatal("dangling copy symlink acquired expected-absent mutation authority")
+	}
+}
+
+func TestCopyFinalSymlinkMutationPinRejectsForeignRootMarker(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	safe := t.TempDir()
+	foreign := t.TempDir()
+	safeFile := filepath.Join(safe, "x.txt")
+	foreignFile := filepath.Join(foreign, "x.txt")
+	for _, name := range []string{safeFile, foreignFile} {
+		if err := os.WriteFile(name, []byte("same"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	safeInfo, err := os.Stat(safeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(foreignFile, safeInfo.ModTime(), safeInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(safeFile, link); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy}}
+	expected, err := exec.ObserveLocalEntry(ctx, "link.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(foreign, rootmarker.FileName), []byte("foreign\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(foreignFile, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.ResolveLocalMutationTarget(ctx, "link.txt", expected, domain.KindFile, nil); err == nil {
+		t.Fatal("final copy symlink mutation pin crossed a foreign root marker")
+	}
+}
+
+func TestCopyFileSymlinkDeleteRejectsReferentChangeAtSideEffectBoundary(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	external := t.TempDir()
+	target := filepath.Join(external, "target.txt")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy}}
+	expected, err := exec.ObserveLocalEntry(ctx, "link.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin, err := exec.ResolveLocalMutationTarget(ctx, "link.txt", expected, domain.KindFile, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := domain.Operation{
+		ID:                   47,
+		Kind:                 domain.OperationDeleteLocal,
+		EntryKind:            domain.KindFile,
+		SrcPath:              "link.txt",
+		LocalTargetPath:      pin.Path,
+		LocalTargetIdentity:  pin.AnchorIdentity,
+		LocalTargetAuthority: pin.Authority,
+		LocalSymlinkTarget:   pin.SymlinkTarget,
+		ExpectedLocal:        expected,
+		ExpectedRemote:       domain.RemoteExpectation{Absent: true},
+	}
+	begin := func() error {
+		return os.WriteFile(target, []byte("concurrent-referent-change"), 0o600)
+	}
+	if err := exec.DeleteLocal(ctx, op, nil, begin); err == nil {
+		t.Fatal("copy symlink delete ignored referent change at atomic preserve boundary")
+	}
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("failed copy delete did not restore lexical symlink")
+	}
+	if resolved, err := os.Readlink(link); err != nil || resolved != target {
+		t.Fatalf("restored symlink target = %q err=%v, want %q", resolved, err, target)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "concurrent-referent-change" {
+		t.Fatalf("concurrent referent change was not preserved: content=%q err=%v", got, err)
 	}
 }
 
@@ -367,7 +518,7 @@ func TestDeleteLocalRejectsSymlinkRetargetEvenWithEquivalentContent(t *testing.T
 		t.Fatal(err)
 	}
 	op := domain.Operation{ID: 42, Kind: domain.OperationDeleteLocal, EntryKind: domain.KindFile, SrcPath: "link.txt", LocalTargetPath: targetA, ExpectedLocal: expected}
-	if err := exec.DeleteLocal(context.Background(), op, nil); err == nil {
+	if err := exec.DeleteLocal(context.Background(), op, nil, allowLocalSideEffectForTest); err == nil {
 		t.Fatal("delete accepted a retargeted symlink")
 	}
 	for _, name := range []string{targetA, targetB} {
@@ -409,7 +560,7 @@ func TestCopyDescendantDeleteRejectsRetargetBeforeFirstSideEffect(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if target.Authority != domain.LocalMutationCopyPhysical || target.Path != fileA {
+	if target.Authority != domain.LocalMutationCopyPhysical || !samePhysicalDestination(target.Path, fileA, true) {
 		t.Fatalf("copy descendant pin = %+v, want copy-physical %q", target, fileA)
 	}
 
@@ -431,7 +582,7 @@ func TestCopyDescendantDeleteRejectsRetargetBeforeFirstSideEffect(t *testing.T) 
 		ExpectedLocal:        expected,
 		ExpectedRemote:       domain.RemoteExpectation{Absent: true},
 	}
-	if err := exec.DeleteLocal(context.Background(), op, nil); err == nil {
+	if err := exec.DeleteLocal(context.Background(), op, nil, allowLocalSideEffectForTest); err == nil {
 		t.Fatal("copy descendant delete accepted retarget before first side effect")
 	}
 	for _, name := range []string{fileA, fileB} {
@@ -533,7 +684,7 @@ func TestCopyDescendantDeleteRecoveryUsesPinnedReferentAfterRetarget(t *testing.
 		Phase:                domain.OperationRecovering,
 		Attempts:             1,
 	}
-	if err := exec.DeleteLocal(context.Background(), op, nil); err != nil {
+	if err := exec.DeleteLocal(context.Background(), op, nil, allowLocalSideEffectForTest); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(fileA); !os.IsNotExist(err) {
@@ -583,7 +734,7 @@ func TestDeleteLocalRejectsSamePathDirectoryReplacementAfterPin(t *testing.T) {
 		LocalTargetIdentity: pinnedIdentity,
 		ExpectedLocal:       expected,
 	}
-	if err := exec.DeleteLocal(context.Background(), op, nil); err == nil {
+	if err := exec.DeleteLocal(context.Background(), op, nil, allowLocalSideEffectForTest); err == nil {
 		t.Fatal("delete accepted a same-path directory replacement after pin")
 	}
 	for _, name := range []string{target, oldTarget} {
@@ -618,7 +769,7 @@ func TestEnsureLocalDirRejectsParentReplacementAfterPin(t *testing.T) {
 		LocalTargetIdentity: pinnedParentIdentity,
 		ExpectedLocal:       domain.LocalFingerprint{},
 	}
-	if err := exec.EnsureLocalDir(context.Background(), op, nil); err == nil {
+	if err := exec.EnsureLocalDir(context.Background(), op, nil, allowLocalSideEffectForTest); err == nil {
 		t.Fatal("directory create accepted a replaced physical parent after pin")
 	}
 	if _, err := os.Stat(target); !os.IsNotExist(err) {

@@ -469,6 +469,75 @@ func TestRunRootCycleDropsStalePlannedIntentThenReplans(t *testing.T) {
 	}
 }
 
+type failBeforeLocalSideEffectDataPlane struct {
+	*fakeDataPlane
+	failDelete bool
+}
+
+func (f *failBeforeLocalSideEffectDataPlane) DeleteLocal(ctx context.Context, op domain.Operation, peers []string, beginSideEffect func() error) error {
+	if f.failDelete {
+		f.failDelete = false
+		return fmt.Errorf("copy alias retargeted before first side effect")
+	}
+	return f.fakeDataPlane.DeleteLocal(ctx, op, peers, beginSideEffect)
+}
+
+func TestRunRootCycleDoesNotRecoverKnownUnstartedCopyDeleteAgainstStalePin(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, false)
+	if err := state.SetSyncRootEnabled(ctx, root.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootSymlinkMode(ctx, root.ID, domain.SymlinkCopy); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SetSyncRootEnabled(ctx, root.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.MarkSyncRootInitialized(ctx, root.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	local := localFileFP(4, 40)
+	remote := remoteFileFP("doc", "rev", 4)
+	if err := state.PutBaseline(ctx, domain.Baseline{SyncRootID: root.ID, RelPath: "alias/x.txt", Local: local, Remote: remote}); err != nil {
+		t.Fatal(err)
+	}
+	data := &failBeforeLocalSideEffectDataPlane{
+		fakeDataPlane: &fakeDataPlane{
+			local:  map[string]domain.LocalFingerprint{"alias/x.txt": local},
+			remote: make(map[string]domain.RemoteFingerprint),
+			mutationTargets: map[string]domain.LocalMutationTarget{
+				"alias/x.txt": {Path: filepath.Join(t.TempDir(), "A", "x.txt"), AnchorIdentity: "copy-a", Authority: domain.LocalMutationCopyPhysical},
+			},
+		},
+		failDelete: true,
+	}
+
+	if _, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1}); err == nil {
+		t.Fatal("known pre-side-effect failure unexpectedly succeeded")
+	}
+	if len(data.localOps) != 0 {
+		t.Fatalf("known pre-side-effect failure mutated local data: %+v", data.localOps)
+	}
+	if operations, err := state.ListOperations(ctx, root.ID); err != nil || len(operations) != 0 {
+		t.Fatalf("known-unstarted operation was retained for recovery: %+v err=%v", operations, err)
+	}
+
+	freshTarget := filepath.Join(t.TempDir(), "B", "x.txt")
+	data.mutationTargets["alias/x.txt"] = domain.LocalMutationTarget{Path: freshTarget, AnchorIdentity: "copy-b", Authority: domain.LocalMutationCopyPhysical}
+	result, err := RunRootCycle(ctx, root.ID, state, data, reconcile.DeletePolicy{MaxCount: 10, MaxFraction: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Blocked || result.Applied != 1 || result.Recovered != 0 {
+		t.Fatalf("fresh replan result = %+v", result)
+	}
+	if len(data.localOps) != 1 || data.localOps[0].LocalTargetPath != freshTarget {
+		t.Fatalf("fresh delete used stale pin: %+v", data.localOps)
+	}
+}
+
 func TestRunRootCycleRecoversAlreadyCompletedRunningDeleteWithoutReplay(t *testing.T) {
 	ctx := context.Background()
 	state, root := newCycleRoot(t, true, true)
@@ -1344,10 +1413,13 @@ func (f *fakeDataPlane) EnsureRemoteDir(_ context.Context, rel string, expected 
 	return nil
 }
 
-func (f *fakeDataPlane) EnsureLocalFile(_ context.Context, op domain.Operation, _ []string) (domain.LocalFingerprint, error) {
+func (f *fakeDataPlane) EnsureLocalFile(_ context.Context, op domain.Operation, _ []string, beginSideEffect func() error) (domain.LocalFingerprint, error) {
 	rel := op.SrcPath
 	if !domain.LocalEquivalent(f.local[rel], op.ExpectedLocal) || !fakeRemoteMatches(f.remote[rel], op.ExpectedRemote, domain.KindFile) {
 		return domain.LocalFingerprint{}, fmt.Errorf("local file precondition mismatch for %q", rel)
+	}
+	if err := beginSideEffect(); err != nil {
+		return domain.LocalFingerprint{}, err
 	}
 	f.calls = append(f.calls, "ensure-local-file:"+rel)
 	remote := f.remote[rel]
@@ -1365,11 +1437,14 @@ func (f *fakeDataPlane) EnsureLocalFile(_ context.Context, op domain.Operation, 
 	return written, nil
 }
 
-func (f *fakeDataPlane) EnsureLocalDir(_ context.Context, op domain.Operation, _ []string) error {
+func (f *fakeDataPlane) EnsureLocalDir(_ context.Context, op domain.Operation, _ []string, beginSideEffect func() error) error {
 	rel := op.SrcPath
 	expected := op.ExpectedLocal
 	if !domain.LocalEquivalent(f.local[rel], expected) || expected.Present {
 		return fmt.Errorf("local dir precondition mismatch for %q", rel)
+	}
+	if err := beginSideEffect(); err != nil {
+		return err
 	}
 	f.calls = append(f.calls, "ensure-local-dir:"+rel)
 	f.local[rel] = localDirFP()
@@ -1402,7 +1477,7 @@ func (f *fakeDataPlane) DeleteRemoteDir(_ context.Context, expected domain.Remot
 	return nil
 }
 
-func (f *fakeDataPlane) DeleteLocal(_ context.Context, op domain.Operation, _ []string) error {
+func (f *fakeDataPlane) DeleteLocal(_ context.Context, op domain.Operation, _ []string, beginSideEffect func() error) error {
 	rel := op.SrcPath
 	expected := op.ExpectedLocal
 	if !domain.LocalEquivalent(f.local[rel], expected) {
@@ -1415,6 +1490,9 @@ func (f *fakeDataPlane) DeleteLocal(_ context.Context, op domain.Operation, _ []
 				return fmt.Errorf("local dir %q is not empty", rel)
 			}
 		}
+	}
+	if err := beginSideEffect(); err != nil {
+		return err
 	}
 	f.calls = append(f.calls, "delete-local:"+rel)
 	f.localOps = append(f.localOps, op)

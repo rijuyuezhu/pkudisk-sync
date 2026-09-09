@@ -634,7 +634,7 @@ VALUES('v3-root', ?, 'pkudisk', 'Personal/V3', 1, 1, 'follow', 60, 1)`, filepath
 	}
 }
 
-func TestMigrationV6ToV7ExpandsCopyModeAndBackfillsOperationAuthority(t *testing.T) {
+func TestMigrationV6ToV7ExpandsCopyModeWithoutGuessingLegacyAuthority(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()
 	dbPath := filepath.Join(base, "state-v6.sqlite3")
@@ -672,7 +672,16 @@ VALUES(?, ?, 'pkudisk', ?, ?, ?, ?, 60, 1)`, row.uuid, row.localRoot, row.remote
 			t.Fatal(err)
 		}
 	}
-	for rootID, relPath := range map[int64]string{1: "followed.txt", 2: "lexical.txt"} {
+	for _, legacy := range []struct {
+		rootID   int64
+		relPath  string
+		phase    string
+		attempts int
+	}{
+		{1, "followed-running.txt", "running", 1},
+		{2, "lexical-running.txt", "running", 1},
+		{1, "planned.txt", "planned", 0},
+	} {
 		if _, err := db.ExecContext(ctx, `
 INSERT INTO operations(
     sync_root_id, kind, entry_kind, src_path, dst_path,
@@ -680,8 +689,8 @@ INSERT INTO operations(
     expected_remote_absent, expected_remote_id, expected_remote_rev,
     phase, attempts, last_error, created_at_ns, updated_at_ns,
     local_target_path, local_target_identity
-) VALUES(?, 'delete-local', 'file', ?, '', 1, 'file', 4, 40, 1, '', '', 'running', 1, '', 1, 1, ?, ?)`,
-			rootID, relPath, filepath.Join(base, relPath), fmt.Sprintf("anchor-%d", rootID)); err != nil {
+) VALUES(?, 'delete-local', 'file', ?, '', 1, 'file', 4, 40, 1, '', '', ?, ?, '', 1, 1, ?, ?)`,
+			legacy.rootID, legacy.relPath, legacy.phase, legacy.attempts, filepath.Join(base, legacy.relPath), fmt.Sprintf("anchor-%s", legacy.relPath)); err != nil {
 			_ = db.Close()
 			t.Fatal(err)
 		}
@@ -699,19 +708,33 @@ INSERT INTO operations(
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	for rootID, wantAuthority := range map[int64]domain.LocalMutationAuthority{
-		1: domain.LocalMutationFollowPhysical,
-		2: domain.LocalMutationLexical,
-	} {
-		operations, err := s.ListOperations(ctx, rootID)
-		if err != nil || len(operations) != 1 {
-			t.Fatalf("root %d migrated operations = %+v err=%v", rootID, operations, err)
-		}
-		op := operations[0]
-		if op.LocalTargetAuthority != wantAuthority || op.LocalTargetPath == "" || op.LocalTargetIdentity == "" || op.LocalSymlinkTarget != "" {
-			t.Fatalf("root %d migrated operation = %+v, want authority %q", rootID, op, wantAuthority)
-		}
+
+	operations, err := s.ListOperations(ctx, 1)
+	if err != nil || len(operations) != 2 {
+		t.Fatalf("follow-root migrated operations = %+v err=%v", operations, err)
 	}
+	byPath := make(map[string]domain.Operation, len(operations))
+	for _, op := range operations {
+		byPath[op.SrcPath] = op
+	}
+	running := byPath["followed-running.txt"]
+	if running.LocalTargetPath == "" || running.LocalTargetIdentity == "" || running.LocalTargetAuthority != "" || running.LocalSymlinkTarget != "" {
+		t.Fatalf("started v6 follow operation invented or lost authority state: %+v", running)
+	}
+	planned := byPath["planned.txt"]
+	if planned.LocalTargetPath != "" || planned.LocalTargetIdentity != "" || planned.LocalTargetAuthority != "" || planned.LocalSymlinkTarget != "" {
+		t.Fatalf("unattempted v6 operation retained stale pin: %+v", planned)
+	}
+
+	operations, err = s.ListOperations(ctx, 2)
+	if err != nil || len(operations) != 1 {
+		t.Fatalf("non-follow migrated operations = %+v err=%v", operations, err)
+	}
+	running = operations[0]
+	if running.LocalTargetPath == "" || running.LocalTargetIdentity == "" || running.LocalTargetAuthority != "" || running.LocalSymlinkTarget != "" {
+		t.Fatalf("started v6 non-follow operation invented or lost authority state: %+v", running)
+	}
+
 	if err := s.SetSyncRootSymlinkMode(ctx, 3, domain.SymlinkCopy); err != nil {
 		t.Fatalf("v7 copy mode rejected after migration: %v", err)
 	}

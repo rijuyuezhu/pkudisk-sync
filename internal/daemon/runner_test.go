@@ -503,12 +503,14 @@ func (stubDataPlane) Upload(context.Context, string, domain.LocalFingerprint, do
 func (stubDataPlane) EnsureRemoteDir(context.Context, string, domain.RemoteExpectation) error {
 	return nil
 }
-func (stubDataPlane) EnsureLocalFile(context.Context, domain.Operation, []string) (domain.LocalFingerprint, error) {
+func (stubDataPlane) EnsureLocalFile(context.Context, domain.Operation, []string, func() error) (domain.LocalFingerprint, error) {
 	return domain.LocalFingerprint{}, nil
 }
-func (stubDataPlane) EnsureLocalDir(context.Context, domain.Operation, []string) error {
+func (stubDataPlane) EnsureLocalDir(context.Context, domain.Operation, []string, func() error) error {
 	return nil
 }
 func (stubDataPlane) DeleteRemoteFile(context.Context, domain.RemoteExpectation) error { return nil }
 func (stubDataPlane) DeleteRemoteDir(context.Context, domain.RemoteExpectation) error  { return nil }
-func (stubDataPlane) DeleteLocal(context.Context, domain.Operation, []string) error    { return nil }
+func (stubDataPlane) DeleteLocal(context.Context, domain.Operation, []string, func() error) error {
+	return nil
+}

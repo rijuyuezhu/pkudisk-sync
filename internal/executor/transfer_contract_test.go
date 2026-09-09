@@ -267,7 +267,7 @@ func TestEnsureLocalFileStagesAndCommitsGuardedDownload(t *testing.T) {
 		LocalTargetIdentity: physicalIdentityForTest(t, root),
 		ExpectedRemote:      expectedRemote,
 	}
-	got, err := exec.EnsureLocalFile(ctx, op, nil)
+	got, err := exec.EnsureLocalFile(ctx, op, nil, allowLocalSideEffectForTest)
 	if err != nil {
 		t.Fatal(err)
 	}
