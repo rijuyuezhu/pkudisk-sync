@@ -403,13 +403,25 @@ func physicalMutationPathname(value string) string {
 	return filepath.Join(parent, filepath.Base(value))
 }
 
+func physicalConfiguredRootPath(value string) string {
+	value = filepath.Clean(value)
+	resolved, err := filepath.EvalSymlinks(value)
+	if err != nil {
+		return value
+	}
+	if abs, absErr := filepath.Abs(resolved); absErr == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(resolved)
+}
+
 func copyMutationOverlapsConfiguredRoot(rootPath, targetPath string, targetKind domain.EntryKind) bool {
-	// Configured roots are canonicalized by daemon.SetupRoot before entering
-	// store authority. Canonicalize only the mutation parent here so the leaf
-	// remains a pathname authority: distinct hard-link pathnames must not
-	// collapse merely because they name the same inode.
+	// Canonicalize the configured root as a directory object, but only the
+	// mutation parent. The target leaf remains pathname authority: native root
+	// aliases such as macOS /var -> /private/var converge without collapsing
+	// distinct hard-link leaf pathnames.
 	return physicalOwnershipPathsOverlap(
-		filepath.Clean(rootPath), domain.KindDir,
+		physicalConfiguredRootPath(rootPath), domain.KindDir,
 		physicalMutationPathname(targetPath), targetKind,
 	)
 }
