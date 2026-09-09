@@ -282,6 +282,127 @@ func TestScanLocalFollowRejectsDuplicatePhysicalOwnership(t *testing.T) {
 	}
 }
 
+func TestScanLocalCopyAllowsDuplicateAndInternalProjections(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "x.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(root, "internal")); err != nil {
+		t.Fatal(err)
+	}
+
+	external := t.TempDir()
+	if err := os.WriteFile(filepath.Join(external, "note.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(root, "alias-a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(root, "alias-b")); err != nil {
+		t.Fatal(err)
+	}
+	fileTarget := filepath.Join(external, "note.txt")
+	if err := os.Symlink(fileTarget, filepath.Join(root, "file-a.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(fileTarget, filepath.Join(root, "file-b.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy}}
+	got, excluded, claims, err := exec.ScanLocal(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(excluded) != 0 || len(claims) != 0 {
+		t.Fatalf("copy exclusions=%v claims=%+v", excluded, claims)
+	}
+	for _, rel := range []string{"real/x.txt", "internal/x.txt", "alias-a/note.txt", "alias-b/note.txt", "file-a.txt", "file-b.txt"} {
+		if !got[rel].Present || got[rel].Kind != domain.KindFile {
+			t.Fatalf("copy projection %q = %+v; snapshot=%+v", rel, got[rel], got)
+		}
+	}
+}
+
+func TestScanLocalCopyRetainsPeerRootFencing(t *testing.T) {
+	root := t.TempDir()
+	peer := t.TempDir()
+	if err := os.WriteFile(filepath.Join(peer, "x.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(peer, filepath.Join(root, "peer")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy}}
+	if _, _, _, err := exec.ScanLocal(context.Background(), nil, []string{peer}); err == nil {
+		t.Fatal("copy projection crossed into configured peer root")
+	}
+
+	root2 := t.TempDir()
+	container := t.TempDir()
+	containedPeer := filepath.Join(container, "peer")
+	if err := os.Mkdir(containedPeer, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(container, filepath.Join(root2, "container")); err != nil {
+		t.Fatal(err)
+	}
+	exec2 := &RootExecutor{root: domain.SyncRoot{LocalRoot: root2, SymlinkMode: domain.SymlinkCopy}}
+	if _, _, _, err := exec2.ScanLocal(context.Background(), nil, []string{containedPeer}); err == nil {
+		t.Fatal("copy projection directory was allowed to contain a configured peer root")
+	}
+}
+
+func TestScanLocalCopyExcludesDanglingAndCycles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Symlink("missing", filepath.Join(root, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", ".."), filepath.Join(root, "sub", "up")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy}}
+	got, excluded, claims, err := exec.ScanLocal(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 0 || got["sub"].Kind != domain.KindDir {
+		t.Fatalf("copy snapshot=%+v claims=%+v", got, claims)
+	}
+	want := map[string]bool{"dangling": true, "sub/up": true}
+	for _, rel := range excluded {
+		delete(want, rel)
+	}
+	if len(want) != 0 {
+		t.Fatalf("copy exclusions missing %v; got %v", want, excluded)
+	}
+}
+
+func TestScanLocalCopyRejectsForeignRootMarker(t *testing.T) {
+	root := t.TempDir()
+	foreign := t.TempDir()
+	if err := os.WriteFile(filepath.Join(foreign, rootmarker.FileName), []byte("foreign\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(foreign, "x.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(foreign, filepath.Join(root, "foreign")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy}}
+	if _, _, _, err := exec.ScanLocal(context.Background(), nil, nil); err == nil {
+		t.Fatal("copy projection crossed a foreign sync-root marker")
+	}
+}
+
 func TestScanLocalFollowRejectsTargetInsideForeignSyncRoot(t *testing.T) {
 	root := t.TempDir()
 	foreign := t.TempDir()

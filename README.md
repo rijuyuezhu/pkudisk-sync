@@ -10,7 +10,7 @@ Cross-platform, stateful, bidirectional synchronization for selected PKU Disk di
 
 - Synchronize multiple explicitly selected local/PKU Disk directory pairs.
 - Three-way reconciliation with conflict preservation and deletion safeguards.
-- Per-root symlink policy: follow by default, or explicitly reject/ignore links.
+- Per-root symlink policy: `follow` by default, Seafile-style `copy` projection, or explicit `reject`/`ignore`.
 - Filesystem watching plus periodic repair scans.
 - Native per-user background service support on Linux, macOS, and Windows.
 

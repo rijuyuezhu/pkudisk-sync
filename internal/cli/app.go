@@ -717,7 +717,7 @@ func (a *Application) runRootAdd(ctx context.Context, args []string) error {
 	localArg := fs.String("local", "", "local directory")
 	remoteArg := fs.String("remote", "", "PKU Disk root in remote:path form")
 	poll := fs.Duration("poll", 0, "periodic repair interval; 0 uses daemon default")
-	symlinks := fs.String("symlinks", string(domain.SymlinkFollow), "symlink policy: follow, reject, or ignore")
+	symlinks := fs.String("symlinks", string(domain.SymlinkFollow), "symlink policy: follow, copy, reject, or ignore")
 	recoverOrphanMarker := fs.Bool("recover-orphan-marker", false, "replace an unowned reserved root marker left by an interrupted prior add")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -844,7 +844,7 @@ func (a *Application) runRootList(ctx context.Context, args []string) error {
 func (a *Application) runRootConfig(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("root config", flag.ContinueOnError)
 	fs.SetOutput(a.stderr)
-	symlinks := fs.String("symlinks", "", "symlink policy: follow, reject, or ignore")
+	symlinks := fs.String("symlinks", "", "symlink policy: follow, copy, reject, or ignore")
 	parseArgs := args
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		parseArgs = append(append([]string(nil), args[1:]...), args[0])
@@ -856,7 +856,7 @@ func (a *Application) runRootConfig(ctx context.Context, args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 || *symlinks == "" {
-		return fmt.Errorf("root config requires one root ID and --symlinks follow|reject|ignore")
+		return fmt.Errorf("root config requires one root ID and --symlinks follow|copy|reject|ignore")
 	}
 	id, err := strconv.ParseInt(fs.Arg(0), 10, 64)
 	if err != nil || id <= 0 {

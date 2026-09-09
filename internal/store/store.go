@@ -10,7 +10,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 6
+const schemaVersion = 7
 
 // Store is the durable semantic authority for sync roots, committed baselines,
 // external-side-effect intents, and conflicts.
@@ -207,6 +207,43 @@ WHERE kind IN ('ensure-local', 'delete-local')
 			return fmt.Errorf("migrate local mutation authority v5 to v6: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 6"); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+		version = 6
+	}
+	if version == 6 {
+		// SQLite cannot alter a CHECK constraint in place. Rename the old mode
+		// column, add the expanded v7 column, copy values, then drop the legacy
+		// column. No pairing/baseline/claim data changes in this migration.
+		if _, err := tx.ExecContext(ctx, `
+ALTER TABLE sync_roots RENAME COLUMN symlink_mode TO symlink_mode_v6;
+ALTER TABLE sync_roots
+ADD COLUMN symlink_mode TEXT NOT NULL DEFAULT 'follow'
+CHECK (symlink_mode IN ('follow', 'copy', 'reject', 'ignore'));
+UPDATE sync_roots SET symlink_mode = symlink_mode_v6;
+ALTER TABLE sync_roots DROP COLUMN symlink_mode_v6`); err != nil {
+			return fmt.Errorf("migrate symlink mode constraint v6 to v7: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+ALTER TABLE operations
+ADD COLUMN local_target_authority TEXT NOT NULL DEFAULT ''
+CHECK (local_target_authority IN ('', 'lexical', 'follow-physical', 'copy-physical'));
+ALTER TABLE operations
+ADD COLUMN local_symlink_target TEXT NOT NULL DEFAULT '';
+
+-- Copy mode did not exist before v7. Existing complete pins on follow roots
+-- are strict physical authority; complete pins on other roots are lexical.
+-- Incomplete legacy pins intentionally remain authority-less and fail closed.
+UPDATE operations
+SET local_target_authority = CASE
+    WHEN (SELECT symlink_mode FROM sync_roots WHERE sync_roots.id = operations.sync_root_id) = 'follow'
+        THEN 'follow-physical'
+    ELSE 'lexical'
+END
+WHERE local_target_path <> '' AND local_target_identity <> ''`); err != nil {
+			return fmt.Errorf("migrate operation-local authority v6 to v7: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 7"); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
 	}

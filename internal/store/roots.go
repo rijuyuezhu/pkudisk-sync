@@ -215,6 +215,8 @@ func (s *Store) SetSyncRootEnabled(ctx context.Context, id int64, enabled bool) 
 
 // SetSyncRootSymlinkMode changes local symlink policy only while a root is
 // paused and has no pending operation created under the previous policy.
+// Copy changes pairing semantics, so an initialized pairing may not transition
+// to or from copy without an explicit remove/re-add (re-pair) lifecycle.
 func (s *Store) SetSyncRootSymlinkMode(ctx context.Context, id int64, mode domain.SymlinkMode) error {
 	if id <= 0 {
 		return fmt.Errorf("sync root ID must be positive")
@@ -228,7 +230,14 @@ UPDATE sync_roots
 SET symlink_mode = ?
 WHERE id = ?
   AND enabled = 0
-  AND NOT EXISTS (SELECT 1 FROM operations WHERE operations.sync_root_id = sync_roots.id)`, parsed, id)
+  AND NOT EXISTS (SELECT 1 FROM operations WHERE operations.sync_root_id = sync_roots.id)
+  AND NOT (
+      initialized = 1
+      AND (
+          (symlink_mode = 'copy' AND ? <> 'copy')
+          OR (symlink_mode <> 'copy' AND ? = 'copy')
+      )
+  )`, parsed, id, parsed, parsed)
 	if err != nil {
 		return fmt.Errorf("update sync root symlink mode: %w", err)
 	}
@@ -239,10 +248,15 @@ WHERE id = ?
 	if rows == 1 {
 		return nil
 	}
-	if _, ok, getErr := s.GetSyncRoot(ctx, id); getErr != nil {
+	root, ok, getErr := s.GetSyncRoot(ctx, id)
+	if getErr != nil {
 		return getErr
-	} else if !ok {
+	}
+	if !ok {
 		return fmt.Errorf("sync root %d not found", id)
+	}
+	if root.Initialized && (root.EffectiveSymlinkMode() == domain.SymlinkCopy) != (parsed == domain.SymlinkCopy) {
+		return fmt.Errorf("sync root %d is initialized; changing to or from symlink mode copy requires explicit re-pairing", id)
 	}
 	return fmt.Errorf("sync root %d must be paused and have no pending operations before changing symlink mode", id)
 }

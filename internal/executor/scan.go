@@ -43,7 +43,7 @@ func (e *RootExecutor) ScanLocal(ctx context.Context, operations []domain.Operat
 		peerLocalRoots:         peerLocalRoots,
 		followedPhysicalClaims: make(map[string]domain.FollowedPhysicalClaim),
 	}
-	if err := e.scanLocalDir(ctx, e.root.LocalRoot, "", []os.FileInfo{rootInfo}, entries, &excluded, state); err != nil {
+	if err := e.scanLocalDir(ctx, e.root.LocalRoot, "", []os.FileInfo{rootInfo}, false, entries, &excluded, state); err != nil {
 		return nil, nil, nil, fmt.Errorf("scan local root %q: %w", e.root.LocalRoot, err)
 	}
 	return entries, excluded, state.followedPhysicalClaims, nil
@@ -68,7 +68,7 @@ func (s *localScanState) claim(physicalPath, rel string, info os.FileInfo) (stri
 	return identity, nil
 }
 
-func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir string, ancestors []os.FileInfo, out map[string]domain.LocalFingerprint, excluded *[]string, state *localScanState) error {
+func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir string, ancestors []os.FileInfo, insideCopyProjection bool, out map[string]domain.LocalFingerprint, excluded *[]string, state *localScanState) error {
 	listed, err := os.ReadDir(physicalDir)
 	if err != nil {
 		return fmt.Errorf("read local directory %q: %w", relDir, err)
@@ -115,6 +115,45 @@ func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir str
 			case domain.SymlinkIgnore:
 				*excluded = append(*excluded, rel)
 				continue
+			case domain.SymlinkCopy:
+				resolved, present, resolveErr := resolveFollowedLocalPath(physicalPath, true)
+				if resolveErr != nil || !present {
+					// An unavailable projection is not local-deletion evidence.
+					*excluded = append(*excluded, rel)
+					continue
+				}
+				if err := rejectPeerRootPath(resolved, state.peerLocalRoots); err != nil {
+					return fmt.Errorf("copy symlink %q: %w", rel, err)
+				}
+				if err := e.rejectForeignRootTarget(resolved); err != nil {
+					return fmt.Errorf("copy symlink %q: %w", rel, err)
+				}
+				resolvedInfo, statErr := os.Stat(resolved)
+				if statErr != nil {
+					*excluded = append(*excluded, rel)
+					continue
+				}
+				if resolvedInfo.IsDir() {
+					resolvedIsAncestor, err := strictPhysicalPathAncestor(resolved, physicalDir)
+					if err != nil {
+						return fmt.Errorf("compare physical copy-symlink ancestry for %q: %w", rel, err)
+					}
+					if sameAsAny(resolvedInfo, ancestors) || resolvedIsAncestor {
+						*excluded = append(*excluded, rel)
+						continue
+					}
+					out[rel] = domain.LocalFingerprint{Present: true, Kind: domain.KindDir}
+					if err := e.scanLocalDir(ctx, resolved, rel, append(ancestors, resolvedInfo), true, out, excluded, state); err != nil {
+						return err
+					}
+					continue
+				}
+				if resolvedInfo.Mode().IsRegular() {
+					out[rel] = localFileFingerprint(resolvedInfo)
+					continue
+				}
+				*excluded = append(*excluded, rel)
+				continue
 			case domain.SymlinkFollow:
 				resolved, present, resolveErr := resolveFollowedLocalPath(physicalPath, true)
 				if resolveErr != nil {
@@ -157,7 +196,7 @@ func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir str
 					}
 					state.followedPhysicalClaims[rel] = domain.FollowedPhysicalClaim{Kind: domain.KindDir, Identity: identity, TargetPath: resolved}
 					out[rel] = domain.LocalFingerprint{Present: true, Kind: domain.KindDir}
-					if err := e.scanLocalDir(ctx, resolved, rel, append(ancestors, resolvedInfo), out, excluded, state); err != nil {
+					if err := e.scanLocalDir(ctx, resolved, rel, append(ancestors, resolvedInfo), false, out, excluded, state); err != nil {
 						return err
 					}
 					continue
@@ -186,16 +225,20 @@ func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir str
 				*excluded = append(*excluded, rel)
 				continue
 			}
-			if _, err := state.claim(physicalPath, rel, info); err != nil {
-				return err
+			if !insideCopyProjection {
+				if _, err := state.claim(physicalPath, rel, info); err != nil {
+					return err
+				}
 			}
 			out[rel] = domain.LocalFingerprint{Present: true, Kind: domain.KindDir}
-			if err := e.scanLocalDir(ctx, physicalPath, rel, append(ancestors, info), out, excluded, state); err != nil {
+			if err := e.scanLocalDir(ctx, physicalPath, rel, append(ancestors, info), insideCopyProjection, out, excluded, state); err != nil {
 				return err
 			}
 		case info.Mode().IsRegular():
-			if _, err := state.claim(physicalPath, rel, info); err != nil {
-				return err
+			if !insideCopyProjection {
+				if _, err := state.claim(physicalPath, rel, info); err != nil {
+					return err
+				}
 			}
 			out[rel] = localFileFingerprint(info)
 		default:

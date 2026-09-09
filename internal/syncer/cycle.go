@@ -21,18 +21,21 @@ type DataPlane interface {
 	ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]domain.FollowedPhysicalClaim, error)
 	ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error)
 	ObserveLocalEntry(context.Context, string) (domain.LocalFingerprint, error)
+	ObservePinnedLocalEntry(context.Context, domain.Operation) (domain.LocalFingerprint, bool, error)
 	ObserveRemoteEntry(context.Context, string) (domain.RemoteFingerprint, error)
-	ResolveLocalMutationTarget(context.Context, string, domain.LocalFingerprint, domain.EntryKind) (domain.LocalMutationTarget, error)
+	ResolveLocalMutationTarget(context.Context, string, domain.LocalFingerprint, domain.EntryKind, []string) (domain.LocalMutationTarget, error)
+	PinnedLocalPreconditionHolds(context.Context, domain.Operation) (bool, error)
 	LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error)
 	CleanupLocalRecoveryArtifact(context.Context, domain.Operation) error
 	CompareFileContent(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (bool, error)
+	ComparePinnedFileContent(context.Context, domain.Operation, domain.RemoteExpectation) (bool, error)
 	Upload(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (domain.RemoteFingerprint, error)
 	EnsureRemoteDir(context.Context, string, domain.RemoteExpectation) error
-	EnsureLocalFile(context.Context, domain.Operation) (domain.LocalFingerprint, error)
-	EnsureLocalDir(context.Context, domain.Operation) error
+	EnsureLocalFile(context.Context, domain.Operation, []string) (domain.LocalFingerprint, error)
+	EnsureLocalDir(context.Context, domain.Operation, []string) error
 	DeleteRemoteFile(context.Context, domain.RemoteExpectation) error
 	DeleteRemoteDir(context.Context, domain.RemoteExpectation) error
-	DeleteLocal(context.Context, domain.Operation) error
+	DeleteLocal(context.Context, domain.Operation, []string) error
 }
 
 // CycleResult summarizes one selected-root cycle without making caller-visible
@@ -355,8 +358,8 @@ func pinLocalMutationTarget(ctx context.Context, state *store.Store, data DataPl
 	if !isLocalMutation(op) {
 		return op, nil
 	}
-	if op.LocalTargetPath != "" || op.LocalTargetIdentity != "" {
-		if op.LocalTargetPath == "" || op.LocalTargetIdentity == "" {
+	if op.LocalTargetPath != "" || op.LocalTargetIdentity != "" || op.LocalTargetAuthority != "" {
+		if op.LocalTargetPath == "" || op.LocalTargetIdentity == "" || op.LocalTargetAuthority == "" {
 			return op, fmt.Errorf("operation %d has an incomplete physical local target pin", op.ID)
 		}
 		return op, nil
@@ -364,7 +367,11 @@ func pinLocalMutationTarget(ctx context.Context, state *store.Store, data DataPl
 	if op.Phase != domain.OperationPlanned || op.Attempts != 0 {
 		return op, fmt.Errorf("operation %d has no pinned local target after mutation attempts started", op.ID)
 	}
-	target, err := data.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal, op.EntryKind)
+	peerRoots, err := configuredPeerLocalRoots(ctx, state, op.SyncRootID)
+	if err != nil {
+		return op, err
+	}
+	target, err := data.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal, op.EntryKind, peerRoots)
 	if err != nil {
 		// This intent is still planned, unpinned, and has never attempted an
 		// external mutation. A resolution failure means the snapshot used to
@@ -387,6 +394,15 @@ func pinLocalMutationTarget(ctx context.Context, state *store.Store, data DataPl
 	}
 	op.LocalTargetPath = target.Path
 	op.LocalTargetIdentity = target.AnchorIdentity
+	op.LocalTargetAuthority = target.Authority
+	if op.LocalTargetAuthority == "" {
+		if len(target.FollowedClaims) != 0 {
+			op.LocalTargetAuthority = domain.LocalMutationFollowPhysical
+		} else {
+			op.LocalTargetAuthority = domain.LocalMutationLexical
+		}
+	}
+	op.LocalSymlinkTarget = target.SymlinkTarget
 	return op, nil
 }
 
@@ -420,8 +436,8 @@ func recoverExistingOperations(ctx context.Context, state *store.Store, data Dat
 					return false, recovered, err
 				}
 			}
-			if isLocalMutation(op) && (op.LocalTargetPath == "" || op.LocalTargetIdentity == "") {
-				detail := "local mutation started before a complete physical target path and identity were pinned; automatic replay is unsafe"
+			if isLocalMutation(op) && (op.LocalTargetPath == "" || op.LocalTargetIdentity == "" || op.LocalTargetAuthority == "") {
+				detail := "local mutation started before a complete target path, identity, and authority were pinned; automatic replay is unsafe"
 				if err := state.SetOperationPhase(ctx, op.ID, domain.OperationBlocked, detail, false); err != nil {
 					return false, recovered, err
 				}
@@ -458,7 +474,7 @@ func recoverExistingOperations(ctx context.Context, state *store.Store, data Dat
 					return true, recovered, nil
 				}
 			}
-			holds, err := operationPreconditionsHold(ctx, data, op)
+			holds, err := recoveryRetryPreconditionsHold(ctx, data, op)
 			if err != nil {
 				return false, recovered, err
 			}
@@ -489,6 +505,11 @@ func executePersistedOperation(ctx context.Context, state *store.Store, data Dat
 	if err := state.SetOperationPhase(ctx, op.ID, domain.OperationRunning, "", true); err != nil {
 		return err
 	}
+	peerRoots, peerErr := configuredPeerLocalRoots(ctx, state, op.SyncRootID)
+	if peerErr != nil {
+		_ = state.SetOperationPhase(ctx, op.ID, domain.OperationRecovering, peerErr.Error(), false)
+		return peerErr
+	}
 
 	var (
 		err                    error
@@ -507,9 +528,9 @@ func executePersistedOperation(ctx context.Context, state *store.Store, data Dat
 		}
 	case domain.OperationEnsureLocal:
 		if op.EntryKind == domain.KindDir {
-			err = data.EnsureLocalDir(ctx, op)
+			err = data.EnsureLocalDir(ctx, op, peerRoots)
 		} else {
-			exactDownloadResult, err = data.EnsureLocalFile(ctx, op)
+			exactDownloadResult, err = data.EnsureLocalFile(ctx, op, peerRoots)
 			hasExactDownloadResult = err == nil
 		}
 	case domain.OperationDeleteRemote:
@@ -519,7 +540,7 @@ func executePersistedOperation(ctx context.Context, state *store.Store, data Dat
 			err = data.DeleteRemoteFile(ctx, op.ExpectedRemote)
 		}
 	case domain.OperationDeleteLocal:
-		err = data.DeleteLocal(ctx, op)
+		err = data.DeleteLocal(ctx, op, peerRoots)
 	default:
 		err = fmt.Errorf("unsupported operation kind %q", op.Kind)
 	}
@@ -528,8 +549,13 @@ func executePersistedOperation(ctx context.Context, state *store.Store, data Dat
 		return fmt.Errorf("execute operation %d (%s %q): %w", op.ID, op.Kind, op.SrcPath, err)
 	}
 
-	local, err := data.ObserveLocalEntry(ctx, op.SrcPath)
+	local, ordinary, err := observeOperationLocalPostState(ctx, data, op)
 	if err != nil {
+		_ = state.SetOperationPhase(ctx, op.ID, domain.OperationRecovering, err.Error(), false)
+		return err
+	}
+	if !ordinary {
+		err := fmt.Errorf("operation %d returned success but pinned local target is not materialized as an ordinary entry", op.ID)
 		_ = state.SetOperationPhase(ctx, op.ID, domain.OperationRecovering, err.Error(), false)
 		return err
 	}
@@ -568,14 +594,40 @@ func operationPreconditionsHold(ctx context.Context, data DataPlane, op domain.O
 	return domain.LocalEquivalent(local, op.ExpectedLocal) && remoteMatchesExpectation(remote, op.ExpectedRemote, op.EntryKind), nil
 }
 
+func recoveryRetryPreconditionsHold(ctx context.Context, data DataPlane, op domain.Operation) (bool, error) {
+	if !isLocalMutation(op) {
+		return operationPreconditionsHold(ctx, data, op)
+	}
+	localHolds, err := data.PinnedLocalPreconditionHolds(ctx, op)
+	if err != nil || !localHolds {
+		return localHolds, err
+	}
+	remote, err := data.ObserveRemoteEntry(ctx, op.SrcPath)
+	if err != nil {
+		return false, err
+	}
+	return remoteMatchesExpectation(remote, op.ExpectedRemote, op.EntryKind), nil
+}
+
+func observeOperationLocalPostState(ctx context.Context, data DataPlane, op domain.Operation) (domain.LocalFingerprint, bool, error) {
+	if !isLocalMutation(op) {
+		local, err := data.ObserveLocalEntry(ctx, op.SrcPath)
+		return local, true, err
+	}
+	return data.ObservePinnedLocalEntry(ctx, op)
+}
+
 func proveRecoveredPostcondition(ctx context.Context, data DataPlane, op domain.Operation) (bool, domain.LocalFingerprint, domain.RemoteFingerprint, error) {
-	local, err := data.ObserveLocalEntry(ctx, op.SrcPath)
+	local, ordinary, err := observeOperationLocalPostState(ctx, data, op)
 	if err != nil {
 		return false, domain.LocalFingerprint{}, domain.RemoteFingerprint{}, err
 	}
 	remote, err := data.ObserveRemoteEntry(ctx, op.SrcPath)
 	if err != nil {
 		return false, domain.LocalFingerprint{}, domain.RemoteFingerprint{}, err
+	}
+	if !ordinary {
+		return false, local, remote, nil
 	}
 
 	switch op.Kind {
@@ -611,18 +663,36 @@ func proveRecoveredPostcondition(ctx context.Context, data DataPlane, op domain.
 		if !local.Present || local.Kind != domain.KindFile || local.Size != remote.Size {
 			return false, local, remote, nil
 		}
-		equal, err := data.CompareFileContent(ctx, op.SrcPath, local, op.ExpectedRemote)
+		equal, err := data.ComparePinnedFileContent(ctx, op, op.ExpectedRemote)
 		if err != nil {
 			return false, local, remote, err
 		}
 		if !equal {
 			return false, local, remote, nil
 		}
-		local2, remote2, err := observeStablePair(ctx, data, op.SrcPath, local, remote)
+		local2, remote2, err := observeStableLocalOperationPair(ctx, data, op, local, remote)
 		return err == nil, local2, remote2, err
 	default:
 		return false, local, remote, nil
 	}
+}
+
+func observeStableLocalOperationPair(ctx context.Context, data DataPlane, op domain.Operation, beforeLocal domain.LocalFingerprint, beforeRemote domain.RemoteFingerprint) (domain.LocalFingerprint, domain.RemoteFingerprint, error) {
+	local, ordinary, err := data.ObservePinnedLocalEntry(ctx, op)
+	if err != nil {
+		return domain.LocalFingerprint{}, domain.RemoteFingerprint{}, err
+	}
+	if !ordinary {
+		return local, domain.RemoteFingerprint{}, fmt.Errorf("pinned local target for %q changed to a non-ordinary entry while proving operation recovery", op.SrcPath)
+	}
+	remote, err := data.ObserveRemoteEntry(ctx, op.SrcPath)
+	if err != nil {
+		return domain.LocalFingerprint{}, domain.RemoteFingerprint{}, err
+	}
+	if !domain.LocalEquivalent(local, beforeLocal) || !domain.RemoteEquivalent(remote, beforeRemote) {
+		return local, remote, fmt.Errorf("entry %q changed while proving operation recovery", op.SrcPath)
+	}
+	return local, remote, nil
 }
 
 func observeStablePair(ctx context.Context, data DataPlane, relPath string, beforeLocal domain.LocalFingerprint, beforeRemote domain.RemoteFingerprint) (domain.LocalFingerprint, domain.RemoteFingerprint, error) {

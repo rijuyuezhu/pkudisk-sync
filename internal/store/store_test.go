@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -633,6 +634,100 @@ VALUES('v3-root', ?, 'pkudisk', 'Personal/V3', 1, 1, 'follow', 60, 1)`, filepath
 	}
 }
 
+func TestMigrationV6ToV7ExpandsCopyModeAndBackfillsOperationAuthority(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	dbPath := filepath.Join(base, "state-v6.sqlite3")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, schemaV1); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`ALTER TABLE sync_roots ADD COLUMN initialized INTEGER NOT NULL DEFAULT 0 CHECK (initialized IN (0, 1))`,
+		`ALTER TABLE sync_roots ADD COLUMN symlink_mode TEXT NOT NULL DEFAULT 'follow' CHECK (symlink_mode IN ('follow', 'reject', 'ignore'))`,
+		`ALTER TABLE operations ADD COLUMN local_target_path TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE operations ADD COLUMN local_target_identity TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	for _, row := range []struct {
+		uuid, localRoot, remoteRoot, mode string
+		enabled, initialized              int
+	}{
+		{"v6-follow", filepath.Join(base, "follow"), "Personal/V6-Follow", "follow", 1, 1},
+		{"v6-reject", filepath.Join(base, "reject"), "Personal/V6-Reject", "reject", 1, 1},
+		{"v6-copy-candidate", filepath.Join(base, "copy"), "Personal/V6-Copy", "follow", 0, 0},
+	} {
+		if _, err := db.ExecContext(ctx, `
+INSERT INTO sync_roots(uuid, local_root, remote_name, remote_root, enabled, initialized, symlink_mode, poll_interval_seconds, created_at_ns)
+VALUES(?, ?, 'pkudisk', ?, ?, ?, ?, 60, 1)`, row.uuid, row.localRoot, row.remoteRoot, row.enabled, row.initialized, row.mode); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	for rootID, relPath := range map[int64]string{1: "followed.txt", 2: "lexical.txt"} {
+		if _, err := db.ExecContext(ctx, `
+INSERT INTO operations(
+    sync_root_id, kind, entry_kind, src_path, dst_path,
+    expected_local_present, expected_local_kind, expected_local_size, expected_local_mtime_ns,
+    expected_remote_absent, expected_remote_id, expected_remote_rev,
+    phase, attempts, last_error, created_at_ns, updated_at_ns,
+    local_target_path, local_target_identity
+) VALUES(?, 'delete-local', 'file', ?, '', 1, 'file', 4, 40, 1, '', '', 'running', 1, '', 1, 1, ?, ?)`,
+			rootID, relPath, filepath.Join(base, relPath), fmt.Sprintf("anchor-%d", rootID)); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA user_version = 6"); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	for rootID, wantAuthority := range map[int64]domain.LocalMutationAuthority{
+		1: domain.LocalMutationFollowPhysical,
+		2: domain.LocalMutationLexical,
+	} {
+		operations, err := s.ListOperations(ctx, rootID)
+		if err != nil || len(operations) != 1 {
+			t.Fatalf("root %d migrated operations = %+v err=%v", rootID, operations, err)
+		}
+		op := operations[0]
+		if op.LocalTargetAuthority != wantAuthority || op.LocalTargetPath == "" || op.LocalTargetIdentity == "" || op.LocalSymlinkTarget != "" {
+			t.Fatalf("root %d migrated operation = %+v, want authority %q", rootID, op, wantAuthority)
+		}
+	}
+	if err := s.SetSyncRootSymlinkMode(ctx, 3, domain.SymlinkCopy); err != nil {
+		t.Fatalf("v7 copy mode rejected after migration: %v", err)
+	}
+	root, ok, err := s.GetSyncRoot(ctx, 3)
+	if err != nil || !ok || root.EffectiveSymlinkMode() != domain.SymlinkCopy {
+		t.Fatalf("copy-mode migrated root = %+v ok=%v err=%v", root, ok, err)
+	}
+	var version int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("schema version after v6 migration = %d, want %d", version, schemaVersion)
+	}
+}
+
 func TestMigrationV4ToV5PreservesDuplicateLegacyClaimsButBlocksBothOwners(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()
@@ -745,11 +840,11 @@ VALUES(?, ?, 'linux:49:shared')`, rootID, relPath); err != nil {
 	for _, op := range operations {
 		switch op.Phase {
 		case domain.OperationPlanned:
-			if op.LocalTargetPath != "" || op.LocalTargetIdentity != "" {
+			if op.LocalTargetPath != "" || op.LocalTargetIdentity != "" || op.LocalTargetAuthority != "" {
 				t.Fatalf("planned legacy mutation retained incomplete pin: %+v", op)
 			}
 		case domain.OperationRunning:
-			if op.LocalTargetPath == "" || op.LocalTargetIdentity != "" {
+			if op.LocalTargetPath == "" || op.LocalTargetIdentity != "" || op.LocalTargetAuthority != "" {
 				t.Fatalf("started legacy mutation migration lost inspectability or invented identity: %+v", op)
 			}
 		default:

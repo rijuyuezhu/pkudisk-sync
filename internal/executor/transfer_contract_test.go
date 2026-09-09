@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -55,6 +56,15 @@ func testLocalFS(t *testing.T, root string) fs.Fs {
 	return f
 }
 
+func testLocalCopyLinksFS(t *testing.T, root string) fs.Fs {
+	t.Helper()
+	f, err := local.NewFs(context.Background(), "test-local-copy-links", root, configmap.Simple{"copy_links": "true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
 func assertDownloadConfig(t *testing.T, ctx context.Context, id, rev string) {
 	t.Helper()
 	ci := fs.GetConfig(ctx)
@@ -101,6 +111,120 @@ func TestUploadExpectedAbsentUsesConditionalMetadataAndReturnsWrittenIdentity(t 
 	}
 }
 
+func TestCopySymlinkUploadReadsProjectedFileBytes(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	external := t.TempDir()
+	target := filepath.Join(external, "target.txt")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	remote := &lookupFS{}
+	exec := &RootExecutor{
+		root:   domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy},
+		local:  testLocalCopyLinksFS(t, root),
+		remote: remote,
+	}
+	before, err := exec.ObserveLocalFile(ctx, "link.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("projected-payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expectedLocal, err := exec.ObserveLocalFile(ctx, "link.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if domain.LocalEquivalent(before, expectedLocal) {
+		t.Fatalf("referent update was not observed: before=%+v after=%+v", before, expectedLocal)
+	}
+	if !expectedLocal.Present || expectedLocal.Size != int64(len("projected-payload")) {
+		t.Fatalf("projected local fingerprint = %+v", expectedLocal)
+	}
+	exec.copyObjectFn = func(copyCtx context.Context, _ fs.Fs, dst fs.Object, remoteName string, src fs.Object) (fs.Object, error) {
+		if dst != nil || remoteName != "link.txt" || src.Remote() != "link.txt" {
+			t.Fatalf("copy args dst=%v remote=%q src=%q", dst, remoteName, src.Remote())
+		}
+		r, err := src.Open(copyCtx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := r.Close(); err != nil {
+				t.Errorf("close upload source: %v", err)
+			}
+		}()
+		got, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != "projected-payload" {
+			t.Fatalf("upload source bytes = %q", got)
+		}
+		return &fingerprintObject{remote: "link.txt", id: "doc-new", rev: "rev-new", size: int64(len(got)), mtime: time.Unix(2, 0)}, nil
+	}
+	got, err := exec.Upload(ctx, "link.txt", expectedLocal, domain.RemoteExpectation{Absent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "doc-new" || got.Rev != "rev-new" || got.Size != expectedLocal.Size {
+		t.Fatalf("Upload() = %+v", got)
+	}
+}
+
+func TestCopyDirectoryAliasesUploadIndependentLogicalPaths(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	external := t.TempDir()
+	if err := os.WriteFile(filepath.Join(external, "x.txt"), []byte("shared"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, alias := range []string{"a", "b"} {
+		if err := os.Symlink(external, filepath.Join(root, alias)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec := &RootExecutor{
+		root:   domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy},
+		local:  testLocalCopyLinksFS(t, root),
+		remote: &lookupFS{},
+	}
+	seen := make(map[string]string)
+	exec.copyObjectFn = func(copyCtx context.Context, _ fs.Fs, _ fs.Object, remoteName string, src fs.Object) (fs.Object, error) {
+		r, err := src.Open(copyCtx)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if err := r.Close(); err != nil {
+				t.Errorf("close alias upload source: %v", err)
+			}
+		}()
+		payload, err := io.ReadAll(r)
+		if err != nil {
+			return nil, err
+		}
+		seen[remoteName] = string(payload)
+		return &fingerprintObject{remote: remoteName, id: "doc-" + remoteName, rev: "rev-" + remoteName, size: int64(len(payload)), mtime: time.Unix(2, 0)}, nil
+	}
+	for _, rel := range []string{"a/x.txt", "b/x.txt"} {
+		expected, err := exec.ObserveLocalFile(ctx, rel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := exec.Upload(ctx, rel, expected, domain.RemoteExpectation{Absent: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if seen["a/x.txt"] != "shared" || seen["b/x.txt"] != "shared" || len(seen) != 2 {
+		t.Fatalf("independent alias uploads = %+v", seen)
+	}
+}
+
 func TestDownloadToTempUsesExactRevisionSingleStream(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -143,7 +267,7 @@ func TestEnsureLocalFileStagesAndCommitsGuardedDownload(t *testing.T) {
 		LocalTargetIdentity: physicalIdentityForTest(t, root),
 		ExpectedRemote:      expectedRemote,
 	}
-	got, err := exec.EnsureLocalFile(ctx, op)
+	got, err := exec.EnsureLocalFile(ctx, op, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,5 +329,44 @@ func TestCompareFileContentUsesGuardedDownloadAndRevalidatesBothSides(t *testing
 	}
 	if !equal {
 		t.Fatal("equal local/remote contents reported different")
+	}
+}
+
+func TestCopySymlinkContentComparisonUsesProjectedFileBytes(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	external := t.TempDir()
+	target := filepath.Join(external, "target.txt")
+	if err := os.WriteFile(target, []byte("same"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{
+		root:  domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy},
+		local: testLocalCopyLinksFS(t, root),
+	}
+	expectedLocal, err := exec.ObserveLocalFile(ctx, "link.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedRemote := domain.RemoteExpectation{ID: "doc", Rev: "rev"}
+	exec.observeRemoteFn = func(context.Context, string) (domain.RemoteFingerprint, error) {
+		return domain.RemoteFingerprint{Present: true, Kind: domain.KindFile, ID: "doc", Rev: "rev", Size: 4}, nil
+	}
+	exec.copyFileFn = func(copyCtx context.Context, dst, _ fs.Fs, dstRemote, srcRemote string) error {
+		assertDownloadConfig(t, copyCtx, "doc", "rev")
+		if srcRemote != "link.txt" {
+			t.Fatalf("remote source = %q", srcRemote)
+		}
+		return os.WriteFile(filepath.Join(dst.Root(), filepath.FromSlash(dstRemote)), []byte("same"), 0o600)
+	}
+	equal, err := exec.CompareFileContent(ctx, "link.txt", expectedLocal, expectedRemote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equal {
+		t.Fatal("copy symlink projection content reported different")
 	}
 }
