@@ -10,7 +10,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 4
+const schemaVersion = 6
 
 // Store is the durable semantic authority for sync roots, committed baselines,
 // external-side-effect intents, and conflicts.
@@ -122,6 +122,91 @@ CREATE TABLE followed_directory_boundaries (
 			return fmt.Errorf("migrate schema v3 to v4: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 4"); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+		version = 4
+	}
+	if version == 4 {
+		if _, err := tx.ExecContext(ctx, `
+CREATE TABLE followed_physical_claims (
+    sync_root_id INTEGER NOT NULL,
+    rel_path TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('file', 'dir')),
+    physical_identity TEXT NOT NULL,
+    physical_target_path TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(sync_root_id, rel_path),
+    FOREIGN KEY(sync_root_id) REFERENCES sync_roots(id) ON DELETE CASCADE
+);
+INSERT INTO followed_physical_claims(sync_root_id, rel_path, kind, physical_identity, physical_target_path)
+SELECT sync_root_id, rel_path, 'dir', physical_identity, ''
+FROM followed_directory_boundaries;
+DROP TABLE followed_directory_boundaries;
+CREATE INDEX followed_physical_claims_identity_idx
+ON followed_physical_claims(physical_identity);
+CREATE INDEX followed_physical_claims_target_path_idx
+ON followed_physical_claims(physical_target_path);
+CREATE TRIGGER followed_physical_claims_unique_insert
+BEFORE INSERT ON followed_physical_claims
+WHEN EXISTS (
+    SELECT 1 FROM followed_physical_claims
+    WHERE physical_identity = NEW.physical_identity
+)
+BEGIN
+    SELECT RAISE(ABORT, 'physical identity already owned by another followed path');
+END;
+CREATE TRIGGER followed_physical_claims_unique_update
+BEFORE UPDATE OF physical_identity ON followed_physical_claims
+WHEN EXISTS (
+    SELECT 1 FROM followed_physical_claims
+    WHERE physical_identity = NEW.physical_identity
+      AND NOT (sync_root_id = OLD.sync_root_id AND rel_path = OLD.rel_path)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'physical identity already owned by another followed path');
+END;
+CREATE TRIGGER followed_physical_claims_unique_target_insert
+BEFORE INSERT ON followed_physical_claims
+WHEN NEW.physical_target_path <> '' AND EXISTS (
+    SELECT 1 FROM followed_physical_claims
+    WHERE physical_target_path = NEW.physical_target_path
+)
+BEGIN
+    SELECT RAISE(ABORT, 'physical target path already owned by another followed path');
+END;
+CREATE TRIGGER followed_physical_claims_unique_target_update
+BEFORE UPDATE OF physical_target_path ON followed_physical_claims
+WHEN NEW.physical_target_path <> '' AND EXISTS (
+    SELECT 1 FROM followed_physical_claims
+    WHERE physical_target_path = NEW.physical_target_path
+      AND NOT (sync_root_id = OLD.sync_root_id AND rel_path = OLD.rel_path)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'physical target path already owned by another followed path');
+END`); err != nil {
+			return fmt.Errorf("migrate followed physical ownership v4 to v5: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 5"); err != nil {
+			return fmt.Errorf("set schema version: %w", err)
+		}
+		version = 5
+	}
+	if version == 5 {
+		if _, err := tx.ExecContext(ctx, `
+ALTER TABLE operations
+ADD COLUMN local_target_identity TEXT NOT NULL DEFAULT '';
+
+-- Planned, unattempted local intents have no external side effects yet. Drop
+-- their legacy path-only pin so v6 will re-resolve and atomically pin both the
+-- physical path and its anchor identity before execution.
+UPDATE operations
+SET local_target_path = ''
+WHERE kind IN ('ensure-local', 'delete-local')
+  AND phase = 'planned'
+  AND attempts = 0
+  AND local_target_path <> ''`); err != nil {
+			return fmt.Errorf("migrate local mutation authority v5 to v6: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 6"); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
 	}

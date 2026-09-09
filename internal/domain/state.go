@@ -135,13 +135,18 @@ type Operation struct {
 	SrcPath         string
 	DstPath         string
 	LocalTargetPath string
-	ExpectedLocal   LocalFingerprint
-	ExpectedRemote  RemoteExpectation
-	Phase           OperationPhase
-	Attempts        int
-	LastError       string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// LocalTargetIdentity is the physical anchor pinned with LocalTargetPath:
+	// the target object's identity when ExpectedLocal is present, otherwise
+	// the containing directory identity. Empty is retained only for migrated
+	// pre-v6 operations that must fail closed before automatic replay.
+	LocalTargetIdentity string
+	ExpectedLocal       LocalFingerprint
+	ExpectedRemote      RemoteExpectation
+	Phase               OperationPhase
+	Attempts            int
+	LastError           string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 func (o Operation) Validate() error {
@@ -172,6 +177,14 @@ func (o Operation) Validate() error {
 		}
 		if !filepath.IsAbs(o.LocalTargetPath) || filepath.Clean(o.LocalTargetPath) != o.LocalTargetPath {
 			return fmt.Errorf("operation local target path %q must be canonical and absolute", o.LocalTargetPath)
+		}
+	}
+	if o.LocalTargetIdentity != "" {
+		if o.Kind != OperationEnsureLocal && o.Kind != OperationDeleteLocal {
+			return fmt.Errorf("operation kind %q must not carry a local target identity", o.Kind)
+		}
+		if o.LocalTargetPath == "" {
+			return fmt.Errorf("operation local target identity requires a pinned local target path")
 		}
 	}
 	if err := o.ExpectedLocal.Validate(); err != nil {

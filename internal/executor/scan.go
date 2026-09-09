@@ -19,7 +19,7 @@ const tempNamePrefix = ".pkudisk-sync-tmp-"
 // ScanLocal performs a complete ordinary-files/directories walk under the
 // configured symlink policy. Excluded prefixes are intentionally outside local
 // authority for this cycle and must not be interpreted as deletions.
-func (e *RootExecutor) ScanLocal(ctx context.Context, operations []domain.Operation, peerLocalRoots []string) (map[string]domain.LocalFingerprint, []string, map[string]string, error) {
+func (e *RootExecutor) ScanLocal(ctx context.Context, operations []domain.Operation, peerLocalRoots []string) (map[string]domain.LocalFingerprint, []string, map[string]domain.FollowedPhysicalClaim, error) {
 	entries := make(map[string]domain.LocalFingerprint)
 	var excluded []string
 	rootInfo, err := os.Stat(e.root.LocalRoot)
@@ -38,22 +38,22 @@ func (e *RootExecutor) ScanLocal(ctx context.Context, operations []domain.Operat
 		return nil, nil, nil, fmt.Errorf("identify local root %q: %w", e.root.LocalRoot, err)
 	}
 	state := &localScanState{
-		claims:                      map[string]string{rootIdentity: "."},
-		ownedArtifacts:              ownedArtifacts,
-		peerLocalRoots:              peerLocalRoots,
-		followedDirectoryIdentities: make(map[string]string),
+		claims:                 map[string]string{rootIdentity: "."},
+		ownedArtifacts:         ownedArtifacts,
+		peerLocalRoots:         peerLocalRoots,
+		followedPhysicalClaims: make(map[string]domain.FollowedPhysicalClaim),
 	}
 	if err := e.scanLocalDir(ctx, e.root.LocalRoot, "", []os.FileInfo{rootInfo}, entries, &excluded, state); err != nil {
 		return nil, nil, nil, fmt.Errorf("scan local root %q: %w", e.root.LocalRoot, err)
 	}
-	return entries, excluded, state.followedDirectoryIdentities, nil
+	return entries, excluded, state.followedPhysicalClaims, nil
 }
 
 type localScanState struct {
-	claims                      map[string]string
-	ownedArtifacts              map[string]struct{}
-	peerLocalRoots              []string
-	followedDirectoryIdentities map[string]string
+	claims                 map[string]string
+	ownedArtifacts         map[string]struct{}
+	peerLocalRoots         []string
+	followedPhysicalClaims map[string]domain.FollowedPhysicalClaim
 }
 
 func (s *localScanState) claim(physicalPath, rel string, info os.FileInfo) (string, error) {
@@ -155,7 +155,7 @@ func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir str
 					if err != nil {
 						return err
 					}
-					state.followedDirectoryIdentities[rel] = identity
+					state.followedPhysicalClaims[rel] = domain.FollowedPhysicalClaim{Kind: domain.KindDir, Identity: identity, TargetPath: resolved}
 					out[rel] = domain.LocalFingerprint{Present: true, Kind: domain.KindDir}
 					if err := e.scanLocalDir(ctx, resolved, rel, append(ancestors, resolvedInfo), out, excluded, state); err != nil {
 						return err
@@ -163,9 +163,11 @@ func (e *RootExecutor) scanLocalDir(ctx context.Context, physicalDir, relDir str
 					continue
 				}
 				if resolvedInfo.Mode().IsRegular() {
-					if _, err := state.claim(resolved, rel, resolvedInfo); err != nil {
+					identity, err := state.claim(resolved, rel, resolvedInfo)
+					if err != nil {
 						return err
 					}
+					state.followedPhysicalClaims[rel] = domain.FollowedPhysicalClaim{Kind: domain.KindFile, Identity: identity, TargetPath: resolved}
 					out[rel] = localFileFingerprint(resolvedInfo)
 					continue
 				}
@@ -230,15 +232,25 @@ func (e *RootExecutor) ownedOperationArtifacts(operations []domain.Operation) (m
 
 func rejectPeerRootPath(physicalPath string, peerLocalRoots []string) error {
 	for _, peer := range peerLocalRoots {
-		owned, err := physicalPathContains(peer, physicalPath)
+		peerOwnsTarget, err := physicalPathContains(peer, physicalPath)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
 			return fmt.Errorf("compare physical path %q with configured sync root %q: %w", physicalPath, peer, err)
 		}
-		if owned {
+		if peerOwnsTarget {
 			return fmt.Errorf("physical path %q is owned by configured sync root %q", physicalPath, peer)
+		}
+		targetOwnsPeer, err := physicalPathContains(physicalPath, peer)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("compare followed physical path %q with configured sync root %q: %w", physicalPath, peer, err)
+		}
+		if targetOwnsPeer {
+			return fmt.Errorf("followed physical directory %q contains configured sync root %q", physicalPath, peer)
 		}
 	}
 	return nil

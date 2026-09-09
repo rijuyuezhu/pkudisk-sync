@@ -97,8 +97,9 @@ func (e *RootExecutor) ObserveRemoteEntry(ctx context.Context, relPath string) (
 	return domain.RemoteFingerprint{}, nil
 }
 
-// EnsureLocalDir creates exactly one planned physical target directory.
-// A dangling followed directory symlink is preserved and its target is created.
+// EnsureLocalDir creates exactly one planned physical target directory. The
+// operation's pinned parent identity prevents a same-path parent replacement
+// from redirecting the create after authority was established.
 func (e *RootExecutor) EnsureLocalDir(ctx context.Context, op domain.Operation) error {
 	if op.Kind != domain.OperationEnsureLocal || op.EntryKind != domain.KindDir || op.LocalTargetPath == "" {
 		return fmt.Errorf("invalid pinned local directory operation")
@@ -116,12 +117,15 @@ func (e *RootExecutor) EnsureLocalDir(ctx context.Context, op domain.Operation) 
 	if current.Present {
 		return fmt.Errorf("local directory create precondition failed for %q", op.SrcPath)
 	}
-	currentTarget, err := e.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal)
+	currentTarget, err := e.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal, op.EntryKind)
 	if err != nil {
 		return err
 	}
-	if !samePhysicalDestination(op.LocalTargetPath, currentTarget, false) {
+	if !samePhysicalDestination(op.LocalTargetPath, currentTarget.Path, false) {
 		return fmt.Errorf("local symlink target changed before directory create for %q", op.SrcPath)
+	}
+	if err := verifyPinnedLocalMutationAnchor(op); err != nil {
+		return err
 	}
 	if err := os.Mkdir(op.LocalTargetPath, 0o755); err != nil {
 		return fmt.Errorf("create local directory %q: %w", op.SrcPath, err)
@@ -178,12 +182,15 @@ func (e *RootExecutor) EnsureLocalFile(ctx context.Context, op domain.Operation)
 	if !domain.LocalEquivalent(current, op.ExpectedLocal) {
 		return domain.LocalFingerprint{}, fmt.Errorf("local download precondition failed for %q", op.SrcPath)
 	}
-	currentTarget, err := e.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal)
+	currentTarget, err := e.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal, op.EntryKind)
 	if err != nil {
 		return domain.LocalFingerprint{}, err
 	}
-	if !samePhysicalDestination(op.LocalTargetPath, currentTarget, op.ExpectedLocal.Present) {
+	if !samePhysicalDestination(op.LocalTargetPath, currentTarget.Path, op.ExpectedLocal.Present) {
 		return domain.LocalFingerprint{}, fmt.Errorf("local symlink target changed before download for %q", op.SrcPath)
+	}
+	if err := verifyPinnedLocalMutationAnchor(op); err != nil {
+		return domain.LocalFingerprint{}, err
 	}
 	tempPath := operationPhysicalTempPath(op.LocalTargetPath, op.ID, "download")
 	_ = os.Remove(tempPath)
@@ -214,15 +221,18 @@ func (e *RootExecutor) DeleteLocal(ctx context.Context, op domain.Operation) err
 	if !domain.LocalEquivalent(current, op.ExpectedLocal) {
 		return fmt.Errorf("local delete precondition failed for %q", op.SrcPath)
 	}
-	currentTarget, err := e.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal)
+	currentTarget, err := e.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal, op.EntryKind)
 	if err != nil {
 		return err
 	}
-	if !samePhysicalDestination(op.LocalTargetPath, currentTarget, true) {
+	if !samePhysicalDestination(op.LocalTargetPath, currentTarget.Path, true) {
 		return fmt.Errorf("local symlink target changed before delete for %q", op.SrcPath)
 	}
+	if err := verifyPinnedLocalMutationAnchor(op); err != nil {
+		return err
+	}
 	recoveryPath := operationPhysicalTempPath(op.LocalTargetPath, op.ID, "recovery")
-	preserved, err := preserveExpectedLocalEntryAt(ctx, op.SrcPath, op.LocalTargetPath, recoveryPath, op.ExpectedLocal)
+	preserved, err := preserveExpectedLocalEntryAt(ctx, op.SrcPath, op.LocalTargetPath, recoveryPath, op.ExpectedLocal, op.LocalTargetIdentity)
 	if err != nil {
 		return err
 	}
@@ -243,14 +253,30 @@ type preservedLocalEntry struct {
 // preserveExpectedLocalEntryAt atomically moves the resolved physical target
 // aside before validating what was actually moved. The symlink path itself is
 // never renamed or unlinked.
-func preserveExpectedLocalEntryAt(ctx context.Context, relPath, targetPath, recoveryPath string, expected domain.LocalFingerprint) (preservedLocalEntry, error) {
+func preserveExpectedLocalEntryAt(ctx context.Context, relPath, targetPath, recoveryPath string, expected domain.LocalFingerprint, expectedIdentity string) (preservedLocalEntry, error) {
 	if err := movePathNoReplace(targetPath, recoveryPath); err != nil {
 		return preservedLocalEntry{}, fmt.Errorf("preserve local entry %q before mutation: %w", relPath, err)
 	}
 	preserved := preservedLocalEntry{targetPath: targetPath, recoveryPath: recoveryPath}
 	observed, observeErr := observePhysicalLocalEntry(ctx, recoveryPath)
 	if observeErr == nil && domain.LocalEquivalent(observed, expected) {
-		return preserved, nil
+		if expectedIdentity == "" {
+			return preserved, nil
+		}
+		info, statErr := os.Stat(recoveryPath)
+		if statErr == nil {
+			identity, identityErr := physicalObjectIdentity(recoveryPath, info)
+			if identityErr == nil && identity == expectedIdentity {
+				return preserved, nil
+			}
+			if identityErr != nil {
+				observeErr = identityErr
+			} else {
+				observeErr = fmt.Errorf("physical identity changed for %q before mutation", relPath)
+			}
+		} else {
+			observeErr = statErr
+		}
 	}
 	primary := observeErr
 	if primary == nil {
@@ -269,14 +295,14 @@ func restorePreservedLocalEntry(preserved preservedLocalEntry, relPath string, p
 	return primary
 }
 
-func (e *RootExecutor) installDownloadedPhysicalTemp(ctx context.Context, relPath, targetPath, tempPath, recoveryPath string, expectedLocal domain.LocalFingerprint) error {
+func (e *RootExecutor) installDownloadedPhysicalTemp(ctx context.Context, relPath, targetPath, tempPath, recoveryPath string, expectedLocal domain.LocalFingerprint, expectedIdentity string) error {
 	if !expectedLocal.Present {
 		if err := movePathNoReplace(tempPath, targetPath); err != nil {
 			return fmt.Errorf("install downloaded file %q without replacing a concurrent local create: %w", relPath, err)
 		}
 		return nil
 	}
-	preserved, err := preserveExpectedLocalEntryAt(ctx, relPath, targetPath, recoveryPath, expectedLocal)
+	preserved, err := preserveExpectedLocalEntryAt(ctx, relPath, targetPath, recoveryPath, expectedLocal, expectedIdentity)
 	if err != nil {
 		return err
 	}
@@ -307,7 +333,7 @@ func (e *RootExecutor) installDownloadedTemp(ctx context.Context, relPath, tempR
 	if err != nil {
 		return err
 	}
-	return e.installDownloadedPhysicalTemp(ctx, relPath, targetPath, tempPath, recoveryPath, expectedLocal)
+	return e.installDownloadedPhysicalTemp(ctx, relPath, targetPath, tempPath, recoveryPath, expectedLocal, "")
 }
 
 func (e *RootExecutor) commitDownloadedPhysicalTemp(ctx context.Context, op domain.Operation, tempPath string) (domain.LocalFingerprint, error) {
@@ -318,12 +344,15 @@ func (e *RootExecutor) commitDownloadedPhysicalTemp(ctx context.Context, op doma
 	if !domain.LocalEquivalent(currentLocal, op.ExpectedLocal) {
 		return domain.LocalFingerprint{}, fmt.Errorf("local download precondition failed for %q", op.SrcPath)
 	}
-	currentTarget, err := e.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal)
+	currentTarget, err := e.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal, op.EntryKind)
 	if err != nil {
 		return domain.LocalFingerprint{}, err
 	}
-	if !samePhysicalDestination(op.LocalTargetPath, currentTarget, op.ExpectedLocal.Present) {
+	if !samePhysicalDestination(op.LocalTargetPath, currentTarget.Path, op.ExpectedLocal.Present) {
 		return domain.LocalFingerprint{}, fmt.Errorf("local symlink target changed during download for %q", op.SrcPath)
+	}
+	if err := verifyPinnedLocalMutationAnchor(op); err != nil {
+		return domain.LocalFingerprint{}, err
 	}
 	currentRemote, err := e.ObserveRemoteEntry(ctx, op.SrcPath)
 	if err != nil {
@@ -340,7 +369,7 @@ func (e *RootExecutor) commitDownloadedPhysicalTemp(ctx context.Context, op doma
 		return domain.LocalFingerprint{}, fmt.Errorf("download temp %q is not a regular file", tempPath)
 	}
 	recoveryPath := operationPhysicalTempPath(op.LocalTargetPath, op.ID, "recovery")
-	if err := e.installDownloadedPhysicalTemp(ctx, op.SrcPath, op.LocalTargetPath, tempPath, recoveryPath, op.ExpectedLocal); err != nil {
+	if err := e.installDownloadedPhysicalTemp(ctx, op.SrcPath, op.LocalTargetPath, tempPath, recoveryPath, op.ExpectedLocal, op.LocalTargetIdentity); err != nil {
 		return domain.LocalFingerprint{}, fmt.Errorf("replace local file %q: %w", op.SrcPath, err)
 	}
 	return temp, nil
@@ -364,18 +393,122 @@ func (e *RootExecutor) resolveLocalMutationPath(relPath string, present bool) (s
 	return filepath.Clean(resolved), nil
 }
 
-func (e *RootExecutor) ResolveLocalMutationTarget(ctx context.Context, relPath string, expected domain.LocalFingerprint) (string, error) {
+func (e *RootExecutor) ResolveLocalMutationTarget(ctx context.Context, relPath string, expected domain.LocalFingerprint, entryKind domain.EntryKind) (domain.LocalMutationTarget, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return domain.LocalMutationTarget{}, err
 	}
 	current, err := e.ObserveLocalEntry(ctx, relPath)
 	if err != nil {
-		return "", err
+		return domain.LocalMutationTarget{}, err
 	}
 	if !domain.LocalEquivalent(current, expected) {
-		return "", fmt.Errorf("local mutation target precondition failed for %q", relPath)
+		return domain.LocalMutationTarget{}, fmt.Errorf("local mutation target precondition failed for %q", relPath)
 	}
-	return e.resolveLocalMutationPath(relPath, expected.Present)
+	target, err := e.resolveLocalMutationAuthority(relPath, expected.Present, entryKind)
+	if err != nil {
+		return domain.LocalMutationTarget{}, err
+	}
+	anchorPath := target.Path
+	if !expected.Present {
+		anchorPath = filepath.Dir(target.Path)
+	}
+	anchorInfo, err := os.Stat(anchorPath)
+	if err != nil {
+		return domain.LocalMutationTarget{}, fmt.Errorf("stat local mutation physical anchor %q: %w", anchorPath, err)
+	}
+	if !expected.Present && !anchorInfo.IsDir() {
+		return domain.LocalMutationTarget{}, fmt.Errorf("local mutation physical anchor %q is not a directory", anchorPath)
+	}
+	identity, err := physicalObjectIdentity(anchorPath, anchorInfo)
+	if err != nil {
+		return domain.LocalMutationTarget{}, fmt.Errorf("identify local mutation physical anchor %q: %w", anchorPath, err)
+	}
+	target.AnchorIdentity = identity
+	return target, nil
+}
+
+// resolveLocalMutationAuthority resolves one logical mutation path while also
+// reporting every followed symlink boundary actually traversed. The result is
+// consumed by the SQLite authority layer before LocalTargetPath is pinned.
+// A final dangling followed boundary may be reported for an absent expectation;
+// the store grants it authority only when the same canonical target was already
+// durably owned. A newly introduced dangling link therefore cannot gain mutation
+// authority merely because its virtual fingerprint is absent.
+func (e *RootExecutor) resolveLocalMutationAuthority(relPath string, present bool, entryKind domain.EntryKind) (domain.LocalMutationTarget, error) {
+	if err := domain.ValidateRelPath(relPath); err != nil {
+		return domain.LocalMutationTarget{}, err
+	}
+	lexical := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
+	if e.root.EffectiveSymlinkMode() != domain.SymlinkFollow {
+		return domain.LocalMutationTarget{Path: filepath.Clean(lexical)}, nil
+	}
+
+	parts := strings.Split(relPath, "/")
+	physicalDir := e.root.LocalRoot
+	claims := make(map[string]domain.FollowedPhysicalClaim)
+	for i, part := range parts {
+		logical := strings.Join(parts[:i+1], "/")
+		candidate := filepath.Join(physicalDir, filepath.FromSlash(part))
+		info, err := os.Lstat(candidate)
+		if errors.Is(err, os.ErrNotExist) {
+			if i == len(parts)-1 && !present {
+				return domain.LocalMutationTarget{Path: filepath.Clean(candidate), FollowedClaims: claims}, nil
+			}
+			return domain.LocalMutationTarget{}, fmt.Errorf("local mutation path component %q disappeared", logical)
+		}
+		if err != nil {
+			return domain.LocalMutationTarget{}, fmt.Errorf("lstat local mutation path %q: %w", logical, err)
+		}
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolved, resolvedPresent, err := resolveFollowedLocalPath(candidate, i == len(parts)-1 && !present)
+			if err != nil {
+				return domain.LocalMutationTarget{}, fmt.Errorf("resolve followed local mutation boundary %q: %w", logical, err)
+			}
+			if !resolvedPresent {
+				if i != len(parts)-1 || present || (entryKind != domain.KindFile && entryKind != domain.KindDir) {
+					return domain.LocalMutationTarget{}, fmt.Errorf("cannot resolve dangling followed symlink %q for local mutation", logical)
+				}
+				claims[logical] = domain.FollowedPhysicalClaim{Kind: entryKind, TargetPath: filepath.Clean(resolved)}
+				return domain.LocalMutationTarget{Path: filepath.Clean(resolved), FollowedClaims: claims}, nil
+			}
+			resolvedInfo, err := os.Stat(resolved)
+			if err != nil {
+				return domain.LocalMutationTarget{}, fmt.Errorf("stat followed local mutation boundary %q: %w", logical, err)
+			}
+			var kind domain.EntryKind
+			switch {
+			case resolvedInfo.IsDir():
+				kind = domain.KindDir
+			case resolvedInfo.Mode().IsRegular():
+				kind = domain.KindFile
+			default:
+				return domain.LocalMutationTarget{}, fmt.Errorf("unsupported followed local mutation boundary %q (%s)", logical, resolvedInfo.Mode().Type())
+			}
+			identity, err := physicalObjectIdentity(resolved, resolvedInfo)
+			if err != nil {
+				return domain.LocalMutationTarget{}, fmt.Errorf("identify followed local mutation boundary %q: %w", logical, err)
+			}
+			claims[logical] = domain.FollowedPhysicalClaim{Kind: kind, Identity: identity, TargetPath: filepath.Clean(resolved)}
+			if i == len(parts)-1 {
+				return domain.LocalMutationTarget{Path: filepath.Clean(resolved), FollowedClaims: claims}, nil
+			}
+			if kind != domain.KindDir {
+				return domain.LocalMutationTarget{}, fmt.Errorf("followed file %q cannot contain descendants", logical)
+			}
+			physicalDir = filepath.Clean(resolved)
+			continue
+		}
+
+		if i == len(parts)-1 {
+			return domain.LocalMutationTarget{Path: filepath.Clean(candidate), FollowedClaims: claims}, nil
+		}
+		if !info.IsDir() {
+			return domain.LocalMutationTarget{}, fmt.Errorf("local mutation path component %q is not a directory", logical)
+		}
+		physicalDir = candidate
+	}
+	return domain.LocalMutationTarget{}, fmt.Errorf("failed to resolve local mutation target %q", relPath)
 }
 
 func samePhysicalDestination(a, b string, present bool) bool {
@@ -390,6 +523,31 @@ func samePhysicalDestination(a, b string, present bool) bool {
 	ai, aErr := os.Stat(filepath.Dir(a))
 	bi, bErr := os.Stat(filepath.Dir(b))
 	return aErr == nil && bErr == nil && os.SameFile(ai, bi)
+}
+
+func verifyPinnedLocalMutationAnchor(op domain.Operation) error {
+	if op.LocalTargetPath == "" || op.LocalTargetIdentity == "" {
+		return fmt.Errorf("local operation %d has no complete physical target pin", op.ID)
+	}
+	anchorPath := op.LocalTargetPath
+	if !op.ExpectedLocal.Present {
+		anchorPath = filepath.Dir(op.LocalTargetPath)
+	}
+	info, err := os.Stat(anchorPath)
+	if err != nil {
+		return fmt.Errorf("stat pinned local mutation anchor %q: %w", anchorPath, err)
+	}
+	if !op.ExpectedLocal.Present && !info.IsDir() {
+		return fmt.Errorf("pinned local mutation anchor %q is not a directory", anchorPath)
+	}
+	identity, err := physicalObjectIdentity(anchorPath, info)
+	if err != nil {
+		return fmt.Errorf("identify pinned local mutation anchor %q: %w", anchorPath, err)
+	}
+	if identity != op.LocalTargetIdentity {
+		return fmt.Errorf("local physical target identity changed before mutation for %q", op.SrcPath)
+	}
+	return nil
 }
 
 func observePhysicalLocalEntry(ctx context.Context, fullPath string) (domain.LocalFingerprint, error) {
@@ -448,7 +606,9 @@ func (e *RootExecutor) LocalRecoveryArtifact(ctx context.Context, op domain.Oper
 // CleanupLocalRecoveryArtifact removes an operation-owned stale recovery slot
 // only after the caller has independently proven the desired operation
 // postcondition. It never follows or derives a path from current symlink state;
-// the durable pinned LocalTargetPath is the sole authority.
+// the durable pinned target path identifies the operation-owned slot, while the
+// paired physical identity prevents an unrelated replacement at that slot from
+// being silently deleted.
 func (e *RootExecutor) CleanupLocalRecoveryArtifact(ctx context.Context, op domain.Operation) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -456,6 +616,23 @@ func (e *RootExecutor) CleanupLocalRecoveryArtifact(ctx context.Context, op doma
 	recoveryPath, ok := RecoveryArtifactPath(op)
 	if !ok {
 		return nil
+	}
+	info, err := os.Stat(recoveryPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stat stale local recovery artifact %q: %w", recoveryPath, err)
+	}
+	if op.LocalTargetIdentity == "" {
+		return fmt.Errorf("refusing to remove stale local recovery artifact %q without a pinned physical identity", recoveryPath)
+	}
+	identity, err := physicalObjectIdentity(recoveryPath, info)
+	if err != nil {
+		return fmt.Errorf("identify stale local recovery artifact %q: %w", recoveryPath, err)
+	}
+	if identity != op.LocalTargetIdentity {
+		return fmt.Errorf("refusing to remove stale local recovery artifact %q because its physical identity changed", recoveryPath)
 	}
 	if err := os.Remove(recoveryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove stale local recovery artifact %q: %w", recoveryPath, err)
@@ -475,7 +652,8 @@ func RecoveryArtifactPath(op domain.Operation) (string, bool) {
 // RestoreLocalRecoveryArtifact restores a preserved pre-mutation local object
 // to its pinned physical target using no-replace semantics. It never overwrites
 // a current target and only restores an artifact that still matches the
-// operation's expected pre-mutation local fingerprint.
+// operation's expected pre-mutation fingerprint and, for v6+ pins, exact
+// physical identity.
 func RestoreLocalRecoveryArtifact(ctx context.Context, op domain.Operation) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -500,6 +678,19 @@ func RestoreLocalRecoveryArtifact(ctx context.Context, op domain.Operation) (str
 	if !domain.LocalEquivalent(artifact, op.ExpectedLocal) {
 		return recoveryPath, fmt.Errorf("local recovery artifact %q no longer matches operation %d expected local state", recoveryPath, op.ID)
 	}
+	if op.LocalTargetIdentity != "" {
+		info, err := os.Stat(recoveryPath)
+		if err != nil {
+			return recoveryPath, fmt.Errorf("stat local recovery artifact %q: %w", recoveryPath, err)
+		}
+		identity, err := physicalObjectIdentity(recoveryPath, info)
+		if err != nil {
+			return recoveryPath, fmt.Errorf("identify local recovery artifact %q: %w", recoveryPath, err)
+		}
+		if identity != op.LocalTargetIdentity {
+			return recoveryPath, fmt.Errorf("local recovery artifact %q does not match operation %d pinned physical identity", recoveryPath, op.ID)
+		}
+	}
 	current, err := observePhysicalLocalEntry(ctx, op.LocalTargetPath)
 	if err != nil {
 		return recoveryPath, err
@@ -511,13 +702,31 @@ func RestoreLocalRecoveryArtifact(ctx context.Context, op domain.Operation) (str
 		return recoveryPath, fmt.Errorf("restore local recovery artifact %q: %w", recoveryPath, err)
 	}
 	restored, err := observePhysicalLocalEntry(ctx, op.LocalTargetPath)
-	if err != nil {
-		return recoveryPath, err
+	if err == nil && domain.LocalEquivalent(restored, op.ExpectedLocal) && op.LocalTargetIdentity != "" {
+		info, statErr := os.Stat(op.LocalTargetPath)
+		if statErr == nil {
+			identity, identityErr := physicalObjectIdentity(op.LocalTargetPath, info)
+			if identityErr == nil && identity == op.LocalTargetIdentity {
+				return recoveryPath, nil
+			}
+			if identityErr != nil {
+				err = identityErr
+			} else {
+				err = fmt.Errorf("restored local target %q does not match operation %d pinned physical identity", op.LocalTargetPath, op.ID)
+			}
+		} else {
+			err = statErr
+		}
+	} else if err == nil && domain.LocalEquivalent(restored, op.ExpectedLocal) && op.LocalTargetIdentity == "" {
+		return recoveryPath, nil
+	} else if err == nil {
+		err = fmt.Errorf("restored local target %q does not match operation %d expected local state", op.LocalTargetPath, op.ID)
 	}
-	if !domain.LocalEquivalent(restored, op.ExpectedLocal) {
-		return recoveryPath, fmt.Errorf("restored local target %q does not match operation %d expected local state", op.LocalTargetPath, op.ID)
+	primary := err
+	if restoreErr := movePathNoReplace(op.LocalTargetPath, recoveryPath); restoreErr != nil {
+		return recoveryPath, errors.Join(primary, fmt.Errorf("unexpected restored object remains at %q because moving it back to recovery slot %q failed: %w", op.LocalTargetPath, recoveryPath, restoreErr))
 	}
-	return recoveryPath, nil
+	return recoveryPath, primary
 }
 
 // CommitDownloadedTemp performs the local half of conditional download commit.

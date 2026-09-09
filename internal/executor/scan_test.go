@@ -150,7 +150,7 @@ func TestScanLocalDefaultFollowsFileSymlinkOutsideRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
-	got, excluded, _, err := exec.ScanLocal(context.Background(), nil, nil)
+	got, excluded, claims, err := exec.ScanLocal(context.Background(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,6 +159,13 @@ func TestScanLocalDefaultFollowsFileSymlinkOutsideRoot(t *testing.T) {
 	}
 	if got["link.txt"].Kind != domain.KindFile || got["link.txt"].Size != int64(len("outside")) {
 		t.Fatalf("followed file fingerprint = %+v", got["link.txt"])
+	}
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim := claims["link.txt"]; claim.Kind != domain.KindFile || claim.Identity == "" || claim.TargetPath != resolvedTarget || len(claims) != 1 {
+		t.Fatalf("followed file claim = %+v all=%+v", claim, claims)
 	}
 }
 
@@ -182,8 +189,12 @@ func TestScanLocalDefaultFollowsDirectorySymlinkOutsideRoot(t *testing.T) {
 	if got["linked"].Kind != domain.KindDir || got["linked/note.txt"].Size != 5 {
 		t.Fatalf("followed directory snapshot = %+v", got)
 	}
-	if boundaries["linked"] == "" || len(boundaries) != 1 {
-		t.Fatalf("followed directory identities = %+v", boundaries)
+	resolvedOutside, err := filepath.EvalSymlinks(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim := boundaries["linked"]; claim.Kind != domain.KindDir || claim.Identity == "" || claim.TargetPath != resolvedOutside || len(boundaries) != 1 {
+		t.Fatalf("followed directory claims = %+v", boundaries)
 	}
 }
 
@@ -381,7 +392,7 @@ func TestScanLocalFollowIgnoresUnavailableUnrelatedPeerRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(excluded) != 0 || got["linked/x.txt"].Size != 1 || boundaries["linked"] == "" {
+	if len(excluded) != 0 || got["linked/x.txt"].Size != 1 || boundaries["linked"].Identity == "" {
 		t.Fatalf("follow with unavailable peer snapshot=%+v excluded=%v boundaries=%+v", got, excluded, boundaries)
 	}
 }

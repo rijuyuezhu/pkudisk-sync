@@ -63,6 +63,9 @@ func (s *Store) PrepareSyncRootCreate(ctx context.Context, root domain.SyncRoot)
 	if err := checkSyncRootOwnershipAgainst(roots, root); err != nil {
 		return fail(err)
 	}
+	if err := checkSyncRootAgainstFollowedClaims(ctx, conn, root); err != nil {
+		return fail(err)
+	}
 	if root.CreatedAt.IsZero() {
 		root.CreatedAt = s.now()
 	} else {
@@ -324,6 +327,25 @@ func localRootContains(parent, child string) bool {
 		return false
 	}
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+func physicalOwnershipPathsOverlap(aPath string, aKind domain.EntryKind, bPath string, bKind domain.EntryKind) bool {
+	return physicalOwnershipPathsOverlapForOS(aPath, aKind, bPath, bKind, runtime.GOOS)
+}
+
+func physicalOwnershipPathsOverlapForOS(aPath string, aKind domain.EntryKind, bPath string, bKind domain.EntryKind, targetOS string) bool {
+	if aPath == "" || bPath == "" {
+		return false
+	}
+	aPath = localRootComparisonPath(aPath, targetOS)
+	bPath = localRootComparisonPath(bPath, targetOS)
+	if aPath == bPath {
+		return true
+	}
+	if aKind == domain.KindDir && localRootContains(aPath, bPath) {
+		return true
+	}
+	return bKind == domain.KindDir && localRootContains(bPath, aPath)
 }
 
 func remoteRootsOverlap(a, b string) bool {

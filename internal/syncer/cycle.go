@@ -18,11 +18,11 @@ const maxCyclePasses = 8
 // DataPlane is the narrow in-process execution surface needed by one complete
 // reconciliation cycle. executor.RootExecutor implements this interface.
 type DataPlane interface {
-	ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]string, error)
+	ScanLocal(context.Context, []domain.Operation, []string) (map[string]domain.LocalFingerprint, []string, map[string]domain.FollowedPhysicalClaim, error)
 	ScanRemote(context.Context) (map[string]domain.RemoteFingerprint, bool, error)
 	ObserveLocalEntry(context.Context, string) (domain.LocalFingerprint, error)
 	ObserveRemoteEntry(context.Context, string) (domain.RemoteFingerprint, error)
-	ResolveLocalMutationTarget(context.Context, string, domain.LocalFingerprint) (string, error)
+	ResolveLocalMutationTarget(context.Context, string, domain.LocalFingerprint, domain.EntryKind) (domain.LocalMutationTarget, error)
 	LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error)
 	CleanupLocalRecoveryArtifact(context.Context, domain.Operation) error
 	CompareFileContent(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (bool, error)
@@ -93,7 +93,7 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 		if err != nil {
 			return result, err
 		}
-		preflight, _, followedDirectories, err := scanCompleteSnapshot(ctx, data, root.Initialized, operations, peerRoots)
+		preflight, _, followedClaims, err := scanCompleteSnapshot(ctx, data, root.Initialized, operations, peerRoots)
 		if err != nil {
 			return result, fmt.Errorf("operation recovery namespace preflight: %w", err)
 		}
@@ -103,17 +103,15 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 			result.BlockDetail = err.Error()
 			return result, nil
 		}
-		if root.Initialized {
-			ok, detail, err := followedDirectoryContinuity(ctx, state, root.ID, preflight, followedDirectories)
-			if err != nil {
-				return result, err
-			}
-			if !ok {
-				result.Blocked = true
-				result.BlockReason = "followed-directory-identity-changed"
-				result.BlockDetail = detail
-				return result, nil
-			}
+		ok, detail, err := followedPhysicalAuthority(ctx, state, root, preflight, followedClaims)
+		if err != nil {
+			return result, err
+		}
+		if !ok {
+			result.Blocked = true
+			result.BlockReason = "followed-physical-authority-blocked"
+			result.BlockDetail = detail
+			return result, nil
 		}
 	}
 
@@ -152,7 +150,7 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 		if err != nil {
 			return result, err
 		}
-		snapshot, remoteRootPresent, followedDirectories, err := scanCompleteSnapshot(ctx, data, root.Initialized, nil, peerRoots)
+		snapshot, remoteRootPresent, followedClaims, err := scanCompleteSnapshot(ctx, data, root.Initialized, nil, peerRoots)
 		if err != nil {
 			return result, err
 		}
@@ -162,17 +160,15 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 			result.BlockDetail = err.Error()
 			return result, nil
 		}
-		if root.Initialized {
-			ok, detail, err := followedDirectoryContinuity(ctx, state, root.ID, snapshot, followedDirectories)
-			if err != nil {
-				return result, err
-			}
-			if !ok {
-				result.Blocked = true
-				result.BlockReason = "followed-directory-identity-changed"
-				result.BlockDetail = detail
-				return result, nil
-			}
+		ok, detail, err := followedPhysicalAuthority(ctx, state, root, snapshot, followedClaims)
+		if err != nil {
+			return result, err
+		}
+		if !ok {
+			result.Blocked = true
+			result.BlockReason = "followed-physical-authority-blocked"
+			result.BlockDetail = detail
+			return result, nil
 		}
 		baselines, err := state.ListBaselines(ctx, root.ID)
 		if err != nil {
@@ -252,7 +248,7 @@ func runRootCycle(ctx context.Context, rootID int64, state *store.Store, data Da
 				return result, err
 			}
 			if !root.Initialized && len(unresolved) == 0 && plan.Conflicts == 0 {
-				if err := state.InitializeSyncRoot(ctx, root.ID, followedDirectories); err != nil {
+				if err := state.InitializeSyncRoot(ctx, root.ID, followedClaims); err != nil {
 					return result, err
 				}
 				result.Initialized = true
@@ -293,8 +289,8 @@ func configuredPeerLocalRoots(ctx context.Context, state *store.Store, rootID in
 	return peers, nil
 }
 
-func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot bool, operations []domain.Operation, peerLocalRoots []string) (reconcile.Snapshot, bool, map[string]string, error) {
-	local, excluded, followedDirectories, err := data.ScanLocal(ctx, operations, peerLocalRoots)
+func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot bool, operations []domain.Operation, peerLocalRoots []string) (reconcile.Snapshot, bool, map[string]domain.FollowedPhysicalClaim, error) {
+	local, excluded, followedClaims, err := data.ScanLocal(ctx, operations, peerLocalRoots)
 	if err != nil {
 		return reconcile.Snapshot{}, false, nil, fmt.Errorf("complete local scan: %w", err)
 	}
@@ -318,35 +314,35 @@ func scanCompleteSnapshot(ctx context.Context, data DataPlane, requireRemoteRoot
 		LocalComplete:  true,
 		RemoteComplete: true,
 		RootHealthy:    true,
-	}, remoteRootPresent, followedDirectories, nil
+	}, remoteRootPresent, followedClaims, nil
 }
 
-func followedDirectoryContinuity(ctx context.Context, state *store.Store, rootID int64, snapshot reconcile.Snapshot, observed map[string]string) (bool, string, error) {
-	expected, err := state.ListFollowedDirectoryBoundaries(ctx, rootID)
+func followedPhysicalAuthority(ctx context.Context, state *store.Store, root domain.SyncRoot, snapshot reconcile.Snapshot, observed map[string]domain.FollowedPhysicalClaim) (bool, string, error) {
+	ok, detail, err := state.ReserveFollowedPhysicalClaims(ctx, root.ID, observed)
+	if err != nil || !ok {
+		return ok, detail, err
+	}
+	expected, err := state.ListFollowedPhysicalClaims(ctx, root.ID)
 	if err != nil {
 		return false, "", err
-	}
-	for relPath, observedIdentity := range observed {
-		expectedIdentity, ok := expected[relPath]
-		if !ok {
-			return false, fmt.Sprintf("followed directory %q has no durable physical identity; re-pair the root before accepting this boundary", relPath), nil
-		}
-		if observedIdentity != expectedIdentity {
-			return false, fmt.Sprintf("followed directory %q changed physical identity from %q to %q; re-pair the root before accepting the replacement", relPath, expectedIdentity, observedIdentity), nil
-		}
 	}
 	for relPath := range expected {
 		if _, ok := observed[relPath]; ok {
 			continue
 		}
+		if !root.Initialized {
+			return false, fmt.Sprintf("followed physical claim %q disappeared during initial pairing; re-pair the root before continuing", relPath), nil
+		}
 		if reconcile.PathExcluded(snapshot.Excluded, relPath) {
 			continue
 		}
 		if local, ok := snapshot.Local[relPath]; ok && local.Present {
-			return false, fmt.Sprintf("followed directory %q no longer resolves through its durable followed boundary; re-pair the root before accepting the replacement", relPath), nil
+			return false, fmt.Sprintf("followed path %q no longer resolves through its durable physical claim; re-pair the root before accepting the replacement", relPath), nil
 		}
-		// The lexical symlink itself disappeared. That is an ordinary local
-		// namespace deletion rather than a referent-identity continuity failure.
+		// For an initialized root, deletion of the lexical symlink itself is an
+		// ordinary local namespace deletion. Its durable claim intentionally stays
+		// reserved for the lifetime of this root pairing, so recreating the path
+		// with a different physical object still requires an explicit re-pair.
 	}
 	return true, "", nil
 }
@@ -356,20 +352,41 @@ func isLocalMutation(op domain.Operation) bool {
 }
 
 func pinLocalMutationTarget(ctx context.Context, state *store.Store, data DataPlane, op domain.Operation) (domain.Operation, error) {
-	if !isLocalMutation(op) || op.LocalTargetPath != "" {
+	if !isLocalMutation(op) {
+		return op, nil
+	}
+	if op.LocalTargetPath != "" || op.LocalTargetIdentity != "" {
+		if op.LocalTargetPath == "" || op.LocalTargetIdentity == "" {
+			return op, fmt.Errorf("operation %d has an incomplete physical local target pin", op.ID)
+		}
 		return op, nil
 	}
 	if op.Phase != domain.OperationPlanned || op.Attempts != 0 {
 		return op, fmt.Errorf("operation %d has no pinned local target after mutation attempts started", op.ID)
 	}
-	target, err := data.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal)
+	target, err := data.ResolveLocalMutationTarget(ctx, op.SrcPath, op.ExpectedLocal, op.EntryKind)
+	if err != nil {
+		// This intent is still planned, unpinned, and has never attempted an
+		// external mutation. A resolution failure means the snapshot used to
+		// create it is no longer a safe authority; discard it so the next cycle
+		// must obtain a fresh complete scan instead of retrying stale intent.
+		if deleteErr := state.DeleteOperation(ctx, op.ID); deleteErr != nil {
+			return op, fmt.Errorf("resolve local mutation target: %v; discard stale planned operation: %w", err, deleteErr)
+		}
+		return op, err
+	}
+	ok, detail, err := state.AuthorizeAndPinLocalMutation(ctx, op.ID, target)
 	if err != nil {
 		return op, err
 	}
-	if err := state.SetOperationLocalTarget(ctx, op.ID, target); err != nil {
-		return op, err
+	if !ok {
+		if deleteErr := state.DeleteOperation(ctx, op.ID); deleteErr != nil {
+			return op, fmt.Errorf("local mutation authority changed before pin: %s; discard stale planned operation: %w", detail, deleteErr)
+		}
+		return op, fmt.Errorf("local mutation authority changed before pin: %s", detail)
 	}
-	op.LocalTargetPath = target
+	op.LocalTargetPath = target.Path
+	op.LocalTargetIdentity = target.AnchorIdentity
 	return op, nil
 }
 
@@ -403,8 +420,9 @@ func recoverExistingOperations(ctx context.Context, state *store.Store, data Dat
 					return false, recovered, err
 				}
 			}
-			if isLocalMutation(op) && op.LocalTargetPath == "" {
-				if err := state.SetOperationPhase(ctx, op.ID, domain.OperationBlocked, "local mutation started before a physical target was pinned", false); err != nil {
+			if isLocalMutation(op) && (op.LocalTargetPath == "" || op.LocalTargetIdentity == "") {
+				detail := "local mutation started before a complete physical target path and identity were pinned; automatic replay is unsafe"
+				if err := state.SetOperationPhase(ctx, op.ID, domain.OperationBlocked, detail, false); err != nil {
 					return false, recovered, err
 				}
 				return true, recovered, nil

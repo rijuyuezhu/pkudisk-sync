@@ -125,7 +125,7 @@ func TestInstallDownloadedPhysicalTempPreservesFollowedFileSymlink(t *testing.T)
 		t.Fatal(err)
 	}
 	recovery := filepath.Join(outside, "recovery")
-	if err := exec.installDownloadedPhysicalTemp(context.Background(), "link.txt", target, temp, recovery, expected); err != nil {
+	if err := exec.installDownloadedPhysicalTemp(context.Background(), "link.txt", target, temp, recovery, expected, ""); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Lstat(link)
@@ -160,7 +160,15 @@ func TestDeleteLocalPreservesSymlinkAndDeletesPinnedTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	op := domain.Operation{ID: 41, Kind: domain.OperationDeleteLocal, EntryKind: domain.KindFile, SrcPath: "link.txt", LocalTargetPath: target, ExpectedLocal: expected}
+	op := domain.Operation{
+		ID:                  41,
+		Kind:                domain.OperationDeleteLocal,
+		EntryKind:           domain.KindFile,
+		SrcPath:             "link.txt",
+		LocalTargetPath:     target,
+		LocalTargetIdentity: physicalIdentityForTest(t, target),
+		ExpectedLocal:       expected,
+	}
 	if err := exec.DeleteLocal(context.Background(), op); err != nil {
 		t.Fatal(err)
 	}
@@ -188,18 +196,18 @@ func TestDanglingFollowedSymlinkCanRecreateTargetWithoutReplacingLink(t *testing
 		t.Fatal(err)
 	}
 	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkFollow}}
-	resolved, err := exec.ResolveLocalMutationTarget(context.Background(), "link.txt", domain.LocalFingerprint{})
+	resolved, err := exec.ResolveLocalMutationTarget(context.Background(), "link.txt", domain.LocalFingerprint{}, domain.KindFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !samePhysicalDestination(resolved, target, false) {
-		t.Fatalf("dangling symlink target = %q, want %q", resolved, target)
+	if !samePhysicalDestination(resolved.Path, target, false) {
+		t.Fatalf("dangling symlink target = %q, want %q", resolved.Path, target)
 	}
 	temp := filepath.Join(outside, "staged")
 	if err := os.WriteFile(temp, []byte("restored"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := exec.installDownloadedPhysicalTemp(context.Background(), "link.txt", resolved, temp, filepath.Join(outside, "unused-recovery"), domain.LocalFingerprint{}); err != nil {
+	if err := exec.installDownloadedPhysicalTemp(context.Background(), "link.txt", resolved.Path, temp, filepath.Join(outside, "unused-recovery"), domain.LocalFingerprint{}, ""); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Lstat(link)
@@ -264,6 +272,80 @@ func TestDeleteLocalRejectsSymlinkRetargetEvenWithEquivalentContent(t *testing.T
 	}
 }
 
+func TestDeleteLocalRejectsSamePathDirectoryReplacementAfterPin(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "dir")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	expected, err := exec.ObserveLocalEntry(context.Background(), "dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedIdentity := physicalIdentityForTest(t, target)
+	oldTarget := filepath.Join(root, "old-dir")
+	if err := os.Rename(target, oldTarget); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	op := domain.Operation{
+		ID:                  43,
+		Kind:                domain.OperationDeleteLocal,
+		EntryKind:           domain.KindDir,
+		SrcPath:             "dir",
+		LocalTargetPath:     target,
+		LocalTargetIdentity: pinnedIdentity,
+		ExpectedLocal:       expected,
+	}
+	if err := exec.DeleteLocal(context.Background(), op); err == nil {
+		t.Fatal("delete accepted a same-path directory replacement after pin")
+	}
+	for _, name := range []string{target, oldTarget} {
+		if info, err := os.Stat(name); err != nil || !info.IsDir() {
+			t.Fatalf("identity fence mutated directory %q: info=%v err=%v", name, info, err)
+		}
+	}
+}
+
+func TestEnsureLocalDirRejectsParentReplacementAfterPin(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "new-dir")
+	pinnedParentIdentity := physicalIdentityForTest(t, root)
+	oldRoot := filepath.Join(base, "old-root")
+	if err := os.Rename(root, oldRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	op := domain.Operation{
+		ID:                  44,
+		Kind:                domain.OperationEnsureLocal,
+		EntryKind:           domain.KindDir,
+		SrcPath:             "new-dir",
+		LocalTargetPath:     target,
+		LocalTargetIdentity: pinnedParentIdentity,
+		ExpectedLocal:       domain.LocalFingerprint{},
+	}
+	if err := exec.EnsureLocalDir(context.Background(), op); err == nil {
+		t.Fatal("directory create accepted a replaced physical parent after pin")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("identity fence created target in replacement parent: %v", err)
+	}
+	if info, err := os.Stat(oldRoot); err != nil || !info.IsDir() {
+		t.Fatalf("original pinned parent lost: info=%v err=%v", info, err)
+	}
+}
+
 func TestLocalRecoveryArtifactFindsPinnedOutsideRootSlot(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
@@ -305,6 +387,7 @@ func TestCleanupLocalRecoveryArtifactRemovesOnlyPinnedOperationSlot(t *testing.T
 	if err := os.WriteFile(artifact, []byte("old"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	op.LocalTargetIdentity = physicalIdentityForTest(t, artifact)
 	neighbor := filepath.Join(root, ".pkudisk-sync-tmp-op-79-recovery")
 	if err := os.WriteFile(neighbor, []byte("other"), 0o600); err != nil {
 		t.Fatal(err)
@@ -324,6 +407,107 @@ func TestCleanupLocalRecoveryArtifactRemovesOnlyPinnedOperationSlot(t *testing.T
 	}
 }
 
+func TestCleanupLocalRecoveryArtifactRefusesReplacementIdentity(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	op := domain.Operation{
+		ID:                  80,
+		Kind:                domain.OperationDeleteLocal,
+		EntryKind:           domain.KindFile,
+		SrcPath:             "target.txt",
+		LocalTargetPath:     target,
+		LocalTargetIdentity: "not-the-artifact-identity",
+	}
+	artifact := operationPhysicalTempPath(target, op.ID, "recovery")
+	if err := os.WriteFile(artifact, []byte("unrelated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	if err := exec.CleanupLocalRecoveryArtifact(context.Background(), op); err == nil {
+		t.Fatal("cleanup deleted a recovery-slot replacement without matching its pinned identity")
+	}
+	if got, err := os.ReadFile(artifact); err != nil || string(got) != "unrelated" {
+		t.Fatalf("cleanup refusal did not preserve replacement artifact: content=%q err=%v", got, err)
+	}
+}
+
+func TestPreserveExpectedLocalEntryRejectsWrongPinnedIdentityAndRestores(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	recovery := filepath.Join(root, "recovery.txt")
+	if err := os.WriteFile(target, []byte("same"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	expected, err := exec.ObserveLocalEntry(ctx, "target.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := preserveExpectedLocalEntryAt(ctx, "target.txt", target, recovery, expected, "definitely-not-the-current-identity"); err == nil {
+		t.Fatal("preserve accepted an object whose moved identity did not match the durable pin")
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || string(got) != "same" {
+		t.Fatalf("identity mismatch did not restore target: content=%q err=%v", got, err)
+	}
+	if _, err := os.Lstat(recovery); !os.IsNotExist(err) {
+		t.Fatalf("identity mismatch left recovery slot behind: %v", err)
+	}
+}
+
+func TestRestoreLocalRecoveryArtifactRejectsReplacementWithMatchingFingerprint(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(target, []byte("same"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	expected, err := exec.ObserveLocalEntry(ctx, "target.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedIdentity := physicalIdentityForTest(t, target)
+	op := domain.Operation{
+		ID:                  90,
+		Kind:                domain.OperationDeleteLocal,
+		EntryKind:           domain.KindFile,
+		SrcPath:             "target.txt",
+		LocalTargetPath:     target,
+		LocalTargetIdentity: pinnedIdentity,
+		ExpectedLocal:       expected,
+		Phase:               domain.OperationBlocked,
+		Attempts:            1,
+	}
+	artifact, _ := RecoveryArtifactPath(op)
+	original := filepath.Join(root, "original-preserved.txt")
+	if err := os.Rename(target, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifact, []byte("same"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(artifact, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoreLocalRecoveryArtifact(ctx, op); err == nil {
+		t.Fatal("restore accepted a replacement recovery artifact with an equivalent fingerprint")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("rejected replacement artifact unexpectedly restored target: %v", err)
+	}
+	for _, path := range []string{artifact, original} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("restore refusal removed %q: %v", path, err)
+		}
+	}
+}
+
 func TestRestoreLocalRecoveryArtifactRestoresMatchingArtifactNoReplace(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -337,14 +521,15 @@ func TestRestoreLocalRecoveryArtifactRestoresMatchingArtifactNoReplace(t *testin
 		t.Fatal(err)
 	}
 	op := domain.Operation{
-		ID:              91,
-		Kind:            domain.OperationDeleteLocal,
-		EntryKind:       domain.KindFile,
-		SrcPath:         "target.txt",
-		LocalTargetPath: target,
-		ExpectedLocal:   expected,
-		Phase:           domain.OperationBlocked,
-		Attempts:        1,
+		ID:                  91,
+		Kind:                domain.OperationDeleteLocal,
+		EntryKind:           domain.KindFile,
+		SrcPath:             "target.txt",
+		LocalTargetPath:     target,
+		LocalTargetIdentity: physicalIdentityForTest(t, target),
+		ExpectedLocal:       expected,
+		Phase:               domain.OperationBlocked,
+		Attempts:            1,
 	}
 	artifact, _ := RecoveryArtifactPath(op)
 	if err := movePathNoReplace(target, artifact); err != nil {
@@ -394,4 +579,17 @@ func TestRestoreLocalRecoveryArtifactRefusesExistingTarget(t *testing.T) {
 			t.Fatalf("restore refusal removed %q: %v", path, err)
 		}
 	}
+}
+
+func physicalIdentityForTest(t *testing.T, path string) string {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := physicalObjectIdentity(path, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
 }

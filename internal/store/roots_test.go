@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -269,15 +270,23 @@ func TestSyncRootInitializationLifecycle(t *testing.T) {
 	}
 }
 
-func TestInitializeSyncRootPersistsFollowedDirectoryBoundariesAtomically(t *testing.T) {
+func TestInitializeSyncRootRequiresReservedFollowedPhysicalClaims(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t)
 	root := createTestRoot(t, s)
-	want := map[string]string{"linked": "linux:1:2", "nested/alias": "linux:1:3"}
+	claimBase := t.TempDir()
+	want := map[string]domain.FollowedPhysicalClaim{
+		"linked":       {Kind: domain.KindDir, Identity: "linux:1:2", TargetPath: filepath.Join(claimBase, "linked")},
+		"nested/alias": {Kind: domain.KindFile, Identity: "linux:1:3", TargetPath: filepath.Join(claimBase, "alias.txt")},
+	}
+	ok, detail, err := s.ReserveFollowedPhysicalClaims(ctx, root.ID, want)
+	if err != nil || !ok {
+		t.Fatalf("reserve followed physical claims = ok=%v detail=%q err=%v", ok, detail, err)
+	}
 	if err := s.InitializeSyncRoot(ctx, root.ID, want); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.ListFollowedDirectoryBoundaries(ctx, root.ID)
+	got, err := s.ListFollowedPhysicalClaims(ctx, root.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,15 +297,204 @@ func TestInitializeSyncRootPersistsFollowedDirectoryBoundariesAtomically(t *test
 	if err != nil || !ok || !initialized.Initialized {
 		t.Fatalf("initialized root = %+v ok=%v err=%v", initialized, ok, err)
 	}
-	if err := s.InitializeSyncRoot(ctx, root.ID, map[string]string{"linked": "linux:9:9"}); err == nil {
+	if err := s.InitializeSyncRoot(ctx, root.ID, map[string]domain.FollowedPhysicalClaim{"linked": {Kind: domain.KindDir, Identity: "linux:9:9", TargetPath: filepath.Join(claimBase, "linked")}}); err == nil {
 		t.Fatal("second initialization rewrote durable followed identities")
 	}
-	got, err = s.ListFollowedDirectoryBoundaries(ctx, root.ID)
+	got, err = s.ListFollowedPhysicalClaims(ctx, root.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("failed second initialization changed boundaries = %+v", got)
+	}
+}
+
+func TestReserveFollowedPhysicalClaimsRejectsCrossRootFileAndDirectoryOwnership(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	rootA := createTestRoot(t, s)
+	rootB, err := s.CreateSyncRoot(ctx, domain.SyncRoot{
+		UUID:                "root-uuid-2",
+		LocalRoot:           filepath.Join(t.TempDir(), "pkudisk-sync-root-b"),
+		RemoteName:          domain.AppRemoteName,
+		RemoteRoot:          "Personal/Sync-B",
+		Enabled:             true,
+		PollIntervalSeconds: 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimBase := t.TempDir()
+	claimsA := map[string]domain.FollowedPhysicalClaim{
+		"dir-link":  {Kind: domain.KindDir, Identity: "linux:49:100", TargetPath: filepath.Join(claimBase, "shared-dir")},
+		"file-link": {Kind: domain.KindFile, Identity: "linux:49:101", TargetPath: filepath.Join(claimBase, "shared-file")},
+	}
+	if ok, detail, err := s.ReserveFollowedPhysicalClaims(ctx, rootA.ID, claimsA); err != nil || !ok {
+		t.Fatalf("reserve root A claims = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+
+	for name, claim := range map[string]domain.FollowedPhysicalClaim{
+		"shared-dir":  {Kind: domain.KindDir, Identity: "linux:49:100", TargetPath: filepath.Join(t.TempDir(), "dir-alias")},
+		"shared-file": {Kind: domain.KindFile, Identity: "linux:49:999", TargetPath: filepath.Join(claimBase, "shared-file")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ok, detail, err := s.ReserveFollowedPhysicalClaims(ctx, rootB.ID, map[string]domain.FollowedPhysicalClaim{name: claim})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ok || !strings.Contains(detail, "already owned by sync root") {
+				t.Fatalf("cross-root reservation = ok=%v detail=%q", ok, detail)
+			}
+		})
+	}
+
+	unique := map[string]domain.FollowedPhysicalClaim{"unique": {Kind: domain.KindFile, Identity: "linux:49:102", TargetPath: filepath.Join(claimBase, "unique-file")}}
+	if ok, detail, err := s.ReserveFollowedPhysicalClaims(ctx, rootB.ID, unique); err != nil || !ok {
+		t.Fatalf("reserve distinct root B claim = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+}
+
+func TestReserveFollowedFileClaimAllowsAtomicReplacementWithoutChangingOwner(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	rootA := createTestRoot(t, s)
+	target := filepath.Join(t.TempDir(), "shared-file")
+	oldClaim := domain.FollowedPhysicalClaim{Kind: domain.KindFile, Identity: "linux:49:200", TargetPath: target}
+	if ok, detail, err := s.ReserveFollowedPhysicalClaims(ctx, rootA.ID, map[string]domain.FollowedPhysicalClaim{"link": oldClaim}); err != nil || !ok {
+		t.Fatalf("reserve old file claim = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+	if err := s.InitializeSyncRoot(ctx, rootA.ID, map[string]domain.FollowedPhysicalClaim{"link": oldClaim}); err != nil {
+		t.Fatal(err)
+	}
+
+	newClaim := oldClaim
+	newClaim.Identity = "linux:49:201"
+	if ok, detail, err := s.ReserveFollowedPhysicalClaims(ctx, rootA.ID, map[string]domain.FollowedPhysicalClaim{"link": newClaim}); err != nil || !ok {
+		t.Fatalf("refresh atomic-replaced file claim = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+	got, err := s.ListFollowedPhysicalClaims(ctx, rootA.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["link"] != newClaim {
+		t.Fatalf("refreshed file claim = %+v, want %+v", got["link"], newClaim)
+	}
+
+	rootB, err := s.CreateSyncRoot(ctx, domain.SyncRoot{
+		UUID:                "root-uuid-file-competitor",
+		LocalRoot:           filepath.Join(t.TempDir(), "pkudisk-sync-root-c"),
+		RemoteName:          domain.AppRemoteName,
+		RemoteRoot:          "Personal/Sync-C",
+		Enabled:             true,
+		PollIntervalSeconds: 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	competitor := domain.FollowedPhysicalClaim{Kind: domain.KindFile, Identity: "linux:49:202", TargetPath: target}
+	ok, detail, err := s.ReserveFollowedPhysicalClaims(ctx, rootB.ID, map[string]domain.FollowedPhysicalClaim{"other": competitor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || !strings.Contains(detail, "physical target") {
+		t.Fatalf("same target path was not retained by original owner: ok=%v detail=%q", ok, detail)
+	}
+}
+
+func TestAuthorizeAndPinLocalMutationRefreshesSameTargetFileIdentity(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	root := createTestRoot(t, s)
+	targetPath := filepath.Join(t.TempDir(), "atomic-file")
+	oldClaim := domain.FollowedPhysicalClaim{Kind: domain.KindFile, Identity: "linux:49:300", TargetPath: targetPath}
+	if ok, detail, err := s.ReserveFollowedPhysicalClaims(ctx, root.ID, map[string]domain.FollowedPhysicalClaim{"link.txt": oldClaim}); err != nil || !ok {
+		t.Fatalf("reserve old claim = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+	op, err := s.CreateOperation(ctx, domain.Operation{
+		SyncRootID:     root.ID,
+		Kind:           domain.OperationEnsureLocal,
+		EntryKind:      domain.KindFile,
+		SrcPath:        "link.txt",
+		ExpectedLocal:  domain.LocalFingerprint{Present: true, Kind: domain.KindFile, Size: 4, MtimeNS: 40},
+		ExpectedRemote: domain.RemoteExpectation{ID: "doc", Rev: "rev"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newClaim := oldClaim
+	newClaim.Identity = "linux:49:301"
+	ok, detail, err := s.AuthorizeAndPinLocalMutation(ctx, op.ID, domain.LocalMutationTarget{
+		Path:           targetPath,
+		AnchorIdentity: newClaim.Identity,
+		FollowedClaims: map[string]domain.FollowedPhysicalClaim{"link.txt": newClaim},
+	})
+	if err != nil || !ok {
+		t.Fatalf("authorize atomic replacement = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+	gotOp, exists, err := s.GetOperation(ctx, op.ID)
+	if err != nil || !exists || gotOp.LocalTargetPath != targetPath || gotOp.LocalTargetIdentity != newClaim.Identity {
+		t.Fatalf("pinned operation = %+v exists=%v err=%v", gotOp, exists, err)
+	}
+	claims, err := s.ListFollowedPhysicalClaims(ctx, root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := claims["link.txt"]; got != newClaim {
+		t.Fatalf("mutation-time file identity = %+v, want %+v", got, newClaim)
+	}
+}
+
+func TestAuthorizeAndPinLocalMutationRequiresDurableAuthorityForDanglingFile(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t)
+	root := createTestRoot(t, s)
+	targetPath := filepath.Join(t.TempDir(), "dangling-file")
+	durable := domain.FollowedPhysicalClaim{Kind: domain.KindFile, Identity: "linux:49:400", TargetPath: targetPath}
+	if ok, detail, err := s.ReserveFollowedPhysicalClaims(ctx, root.ID, map[string]domain.FollowedPhysicalClaim{"known.txt": durable}); err != nil || !ok {
+		t.Fatalf("reserve durable dangling owner = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+
+	newOp := func(path string) domain.Operation {
+		op, err := s.CreateOperation(ctx, domain.Operation{
+			SyncRootID:     root.ID,
+			Kind:           domain.OperationEnsureLocal,
+			EntryKind:      domain.KindFile,
+			SrcPath:        path,
+			ExpectedLocal:  domain.LocalFingerprint{},
+			ExpectedRemote: domain.RemoteExpectation{ID: "doc-" + path, Rev: "rev"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return op
+	}
+
+	known := newOp("known.txt")
+	ok, detail, err := s.AuthorizeAndPinLocalMutation(ctx, known.ID, domain.LocalMutationTarget{
+		Path:           targetPath,
+		AnchorIdentity: "known-parent-anchor",
+		FollowedClaims: map[string]domain.FollowedPhysicalClaim{
+			"known.txt": {Kind: domain.KindFile, TargetPath: targetPath},
+		},
+	})
+	if err != nil || !ok {
+		t.Fatalf("authorize durable dangling file = ok=%v detail=%q err=%v", ok, detail, err)
+	}
+
+	newTarget := filepath.Join(t.TempDir(), "new-dangling-file")
+	unknown := newOp("unknown.txt")
+	ok, detail, err = s.AuthorizeAndPinLocalMutation(ctx, unknown.ID, domain.LocalMutationTarget{
+		Path:           newTarget,
+		AnchorIdentity: "unknown-parent-anchor",
+		FollowedClaims: map[string]domain.FollowedPhysicalClaim{
+			"unknown.txt": {Kind: domain.KindFile, TargetPath: newTarget},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || !strings.Contains(detail, "appeared after the authoritative scan") {
+		t.Fatalf("new dangling boundary gained authority: ok=%v detail=%q", ok, detail)
 	}
 }
 

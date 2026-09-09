@@ -15,11 +15,13 @@ jobs:
     timeout-minutes: 5
     outputs:
       tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
       targets: ${{ steps.release.outputs.targets }}
       prerelease: ${{ steps.release.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Validate tag and build matrix
         id: release
@@ -32,7 +34,12 @@ jobs:
             exit 1
           fi
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          tag_commit=$(git rev-list -n 1 "$RELEASE_TAG")
+          tag_commit=$(git rev-parse HEAD)
+          current_tag_commit=$(git rev-parse "$RELEASE_TAG^{commit}")
+          if [[ "$current_tag_commit" != "$tag_commit" ]]; then
+            echo "release tag moved before metadata validation: event commit $tag_commit, current tag commit $current_tag_commit" >&2
+            exit 1
+          fi
           main_commit=$(git rev-parse origin/main)
           if ! git merge-base --is-ancestor "$tag_commit" "$main_commit"; then
             echo "release tag commit $tag_commit is not on origin/main ($main_commit)" >&2
@@ -45,13 +52,16 @@ jobs:
             echo "release target matrix must be non-empty and contain no duplicates" >&2
             exit 1
           fi
-          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          echo "targets=$targets" >> "$GITHUB_OUTPUT"
-          if [[ "$(./scripts/version.sh version)" == *-* ]]; then
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-          fi
+          {
+            echo "tag=$RELEASE_TAG"
+            echo "commit=$tag_commit"
+            echo "targets=$targets"
+            if [[ "$(./scripts/version.sh version)" == *-* ]]; then
+              echo "prerelease=true"
+            else
+              echo "prerelease=false"
+            fi
+          } >> "$GITHUB_OUTPUT"
 
   quality:
     name: Quality gate
@@ -61,7 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.metadata.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.commit }}
       - uses: actions/setup-go@v7
         with:
           go-version-file: '.go-version'
@@ -72,8 +82,10 @@ jobs:
       - name: Verify embedded release version
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          VALIDATED_COMMIT: ${{ needs.metadata.outputs.commit }}
         run: |
           commit=$(git rev-parse HEAD)
+          test "$commit" = "$VALIDATED_COMMIT"
           built=$(git show -s --format=%cI HEAD)
           go build \
             -buildvcs=false \
@@ -84,11 +96,96 @@ jobs:
           /tmp/pkudisk-sync version | grep -Fx "pkudisk-sync $RELEASE_TAG"
           /tmp/pkudisk-sync version | grep -Fx "$(printf 'commit\t%s' "$commit")"
 
+  native-windows:
+    name: Windows native release gate
+    needs: metadata
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.metadata.outputs.commit }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: '.go-version'
+          cache: true
+      - name: Run native Windows tests
+        shell: pwsh
+        run: go test ./...
+      - name: Build pkudisk-sync
+        shell: pwsh
+        run: go build -o pkudisk-sync.exe ./cmd/pkudisk-sync
+      - name: Exercise Scheduled Task lifecycle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Invoke-Sync {
+            param([Parameter(ValueFromRemainingArguments = $true)][string[]] $Arguments)
+            $output = & .\pkudisk-sync.exe @Arguments 2>&1
+            $code = $LASTEXITCODE
+            $output | Out-Host
+            if ($code -ne 0) {
+              throw "pkudisk-sync $($Arguments -join ' ') failed with exit code $code"
+            }
+            return $output
+          }
+
+          function Wait-SyncStatus {
+            param([string] $Expected)
+            $status = ''
+            for ($i = 0; $i -lt 30; $i++) {
+              $status = (Invoke-Sync service status | Out-String).Trim()
+              if ($status -eq $Expected) {
+                return
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            throw "scheduled task did not reach $Expected state: $status"
+          }
+
+          $installed = $false
+          try {
+            Invoke-Sync service install | Out-Null
+            $installed = $true
+            Wait-SyncStatus 'inactive'
+            Invoke-Sync service start | Out-Null
+            Wait-SyncStatus 'active'
+            Invoke-Sync service stop | Out-Null
+            Wait-SyncStatus 'inactive'
+            Invoke-Sync service uninstall | Out-Null
+            $installed = $false
+            Wait-SyncStatus 'not-installed'
+          }
+          finally {
+            if ($installed) {
+              & .\pkudisk-sync.exe service stop 2>&1 | Out-Host
+              & .\pkudisk-sync.exe service uninstall 2>&1 | Out-Host
+            }
+          }
+
+  native-macos:
+    name: macOS native release gate
+    needs: metadata
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.metadata.outputs.commit }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: '.go-version'
+          cache: true
+      - run: go test ./...
+
   build:
     name: Build ${{ matrix.target }}
     needs:
       - metadata
       - quality
+      - native-windows
+      - native-macos
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -98,7 +195,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.metadata.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.commit }}
       - uses: actions/setup-go@v7
         with:
           go-version-file: '.go-version'
@@ -117,9 +214,11 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          VALIDATED_COMMIT: ${{ needs.metadata.outputs.commit }}
         run: |
           archive="dist/pkudisk-sync-${RELEASE_TAG}-${TARGET//\//-}.zip"
-          ./scripts/verify-release.sh "$archive" "$TARGET" "$RELEASE_TAG" "$(git rev-parse HEAD)" "$(cat .go-version)"
+          test "$(git rev-parse HEAD)" = "$VALIDATED_COMMIT"
+          ./scripts/verify-release.sh "$archive" "$TARGET" "$RELEASE_TAG" "$VALIDATED_COMMIT" "$(cat .go-version)"
       - name: Name artifact
         id: artifact
         env:
@@ -145,7 +244,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.metadata.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.commit }}
       - uses: actions/setup-go@v7
         with:
           go-version-file: '.go-version'
@@ -163,21 +262,33 @@ jobs:
       - name: Verify artifacts and create checksums
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          VALIDATED_COMMIT: ${{ needs.metadata.outputs.commit }}
         run: |
+          test "$(git rev-parse HEAD)" = "$VALIDATED_COMMIT"
           expected=$(wc -l < scripts/release-targets.txt)
           actual=$(find dist -maxdepth 1 -type f -name '*.zip' | wc -l)
           if [[ "$actual" -ne "$expected" ]]; then
             echo "expected $expected release archives, found $actual" >&2
             exit 1
           fi
-          source_commit=$(git rev-parse HEAD)
           while IFS= read -r target; do
             [[ -z $target ]] && continue
             archive="dist/pkudisk-sync-${RELEASE_TAG}-${target//\//-}.zip"
-            ./scripts/verify-release.sh "$archive" "$target" "$RELEASE_TAG" "$source_commit" "$(cat .go-version)"
+            ./scripts/verify-release.sh "$archive" "$target" "$RELEASE_TAG" "$VALIDATED_COMMIT" "$(cat .go-version)"
           done < scripts/release-targets.txt
           (cd dist && sha256sum ./*.zip | sort -k2 > SHA256SUMS)
           (cd dist && sha256sum -c SHA256SUMS)
+      - name: Verify release tag is still immutable for this run
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          VALIDATED_COMMIT: ${{ needs.metadata.outputs.commit }}
+        run: |
+          git fetch --force --no-tags origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          current_tag_commit=$(git rev-parse "$RELEASE_TAG^{commit}")
+          if [[ "$current_tag_commit" != "$VALIDATED_COMMIT" ]]; then
+            echo "release tag moved during workflow: validated $VALIDATED_COMMIT, current $current_tag_commit" >&2
+            exit 1
+          fi
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
