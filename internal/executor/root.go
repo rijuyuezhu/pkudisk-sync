@@ -175,9 +175,9 @@ func (e *RootExecutor) DownloadToTemp(ctx context.Context, relPath, tempRelPath 
 }
 
 // downloadToPhysicalTemp stages one exact remote revision into a caller-owned
-// absolute path. The caller chooses a path in the destination target's physical
-// directory so the later no-replace rename remains same-filesystem even when a
-// followed symlink points outside the configured sync root.
+// absolute path. Mutation/recovery callers may choose the destination target's
+// physical directory when they need a later no-replace rename to stay on the
+// same filesystem; comparison-only callers do not require that placement.
 func (e *RootExecutor) downloadToPhysicalTemp(ctx context.Context, relPath, tempPath string, expected domain.RemoteExpectation) error {
 	if err := domain.ValidateRelPath(relPath); err != nil {
 		return err

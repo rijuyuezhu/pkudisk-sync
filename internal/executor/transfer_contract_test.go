@@ -371,14 +371,17 @@ func TestCompareFileContentUsesGuardedDownloadAndRevalidatesBothSides(t *testing
 	exec.copyFileFn = func(copyCtx context.Context, dst, _ fs.Fs, dstRemote, _ string) error {
 		assertDownloadConfig(t, copyCtx, "doc", "rev")
 		stagedPath = filepath.Join(dst.Root(), filepath.FromSlash(dstRemote))
-		relToRoot, err := filepath.Rel(root, stagedPath)
+		if err := os.WriteFile(stagedPath, []byte("same"), 0o600); err != nil {
+			return err
+		}
+		matches, err := filepath.Glob(filepath.Join(root, tempNamePrefix+"*"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if filepath.IsLocal(relToRoot) {
-			t.Fatalf("comparison staging %q is inside sync root %q", stagedPath, root)
+		if len(matches) != 0 {
+			t.Fatalf("comparison left reserved staging inside sync root during download: %v", matches)
 		}
-		return os.WriteFile(stagedPath, []byte("same"), 0o600)
+		return nil
 	}
 	equal, err := exec.CompareFileContent(ctx, "a.txt", expectedLocal, expectedRemote)
 	if err != nil {
