@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/rijuyuezhu/pkudisk-sync/internal/domain"
 )
 
@@ -1266,9 +1267,10 @@ func (e *RootExecutor) CommitDownloadedTemp(ctx context.Context, relPath, tempRe
 	return temp, nil
 }
 
-// CompareFileContent obtains the exact planned remote revision through the same
-// guarded download path and compares it byte-for-byte with an unchanged local
-// file. The temporary file is always client-owned and excluded from snapshots.
+// CompareFileContent opens the exact planned remote revision as a guarded
+// stream and compares it byte-for-byte with an unchanged local file. Plan-time
+// comparison creates no local staging artifact, so a crash cannot leak internal
+// bytes into any lexical or projected sync namespace.
 func (e *RootExecutor) CompareFileContent(ctx context.Context, relPath string, expectedLocal domain.LocalFingerprint, expectedRemote domain.RemoteExpectation) (bool, error) {
 	if err := validateFilePathAndLocalExpectation(relPath, expectedLocal); err != nil {
 		return false, err
@@ -1287,21 +1289,27 @@ func (e *RootExecutor) CompareFileContent(ctx context.Context, relPath string, e
 		return false, fmt.Errorf("local content comparison precondition failed for %q", relPath)
 	}
 
-	tempRel, err := newTempRelPath(relPath)
+	remoteObject, err := e.remote.NewObject(ctx, relPath)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("open remote comparison source %q: %w", relPath, err)
 	}
-	defer e.removeLocalTemp(tempRel)
-	if err := e.DownloadToTemp(ctx, relPath, tempRel, expectedRemote); err != nil {
-		return false, err
+	if remoteObject.Size() != expectedLocal.Size {
+		return false, fmt.Errorf("remote content comparison size changed for %q: expected %d bytes, got %d", relPath, expectedLocal.Size, remoteObject.Size())
+	}
+	remoteReader, err := operations.Open(ctx, remoteObject,
+		&fs.HTTPOption{Key: syncExpectedIDDownloadHeader, Value: expectedRemote.ID},
+		&fs.HTTPOption{Key: syncExpectedRevDownloadHeader, Value: expectedRemote.Rev},
+	)
+	if err != nil {
+		return false, fmt.Errorf("open exact remote revision %q: %w", relPath, err)
+	}
+	localPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
+	equal, compareErr := fileReaderEqual(localPath, remoteReader, expectedLocal.Size)
+	_ = remoteReader.Close()
+	if compareErr != nil {
+		return false, compareErr
 	}
 
-	localPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(relPath))
-	tempPath := filepath.Join(e.root.LocalRoot, filepath.FromSlash(tempRel))
-	equal, err := filesEqual(localPath, tempPath)
-	if err != nil {
-		return false, err
-	}
 	after, err := e.ObserveLocalEntry(ctx, relPath)
 	if err != nil {
 		return false, err
@@ -1379,26 +1387,54 @@ func newTempName() (string, error) {
 	return tempNamePrefix + hex.EncodeToString(random[:]), nil
 }
 
-func newTempRelPath(relPath string) (string, error) {
-	if err := domain.ValidateRelPath(relPath); err != nil {
-		return "", err
-	}
-	name, err := newTempName()
+func fileReaderEqual(localPath string, remote io.Reader, expectedSize int64) (bool, error) {
+	local, err := os.Open(localPath)
 	if err != nil {
-		return "", err
+		return false, fmt.Errorf("open local comparison file: %w", err)
 	}
-	dir := path.Dir(relPath)
-	if dir == "." {
-		return name, nil
-	}
-	return path.Join(dir, name), nil
+	defer func() { _ = local.Close() }()
+	return readersEqualExactSize(local, remote, expectedSize)
 }
 
-func (e *RootExecutor) removeLocalTemp(tempRelPath string) {
-	if err := domain.ValidateRelPath(tempRelPath); err != nil {
-		return
+func readersEqualExactSize(left, right io.Reader, expectedSize int64) (bool, error) {
+	if expectedSize < 0 {
+		return false, fmt.Errorf("invalid content comparison size %d", expectedSize)
 	}
-	_ = os.Remove(filepath.Join(e.root.LocalRoot, filepath.FromSlash(tempRelPath)))
+	leftBuf := make([]byte, 256*1024)
+	rightBuf := make([]byte, 256*1024)
+	equal := true
+	remaining := expectedSize
+	for remaining > 0 {
+		chunk := int64(len(leftBuf))
+		if remaining < chunk {
+			chunk = remaining
+		}
+		ln, le := io.ReadFull(left, leftBuf[:int(chunk)])
+		if le != nil {
+			return false, fmt.Errorf("local comparison file ended before expected size %d: %w", expectedSize, le)
+		}
+		rn, re := io.ReadFull(right, rightBuf[:int(chunk)])
+		if re != nil {
+			return false, fmt.Errorf("remote comparison stream ended before expected size %d: %w", expectedSize, re)
+		}
+		if ln != rn || string(leftBuf[:ln]) != string(rightBuf[:rn]) {
+			equal = false
+		}
+		remaining -= int64(ln)
+	}
+
+	var extra [1]byte
+	if n, err := io.ReadFull(left, extra[:]); err == nil || n != 0 {
+		return false, fmt.Errorf("local comparison file exceeds expected size %d", expectedSize)
+	} else if err != io.EOF {
+		return false, fmt.Errorf("read local comparison file after expected size: %w", err)
+	}
+	if n, err := io.ReadFull(right, extra[:]); err == nil || n != 0 {
+		return false, fmt.Errorf("remote comparison stream exceeds expected size %d", expectedSize)
+	} else if err != io.EOF {
+		return false, fmt.Errorf("read remote comparison stream after expected size: %w", err)
+	}
+	return equal, nil
 }
 
 func filesEqual(a, b string) (bool, error) {
@@ -1412,23 +1448,28 @@ func filesEqual(a, b string) (bool, error) {
 		return false, fmt.Errorf("open downloaded comparison file: %w", err)
 	}
 	defer func() { _ = right.Close() }()
+	return readersEqual(left, right)
+}
 
+func readersEqual(left, right io.Reader) (bool, error) {
 	leftBuf := make([]byte, 256*1024)
 	rightBuf := make([]byte, 256*1024)
 	for {
 		ln, le := io.ReadFull(left, leftBuf)
 		rn, re := io.ReadFull(right, rightBuf)
+		leftDone := le == io.EOF || le == io.ErrUnexpectedEOF
+		rightDone := re == io.EOF || re == io.ErrUnexpectedEOF
+		if le != nil && !leftDone {
+			return false, fmt.Errorf("read local comparison file: %w", le)
+		}
+		if re != nil && !rightDone {
+			return false, fmt.Errorf("read downloaded comparison file: %w", re)
+		}
 		if ln != rn || string(leftBuf[:ln]) != string(rightBuf[:rn]) {
 			return false, nil
 		}
-		if le == io.EOF || le == io.ErrUnexpectedEOF || re == io.EOF || re == io.ErrUnexpectedEOF {
-			return (le == io.EOF || le == io.ErrUnexpectedEOF) && (re == io.EOF || re == io.ErrUnexpectedEOF), nil
-		}
-		if le != nil {
-			return false, fmt.Errorf("read local comparison file: %w", le)
-		}
-		if re != nil {
-			return false, fmt.Errorf("read downloaded comparison file: %w", re)
+		if leftDone || rightDone {
+			return leftDone && rightDone, nil
 		}
 	}
 }

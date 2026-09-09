@@ -2,10 +2,13 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/rclone/rclone/backend/local"
@@ -45,6 +48,68 @@ func (o *fingerprintObject) Size() int64                       { return o.size }
 func (o *fingerprintObject) ModTime(context.Context) time.Time { return o.mtime }
 func (o *fingerprintObject) Metadata(context.Context) (fs.Metadata, error) {
 	return fs.Metadata{"rev": o.rev}, nil
+}
+
+type guardedContentObject struct {
+	fingerprintObject
+	t    *testing.T
+	data string
+}
+
+func (o *guardedContentObject) Open(_ context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	o.t.Helper()
+	assertGuardedOpenOptions(o.t, options, o.id, o.rev)
+	return io.NopCloser(strings.NewReader(o.data)), nil
+}
+
+func assertGuardedOpenOptions(t *testing.T, options []fs.OpenOption, id, rev string) {
+	t.Helper()
+	got := map[string]string{}
+	for _, option := range options {
+		key, value := option.Header()
+		if key != "" {
+			got[key] = value
+		}
+	}
+	if got[syncExpectedIDDownloadHeader] != id || got[syncExpectedRevDownloadHeader] != rev {
+		t.Fatalf("guarded stream options = %#v, want id=%q rev=%q", got, id, rev)
+	}
+}
+
+type reopeningContentObject struct {
+	fingerprintObject
+	t     *testing.T
+	opens int
+}
+
+func (o *reopeningContentObject) Open(_ context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	o.t.Helper()
+	assertGuardedOpenOptions(o.t, options, o.id, o.rev)
+	var start int64
+	for _, option := range options {
+		switch value := option.(type) {
+		case *fs.RangeOption:
+			start = value.Start
+		case *fs.SeekOption:
+			start = value.Offset
+		}
+	}
+	o.opens++
+	switch o.opens {
+	case 1:
+		if start != 0 {
+			o.t.Fatalf("initial stream starts at %d, want 0", start)
+		}
+		return io.NopCloser(io.MultiReader(strings.NewReader("sa"), iotest.ErrReader(errors.New("transient read failure")))), nil
+	case 2:
+		if start != 2 {
+			o.t.Fatalf("reopened stream starts at %d, want 2", start)
+		}
+		return io.NopCloser(strings.NewReader("me")), nil
+	default:
+		o.t.Fatalf("unexpected remote reopen %d", o.opens)
+		return nil, errors.New("unexpected reopen")
+	}
 }
 
 func testLocalFS(t *testing.T, root string) fs.Fs {
@@ -352,13 +417,22 @@ func TestCommitDownloadedTempRevalidatesRemoteAndMovesNoReplace(t *testing.T) {
 	}
 }
 
-func TestCompareFileContentUsesGuardedDownloadAndRevalidatesBothSides(t *testing.T) {
+func TestCompareFileContentStreamsGuardedRevisionWithoutStaging(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("same"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}, local: testLocalFS(t, root)}
+	remoteObject := &guardedContentObject{
+		fingerprintObject: fingerprintObject{remote: "a.txt", id: "doc", rev: "rev", size: 4},
+		t:                 t,
+		data:              "same",
+	}
+	exec := &RootExecutor{
+		root:   domain.SyncRoot{LocalRoot: root},
+		local:  testLocalFS(t, root),
+		remote: &lookupFS{object: remoteObject},
+	}
 	expectedLocal, err := exec.ObserveLocalFile(ctx, "a.txt")
 	if err != nil {
 		t.Fatal(err)
@@ -367,9 +441,9 @@ func TestCompareFileContentUsesGuardedDownloadAndRevalidatesBothSides(t *testing
 	exec.observeRemoteFn = func(context.Context, string) (domain.RemoteFingerprint, error) {
 		return domain.RemoteFingerprint{Present: true, Kind: domain.KindFile, ID: "doc", Rev: "rev", Size: 4}, nil
 	}
-	exec.copyFileFn = func(copyCtx context.Context, dst, _ fs.Fs, dstRemote, _ string) error {
-		assertDownloadConfig(t, copyCtx, "doc", "rev")
-		return os.WriteFile(filepath.Join(dst.Root(), filepath.FromSlash(dstRemote)), []byte("same"), 0o600)
+	exec.copyFileFn = func(context.Context, fs.Fs, fs.Fs, string, string) error {
+		t.Fatal("plan-time content comparison must not stage through CopyFile")
+		return nil
 	}
 	equal, err := exec.CompareFileContent(ctx, "a.txt", expectedLocal, expectedRemote)
 	if err != nil {
@@ -377,6 +451,105 @@ func TestCompareFileContentUsesGuardedDownloadAndRevalidatesBothSides(t *testing
 	}
 	if !equal {
 		t.Fatal("equal local/remote contents reported different")
+	}
+}
+
+func TestCompareFileContentRequiresCompleteRemoteStream(t *testing.T) {
+	tests := []struct {
+		name      string
+		data      string
+		wantError bool
+		wantEqual bool
+	}{
+		{name: "short", data: "sa", wantError: true},
+		{name: "overlong", data: "same-extra", wantError: true},
+		{name: "exact different", data: "diff", wantEqual: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("same"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			remoteObject := &guardedContentObject{
+				fingerprintObject: fingerprintObject{remote: "a.txt", id: "doc", rev: "rev", size: 4},
+				t:                 t,
+				data:              test.data,
+			}
+			exec := &RootExecutor{
+				root:   domain.SyncRoot{LocalRoot: root},
+				local:  testLocalFS(t, root),
+				remote: &lookupFS{object: remoteObject},
+			}
+			expectedLocal, err := exec.ObserveLocalFile(ctx, "a.txt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec.observeRemoteFn = func(context.Context, string) (domain.RemoteFingerprint, error) {
+				return domain.RemoteFingerprint{Present: true, Kind: domain.KindFile, ID: "doc", Rev: "rev", Size: 4}, nil
+			}
+			equal, err := exec.CompareFileContent(ctx, "a.txt", expectedLocal, domain.RemoteExpectation{ID: "doc", Rev: "rev"})
+			if test.wantError {
+				if err == nil {
+					t.Fatalf("CompareFileContent() = equal %v, nil error; want incomplete-stream error", equal)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if equal != test.wantEqual {
+				t.Fatalf("CompareFileContent() equal = %v, want %v", equal, test.wantEqual)
+			}
+		})
+	}
+}
+
+func TestReadersEqualPropagatesRemoteReadError(t *testing.T) {
+	transportErr := errors.New("transport failed")
+	equal, err := readersEqual(
+		strings.NewReader("same"),
+		io.MultiReader(strings.NewReader("sa"), iotest.ErrReader(transportErr)),
+	)
+	if err == nil || !errors.Is(err, transportErr) {
+		t.Fatalf("readersEqual() = equal %v, err %v; want remote read error", equal, err)
+	}
+}
+
+func TestCompareFileContentReopensGuardedStreamOnReadFailure(t *testing.T) {
+	ctx, config := fs.AddConfig(context.Background())
+	config.LowLevelRetries = 2
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("same"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	remoteObject := &reopeningContentObject{
+		fingerprintObject: fingerprintObject{remote: "a.txt", id: "doc", rev: "rev", size: 4},
+		t:                 t,
+	}
+	exec := &RootExecutor{
+		root:   domain.SyncRoot{LocalRoot: root},
+		local:  testLocalFS(t, root),
+		remote: &lookupFS{object: remoteObject},
+	}
+	expectedLocal, err := exec.ObserveLocalFile(ctx, "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedRemote := domain.RemoteExpectation{ID: "doc", Rev: "rev"}
+	exec.observeRemoteFn = func(context.Context, string) (domain.RemoteFingerprint, error) {
+		return domain.RemoteFingerprint{Present: true, Kind: domain.KindFile, ID: "doc", Rev: "rev", Size: 4}, nil
+	}
+	equal, err := exec.CompareFileContent(ctx, "a.txt", expectedLocal, expectedRemote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equal {
+		t.Fatal("reopened exact remote revision reported different content")
+	}
+	if remoteObject.opens != 2 {
+		t.Fatalf("remote opens = %d, want initial open plus one range reopen", remoteObject.opens)
 	}
 }
 
@@ -391,9 +564,15 @@ func TestCopySymlinkContentComparisonUsesProjectedFileBytes(t *testing.T) {
 	if err := os.Symlink(target, filepath.Join(root, "link.txt")); err != nil {
 		t.Fatal(err)
 	}
+	remoteObject := &guardedContentObject{
+		fingerprintObject: fingerprintObject{remote: "link.txt", id: "doc", rev: "rev", size: 4},
+		t:                 t,
+		data:              "same",
+	}
 	exec := &RootExecutor{
-		root:  domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy},
-		local: testLocalCopyLinksFS(t, root),
+		root:   domain.SyncRoot{LocalRoot: root, SymlinkMode: domain.SymlinkCopy},
+		local:  testLocalCopyLinksFS(t, root),
+		remote: &lookupFS{object: remoteObject},
 	}
 	expectedLocal, err := exec.ObserveLocalFile(ctx, "link.txt")
 	if err != nil {
@@ -402,13 +581,6 @@ func TestCopySymlinkContentComparisonUsesProjectedFileBytes(t *testing.T) {
 	expectedRemote := domain.RemoteExpectation{ID: "doc", Rev: "rev"}
 	exec.observeRemoteFn = func(context.Context, string) (domain.RemoteFingerprint, error) {
 		return domain.RemoteFingerprint{Present: true, Kind: domain.KindFile, ID: "doc", Rev: "rev", Size: 4}, nil
-	}
-	exec.copyFileFn = func(copyCtx context.Context, dst, _ fs.Fs, dstRemote, srcRemote string) error {
-		assertDownloadConfig(t, copyCtx, "doc", "rev")
-		if srcRemote != "link.txt" {
-			t.Fatalf("remote source = %q", srcRemote)
-		}
-		return os.WriteFile(filepath.Join(dst.Root(), filepath.FromSlash(dstRemote)), []byte("same"), 0o600)
 	}
 	equal, err := exec.CompareFileContent(ctx, "link.txt", expectedLocal, expectedRemote)
 	if err != nil {
