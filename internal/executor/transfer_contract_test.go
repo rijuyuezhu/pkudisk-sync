@@ -454,6 +454,58 @@ func TestCompareFileContentStreamsGuardedRevisionWithoutStaging(t *testing.T) {
 	}
 }
 
+func TestCompareFileContentRequiresCompleteRemoteStream(t *testing.T) {
+	tests := []struct {
+		name      string
+		data      string
+		wantError bool
+		wantEqual bool
+	}{
+		{name: "short", data: "sa", wantError: true},
+		{name: "overlong", data: "same-extra", wantError: true},
+		{name: "exact different", data: "diff", wantEqual: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("same"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			remoteObject := &guardedContentObject{
+				fingerprintObject: fingerprintObject{remote: "a.txt", id: "doc", rev: "rev", size: 4},
+				t:                 t,
+				data:              test.data,
+			}
+			exec := &RootExecutor{
+				root:   domain.SyncRoot{LocalRoot: root},
+				local:  testLocalFS(t, root),
+				remote: &lookupFS{object: remoteObject},
+			}
+			expectedLocal, err := exec.ObserveLocalFile(ctx, "a.txt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec.observeRemoteFn = func(context.Context, string) (domain.RemoteFingerprint, error) {
+				return domain.RemoteFingerprint{Present: true, Kind: domain.KindFile, ID: "doc", Rev: "rev", Size: 4}, nil
+			}
+			equal, err := exec.CompareFileContent(ctx, "a.txt", expectedLocal, domain.RemoteExpectation{ID: "doc", Rev: "rev"})
+			if test.wantError {
+				if err == nil {
+					t.Fatalf("CompareFileContent() = equal %v, nil error; want incomplete-stream error", equal)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if equal != test.wantEqual {
+				t.Fatalf("CompareFileContent() equal = %v, want %v", equal, test.wantEqual)
+			}
+		})
+	}
+}
+
 func TestReadersEqualPropagatesRemoteReadError(t *testing.T) {
 	transportErr := errors.New("transport failed")
 	equal, err := readersEqual(
