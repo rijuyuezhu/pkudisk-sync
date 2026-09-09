@@ -113,6 +113,80 @@ func TestScanLocalPlannedOperationDoesNotOwnTempArtifact(t *testing.T) {
 	}
 }
 
+func TestScanLocalPinnedPlannedEnsureOwnsOnlyDownloadStaging(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	download := operationPhysicalTempPath(target, 17, "download")
+	if err := os.WriteFile(download, []byte("partial download"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{ID: 1, LocalRoot: root}}
+	op := domain.Operation{
+		ID:                   17,
+		SyncRootID:           1,
+		Kind:                 domain.OperationEnsureLocal,
+		LocalTargetPath:      target,
+		LocalTargetIdentity:  "pinned-parent",
+		LocalTargetAuthority: domain.LocalMutationLexical,
+		Phase:                domain.OperationPlanned,
+		Attempts:             0,
+	}
+	got, excluded, _, _, err := exec.ScanLocal(context.Background(), []domain.Operation{op}, nil)
+	if err != nil {
+		t.Fatalf("restart preflight rejected pinned planned download staging: %v", err)
+	}
+	if len(got) != 0 || len(excluded) != 0 {
+		t.Fatalf("planned download staging leaked into snapshot: got=%+v excluded=%v", got, excluded)
+	}
+
+	if err := os.Remove(download); err != nil {
+		t.Fatal(err)
+	}
+	recovery := operationPhysicalTempPath(target, 17, "recovery")
+	if err := os.WriteFile(recovery, []byte("unexpected recovery"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, err := exec.ScanLocal(context.Background(), []domain.Operation{op}, nil); err == nil {
+		t.Fatal("pinned planned operation incorrectly owned a pre-side-effect recovery artifact")
+	}
+}
+
+func TestScanLocalIncompleteOrAttemptedPlannedEnsureDoesNotOwnDownloadStaging(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		identity  string
+		authority domain.LocalMutationAuthority
+		attempts  int
+	}{
+		{name: "missing identity", authority: domain.LocalMutationLexical},
+		{name: "missing authority", identity: "pinned-parent"},
+		{name: "already attempted", identity: "pinned-parent", authority: domain.LocalMutationLexical, attempts: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			target := filepath.Join(root, "target.txt")
+			download := operationPhysicalTempPath(target, 17, "download")
+			if err := os.WriteFile(download, []byte("user-or-ambiguous"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			exec := &RootExecutor{root: domain.SyncRoot{ID: 1, LocalRoot: root}}
+			op := domain.Operation{
+				ID:                   17,
+				SyncRootID:           1,
+				Kind:                 domain.OperationEnsureLocal,
+				LocalTargetPath:      target,
+				LocalTargetIdentity:  tc.identity,
+				LocalTargetAuthority: tc.authority,
+				Phase:                domain.OperationPlanned,
+				Attempts:             tc.attempts,
+			}
+			if _, _, _, _, err := exec.ScanLocal(context.Background(), []domain.Operation{op}, nil); err == nil {
+				t.Fatal("ambiguous planned operation incorrectly owned a download staging artifact")
+			}
+		})
+	}
+}
+
 func TestScanLocalRejectsUnownedOperationShapedFile(t *testing.T) {
 	root := t.TempDir()
 	name := operationPhysicalTempPath(filepath.Join(root, "target.txt"), 17, "recovery")

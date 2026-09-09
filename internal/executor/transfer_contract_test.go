@@ -280,6 +280,54 @@ func TestEnsureLocalFileStagesAndCommitsGuardedDownload(t *testing.T) {
 	}
 }
 
+func TestEnsureLocalFileDiscardsStalePlannedDownloadStagingBeforeRedownload(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	target := filepath.Join(root, "a.txt")
+	expectedRemote := domain.RemoteExpectation{ID: "doc", Rev: "rev"}
+	remoteState := domain.RemoteFingerprint{Present: true, Kind: domain.KindFile, ID: "doc", Rev: "rev", Size: 6}
+	exec := &RootExecutor{root: domain.SyncRoot{LocalRoot: root}}
+	exec.observeRemoteFn = func(context.Context, string) (domain.RemoteFingerprint, error) { return remoteState, nil }
+	op := domain.Operation{
+		ID:                   7,
+		Kind:                 domain.OperationEnsureLocal,
+		EntryKind:            domain.KindFile,
+		SrcPath:              "a.txt",
+		LocalTargetPath:      target,
+		LocalTargetIdentity:  physicalIdentityForTest(t, root),
+		LocalTargetAuthority: domain.LocalMutationLexical,
+		ExpectedRemote:       expectedRemote,
+		Phase:                domain.OperationPlanned,
+	}
+	stale := operationPhysicalTempPath(target, op.ID, "download")
+	if err := os.WriteFile(stale, []byte("partial-old-download"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec.copyFileFn = func(copyCtx context.Context, dst, _ fs.Fs, dstRemote, _ string) error {
+		assertDownloadConfig(t, copyCtx, "doc", "rev")
+		staged := filepath.Join(dst.Root(), filepath.FromSlash(dstRemote))
+		if _, err := os.Lstat(staged); !os.IsNotExist(err) {
+			t.Fatalf("stale download staging was not removed before redownload: %v", err)
+		}
+		return os.WriteFile(staged, []byte("remote"), 0o600)
+	}
+
+	got, err := exec.EnsureLocalFile(ctx, op, nil, allowLocalSideEffectForTest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Present || got.Kind != domain.KindFile || got.Size != 6 {
+		t.Fatalf("EnsureLocalFile() = %+v", got)
+	}
+	contents, err := os.ReadFile(target)
+	if err != nil || string(contents) != "remote" {
+		t.Fatalf("committed target = %q err=%v", contents, err)
+	}
+	if _, err := os.Lstat(stale); !os.IsNotExist(err) {
+		t.Fatalf("download staging survived successful retry: %v", err)
+	}
+}
+
 func TestCommitDownloadedTempRevalidatesRemoteAndMovesNoReplace(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

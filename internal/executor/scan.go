@@ -283,13 +283,34 @@ func (e *RootExecutor) ownedOperationArtifacts(operations []domain.Operation) (m
 		if op.LocalTargetPath == "" || (op.Kind != domain.OperationEnsureLocal && op.Kind != domain.OperationDeleteLocal) {
 			continue
 		}
+		plannedDownloadOnly := false
 		switch op.Phase {
 		case domain.OperationRunning, domain.OperationRecovering, domain.OperationBlocked:
+		case domain.OperationPlanned:
+			if op.Kind != domain.OperationEnsureLocal || op.Attempts != 0 || op.ID <= 0 || op.LocalTargetIdentity == "" {
+				continue
+			}
+			switch op.LocalTargetAuthority {
+			case domain.LocalMutationLexical, domain.LocalMutationFollowPhysical, domain.LocalMutationCopyPhysical:
+				plannedDownloadOnly = true
+			default:
+				continue
+			}
 		default:
 			continue
 		}
 		if !filepath.IsAbs(op.LocalTargetPath) || filepath.Clean(op.LocalTargetPath) != op.LocalTargetPath {
 			return nil, fmt.Errorf("operation %d has invalid pinned local target %q", op.ID, op.LocalTargetPath)
+		}
+		if plannedDownloadOnly {
+			// A fully pinned, unattempted EnsureLocal may have created its exact
+			// download staging slot before the first user-data side effect. A hard
+			// crash cannot run the executor's deferred cleanup, so restart preflight
+			// must recognize only that exact disposable slot as journal-owned. It
+			// must not grant recovery-slot ownership before the operation has crossed
+			// the durable running boundary.
+			owned[operationPhysicalTempPath(op.LocalTargetPath, op.ID, "download")] = struct{}{}
+			continue
 		}
 		owned[operationPhysicalTempPath(op.LocalTargetPath, op.ID, "recovery")] = struct{}{}
 		if op.Kind == domain.OperationEnsureLocal {
