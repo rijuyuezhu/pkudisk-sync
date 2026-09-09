@@ -4,7 +4,7 @@ Cross-platform, stateful, bidirectional synchronization for selected PKU Disk di
 
 `pkudisk-sync` embeds rclone and [`rclone-pkudisk`](https://github.com/rijuyuezhu/rclone-pkudisk) directly as Go libraries and manages synchronization state itself. No separate rclone process is required.
 
-> **Status:** current development version is `0.1.0-alpha.4`.
+> **Status:** current development version is `0.1.0-alpha.5`.
 
 ## Features
 
