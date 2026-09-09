@@ -982,6 +982,29 @@ func operationPhysicalTempPath(targetPath string, operationID int64, role string
 	return filepath.Join(filepath.Dir(targetPath), fmt.Sprintf("%sop-%d-%s", tempNamePrefix, operationID, role))
 }
 
+// CleanupLocalDownloadArtifact removes the one disposable pre-side-effect
+// staging slot that a fully pinned, unattempted file EnsureLocal may own. The
+// path comes only from the durable pin and operation ID; current symlink state
+// is never consulted. Restart recovery calls this before deciding whether the
+// old planned intent is still current, so discarding that intent cannot orphan
+// its staging file and wedge later complete scans.
+func (e *RootExecutor) CleanupLocalDownloadArtifact(ctx context.Context, op domain.Operation) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !operationOwnsPlannedDownloadArtifact(op) {
+		return fmt.Errorf("operation %d does not own a disposable planned download artifact", op.ID)
+	}
+	if !filepath.IsAbs(op.LocalTargetPath) || filepath.Clean(op.LocalTargetPath) != op.LocalTargetPath {
+		return fmt.Errorf("operation %d has invalid pinned local target %q", op.ID, op.LocalTargetPath)
+	}
+	downloadPath := operationPhysicalTempPath(op.LocalTargetPath, op.ID, "download")
+	if err := os.Remove(downloadPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove stale planned download artifact %q: %w", downloadPath, err)
+	}
+	return nil
+}
+
 // LocalRecoveryArtifact reports the deterministic preserved-target slot for a
 // journaled local mutation. Recovery code uses this to fail closed rather than
 // forgetting data moved outside the lexical sync root by a followed symlink.

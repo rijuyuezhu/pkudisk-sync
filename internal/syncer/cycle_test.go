@@ -1225,6 +1225,103 @@ func TestRecoverExistingOperationsDiscardsUnpinnedCopyPlanWithoutScanEvidence(t 
 	}
 }
 
+func TestRecoverExistingOperationsCleansPlannedDownloadBeforeStaleDiscard(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, true)
+	expectedLocal := localFileFP(4, 40)
+	remote := remoteFileFP("doc", "rev", 4)
+	target := filepath.Join(t.TempDir(), "target.txt")
+	op, err := state.CreateOperation(ctx, domain.Operation{
+		SyncRootID:           root.ID,
+		Kind:                 domain.OperationEnsureLocal,
+		EntryKind:            domain.KindFile,
+		SrcPath:              "file.txt",
+		LocalTargetPath:      target,
+		LocalTargetIdentity:  "pinned-parent",
+		LocalTargetAuthority: domain.LocalMutationLexical,
+		ExpectedLocal:        expectedLocal,
+		ExpectedRemote:       expectationFromRemote(remote),
+		Phase:                domain.OperationPlanned,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(filepath.Dir(target), fmt.Sprintf(".pkudisk-sync-tmp-op-%d-download", op.ID))
+	if err := os.WriteFile(artifact, []byte("partial download"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data := &plannedDownloadCleanupDataPlane{
+		fakeDataPlane: &fakeDataPlane{
+			// Local state changed while the daemon was down, so the old planned
+			// operation must be discarded after restart cleanup.
+			local:  map[string]domain.LocalFingerprint{"file.txt": localFileFP(9, 90)},
+			remote: map[string]domain.RemoteFingerprint{"file.txt": remote},
+		},
+		artifact: artifact,
+	}
+	blocked, recovered, err := recoverExistingOperations(ctx, state, data, []domain.Operation{op}, false)
+	if err != nil || blocked || recovered != 0 {
+		t.Fatalf("recover stale planned download = blocked=%v recovered=%d err=%v", blocked, recovered, err)
+	}
+	if data.cleanupCalls != 1 {
+		t.Fatalf("planned download cleanup calls = %d, want 1", data.cleanupCalls)
+	}
+	if _, err := os.Lstat(artifact); !os.IsNotExist(err) {
+		t.Fatalf("discarded planned operation left download staging behind: %v", err)
+	}
+	if _, ok, err := state.GetOperation(ctx, op.ID); err != nil || ok {
+		t.Fatalf("stale planned operation survived recovery: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRecoverExistingOperationsCleansPlannedDownloadBeforeKnownUnstartedExecutorDiscard(t *testing.T) {
+	ctx := context.Background()
+	state, root := newCycleRoot(t, true, true)
+	expectedLocal := localFileFP(4, 40)
+	remote := remoteFileFP("doc", "rev", 4)
+	target := filepath.Join(t.TempDir(), "target.txt")
+	op, err := state.CreateOperation(ctx, domain.Operation{
+		SyncRootID:           root.ID,
+		Kind:                 domain.OperationEnsureLocal,
+		EntryKind:            domain.KindFile,
+		SrcPath:              "alias/file.txt",
+		LocalTargetPath:      target,
+		LocalTargetIdentity:  "pinned-parent",
+		LocalTargetAuthority: domain.LocalMutationCopyPhysical,
+		ExpectedLocal:        expectedLocal,
+		ExpectedRemote:       expectationFromRemote(remote),
+		Phase:                domain.OperationPlanned,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(filepath.Dir(target), fmt.Sprintf(".pkudisk-sync-tmp-op-%d-download", op.ID))
+	if err := os.WriteFile(artifact, []byte("partial download"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data := &plannedDownloadCleanupDataPlane{
+		fakeDataPlane: &fakeDataPlane{
+			local:  map[string]domain.LocalFingerprint{"alias/file.txt": expectedLocal},
+			remote: map[string]domain.RemoteFingerprint{"alias/file.txt": remote},
+		},
+		artifact:                   artifact,
+		failEnsureBeforeSideEffect: true,
+	}
+	blocked, recovered, err := recoverExistingOperations(ctx, state, data, []domain.Operation{op}, false)
+	if err == nil || blocked || recovered != 0 {
+		t.Fatalf("known-unstarted executor failure = blocked=%v recovered=%d err=%v", blocked, recovered, err)
+	}
+	if data.cleanupCalls != 1 {
+		t.Fatalf("planned download cleanup calls = %d, want 1", data.cleanupCalls)
+	}
+	if _, err := os.Lstat(artifact); !os.IsNotExist(err) {
+		t.Fatalf("known-unstarted discard left download staging behind: %v", err)
+	}
+	if _, ok, err := state.GetOperation(ctx, op.ID); err != nil || ok {
+		t.Fatalf("known-unstarted planned operation survived executor failure: ok=%v err=%v", ok, err)
+	}
+}
+
 func TestPinLocalMutationRejectsIncompleteExistingPin(t *testing.T) {
 	ctx := context.Background()
 	state, root := newCycleRoot(t, true, true)
@@ -1372,6 +1469,28 @@ type recoveryArtifactDataPlane struct {
 	cleaned  bool
 }
 
+type plannedDownloadCleanupDataPlane struct {
+	*fakeDataPlane
+	artifact                   string
+	cleanupCalls               int
+	failEnsureBeforeSideEffect bool
+}
+
+func (f *plannedDownloadCleanupDataPlane) CleanupLocalDownloadArtifact(context.Context, domain.Operation) error {
+	f.cleanupCalls++
+	if err := os.Remove(f.artifact); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (f *plannedDownloadCleanupDataPlane) EnsureLocalFile(ctx context.Context, op domain.Operation, peerRoots []string, beginSideEffect func() error) (domain.LocalFingerprint, error) {
+	if f.failEnsureBeforeSideEffect {
+		return domain.LocalFingerprint{}, fmt.Errorf("local symlink target changed before download for %q", op.SrcPath)
+	}
+	return f.fakeDataPlane.EnsureLocalFile(ctx, op, peerRoots, beginSideEffect)
+}
+
 func (f *recoveryArtifactDataPlane) LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error) {
 	return f.artifact, true, nil
 }
@@ -1435,6 +1554,10 @@ func (f *fakeDataPlane) PinnedLocalPreconditionHolds(ctx context.Context, op dom
 
 func (f *fakeDataPlane) LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error) {
 	return "", false, nil
+}
+
+func (f *fakeDataPlane) CleanupLocalDownloadArtifact(context.Context, domain.Operation) error {
+	return nil
 }
 
 func (f *fakeDataPlane) CleanupLocalRecoveryArtifact(context.Context, domain.Operation) error {

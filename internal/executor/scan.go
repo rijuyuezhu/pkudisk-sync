@@ -287,15 +287,10 @@ func (e *RootExecutor) ownedOperationArtifacts(operations []domain.Operation) (m
 		switch op.Phase {
 		case domain.OperationRunning, domain.OperationRecovering, domain.OperationBlocked:
 		case domain.OperationPlanned:
-			if op.Kind != domain.OperationEnsureLocal || op.Attempts != 0 || op.ID <= 0 || op.LocalTargetIdentity == "" {
+			if !operationOwnsPlannedDownloadArtifact(op) {
 				continue
 			}
-			switch op.LocalTargetAuthority {
-			case domain.LocalMutationLexical, domain.LocalMutationFollowPhysical, domain.LocalMutationCopyPhysical:
-				plannedDownloadOnly = true
-			default:
-				continue
-			}
+			plannedDownloadOnly = true
 		default:
 			continue
 		}
@@ -313,11 +308,26 @@ func (e *RootExecutor) ownedOperationArtifacts(operations []domain.Operation) (m
 			continue
 		}
 		owned[operationPhysicalTempPath(op.LocalTargetPath, op.ID, "recovery")] = struct{}{}
-		if op.Kind == domain.OperationEnsureLocal {
+		if op.Kind == domain.OperationEnsureLocal && op.EntryKind == domain.KindFile {
 			owned[operationPhysicalTempPath(op.LocalTargetPath, op.ID, "download")] = struct{}{}
 		}
 	}
 	return owned, nil
+}
+
+func operationOwnsPlannedDownloadArtifact(op domain.Operation) bool {
+	if op.Kind != domain.OperationEnsureLocal || op.EntryKind != domain.KindFile || op.Phase != domain.OperationPlanned || op.Attempts != 0 || op.ID <= 0 {
+		return false
+	}
+	if op.LocalTargetPath == "" || op.LocalTargetIdentity == "" {
+		return false
+	}
+	switch op.LocalTargetAuthority {
+	case domain.LocalMutationLexical, domain.LocalMutationFollowPhysical, domain.LocalMutationCopyPhysical:
+		return true
+	default:
+		return false
+	}
 }
 
 func rejectPeerRootPath(physicalPath string, peerLocalRoots []string) error {

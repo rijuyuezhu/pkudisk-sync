@@ -488,6 +488,9 @@ func (stubDataPlane) PinnedLocalPreconditionHolds(context.Context, domain.Operat
 func (stubDataPlane) LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error) {
 	return "", false, nil
 }
+func (stubDataPlane) CleanupLocalDownloadArtifact(context.Context, domain.Operation) error {
+	return nil
+}
 func (stubDataPlane) CleanupLocalRecoveryArtifact(context.Context, domain.Operation) error {
 	return nil
 }

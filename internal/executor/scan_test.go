@@ -125,6 +125,7 @@ func TestScanLocalPinnedPlannedEnsureOwnsOnlyDownloadStaging(t *testing.T) {
 		ID:                   17,
 		SyncRootID:           1,
 		Kind:                 domain.OperationEnsureLocal,
+		EntryKind:            domain.KindFile,
 		LocalTargetPath:      target,
 		LocalTargetIdentity:  "pinned-parent",
 		LocalTargetAuthority: domain.LocalMutationLexical,
@@ -174,6 +175,7 @@ func TestScanLocalIncompleteOrAttemptedPlannedEnsureDoesNotOwnDownloadStaging(t 
 				ID:                   17,
 				SyncRootID:           1,
 				Kind:                 domain.OperationEnsureLocal,
+				EntryKind:            domain.KindFile,
 				LocalTargetPath:      target,
 				LocalTargetIdentity:  tc.identity,
 				LocalTargetAuthority: tc.authority,
@@ -184,6 +186,69 @@ func TestScanLocalIncompleteOrAttemptedPlannedEnsureDoesNotOwnDownloadStaging(t 
 				t.Fatal("ambiguous planned operation incorrectly owned a download staging artifact")
 			}
 		})
+	}
+}
+
+func TestScanLocalPlannedDirectoryEnsureDoesNotOwnDownloadStaging(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target-dir")
+	download := operationPhysicalTempPath(target, 17, "download")
+	if err := os.WriteFile(download, []byte("user-or-ambiguous"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{ID: 1, LocalRoot: root}}
+	op := domain.Operation{
+		ID:                   17,
+		SyncRootID:           1,
+		Kind:                 domain.OperationEnsureLocal,
+		EntryKind:            domain.KindDir,
+		LocalTargetPath:      target,
+		LocalTargetIdentity:  "pinned-parent",
+		LocalTargetAuthority: domain.LocalMutationLexical,
+		Phase:                domain.OperationPlanned,
+	}
+	if _, _, _, _, err := exec.ScanLocal(context.Background(), []domain.Operation{op}, nil); err == nil {
+		t.Fatal("planned directory ensure incorrectly owned a download staging artifact")
+	}
+}
+
+func TestCleanupLocalDownloadArtifactRequiresExactPlannedFileOwner(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	download := operationPhysicalTempPath(target, 17, "download")
+	if err := os.WriteFile(download, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := &RootExecutor{root: domain.SyncRoot{ID: 1, LocalRoot: root}}
+	op := domain.Operation{
+		ID:                   17,
+		SyncRootID:           1,
+		Kind:                 domain.OperationEnsureLocal,
+		EntryKind:            domain.KindFile,
+		LocalTargetPath:      target,
+		LocalTargetIdentity:  "pinned-parent",
+		LocalTargetAuthority: domain.LocalMutationLexical,
+		Phase:                domain.OperationPlanned,
+	}
+	if err := exec.CleanupLocalDownloadArtifact(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(download); !os.IsNotExist(err) {
+		t.Fatalf("planned download staging survived cleanup: %v", err)
+	}
+	if _, _, _, _, err := exec.ScanLocal(context.Background(), nil, nil); err != nil {
+		t.Fatalf("complete scan remained wedged after planned download cleanup: %v", err)
+	}
+
+	if err := os.WriteFile(download, []byte("user-or-ambiguous"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	op.Attempts = 1
+	if err := exec.CleanupLocalDownloadArtifact(context.Background(), op); err == nil {
+		t.Fatal("attempted planned operation was allowed to clean a download slot")
+	}
+	if _, err := os.Lstat(download); err != nil {
+		t.Fatalf("invalid cleanup removed ambiguous download-shaped file: %v", err)
 	}
 }
 

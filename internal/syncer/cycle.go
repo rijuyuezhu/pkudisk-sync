@@ -26,6 +26,7 @@ type DataPlane interface {
 	ResolveLocalMutationTarget(context.Context, string, domain.LocalFingerprint, domain.EntryKind, []string) (domain.LocalMutationTarget, error)
 	PinnedLocalPreconditionHolds(context.Context, domain.Operation) (bool, error)
 	LocalRecoveryArtifact(context.Context, domain.Operation) (string, bool, error)
+	CleanupLocalDownloadArtifact(context.Context, domain.Operation) error
 	CleanupLocalRecoveryArtifact(context.Context, domain.Operation) error
 	CompareFileContent(context.Context, string, domain.LocalFingerprint, domain.RemoteExpectation) (bool, error)
 	ComparePinnedFileContent(context.Context, domain.Operation, domain.RemoteExpectation) (bool, error)
@@ -466,6 +467,16 @@ func recoverExistingOperations(ctx context.Context, state *store.Store, data Dat
 			if err != nil {
 				return false, recovered, err
 			}
+			if ownsDisposablePlannedDownload(op) {
+				// A hard crash may have left the exact operation-owned download
+				// staging slot behind while this durable operation was still planned.
+				// Remove that disposable state before any branch can discard the
+				// journal row; otherwise the next complete scan would see an orphaned
+				// reserved artifact with no remaining durable owner.
+				if err := data.CleanupLocalDownloadArtifact(ctx, op); err != nil {
+					return false, recovered, err
+				}
+			}
 			holds, err := operationPreconditionsHold(ctx, data, op)
 			if err != nil {
 				return false, recovered, err
@@ -543,6 +554,16 @@ func recoverExistingOperations(ctx context.Context, state *store.Store, data Dat
 		}
 	}
 	return false, recovered, nil
+}
+
+func ownsDisposablePlannedDownload(op domain.Operation) bool {
+	if op.Kind != domain.OperationEnsureLocal || op.EntryKind != domain.KindFile || op.Phase != domain.OperationPlanned || op.Attempts != 0 || op.ID <= 0 {
+		return false
+	}
+	if op.LocalTargetPath == "" || op.LocalTargetIdentity == "" || op.LocalTargetAuthority == "" {
+		return false
+	}
+	return true
 }
 
 func executePersistedOperation(ctx context.Context, state *store.Store, data DataPlane, op domain.Operation) error {
