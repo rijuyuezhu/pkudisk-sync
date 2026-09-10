@@ -1,5 +1,8 @@
 # pkudisk-sync
 
+> [!WARNING]
+> This project is not ready for daily use, and I don't think the current design is sufficient for that purpose. I'll archive it for now and turn to [rclone-pkudisk](https://github.com/rijuyuezhu/rclone-pkudisk) instead for PKU Disk synchronization.
+
 Cross-platform, stateful, bidirectional synchronization for selected PKU Disk directories on Linux, macOS, and Windows.
 
 `pkudisk-sync` embeds rclone and [`rclone-pkudisk`](https://github.com/rijuyuezhu/rclone-pkudisk) directly as Go libraries and manages synchronization state itself. No separate rclone process is required.
